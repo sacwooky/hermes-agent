@@ -1,9 +1,8 @@
 ---
 name: kanban-worker
 description: Pitfalls, examples, and edge cases for Hermes Kanban workers. The lifecycle itself is auto-injected into every worker's system prompt as KANBAN_GUIDANCE (from agent/prompt_builder.py); this skill is what you load when you want deeper detail on specific scenarios.
-version: 2.0.0
+version: 2.1.0
 platforms: [linux, macos, windows]
-environments: [kanban]
 metadata:
   hermes:
     tags: [kanban, multi-agent, collaboration, workflow, pitfalls]
@@ -13,6 +12,153 @@ metadata:
 # Kanban Worker — Pitfalls and Examples
 
 > You're seeing this skill because the Hermes Kanban dispatcher spawned you as a worker with `--skills kanban-worker` — it's loaded automatically for every dispatched worker. The **lifecycle** (6 steps: orient → work → heartbeat → block/complete) also lives in the `KANBAN_GUIDANCE` block that's auto-injected into your system prompt. This skill is the deeper detail: good handoff shapes, retry diagnostics, edge cases.
+
+## Board naming convention
+
+When Keith says "the board" to an agent/worker, default to that agent or workstream's **Hermes Kanban board**. Do not jump to Linear, Trello, GitHub Projects, or another external tracker unless Keith explicitly names that system. Linear is a source/import target only when the request says Linear.
+
+## Phase 12/13: Know the orchestrator's decomposition gate
+
+The orchestrator skill enforces two rules that workers should understand:
+
+### Phase 12 — decomposition requires packet
+Before an orchestrator fans out child cards, an approval packet (scope, AC, risk, operator approval) must exist on-file. This is a hard gate — the orchestrator blocks itself with `packet-required` if no packet is found.
+
+### Phase 13 — unannounced work is coordination defect
+Cards representing new work without an approval packet or prior operator acknowledgment are coordination defects. Repair/maintenance cards are exempt.
+
+**What this means for workers:**
+- If you're working on a card that was part of a properly-decomposed fan-out, the orchestrator already verified the packet. You can proceed normally.
+- If you encounter a `packet-required` block on a sibling card, don't try to unblock it by bypassing the gate — the missing packet is a real coordination defect that needs operator input.
+- If you're working as an orchestrator yourself (rare — usually a separate profile), you MUST enforce Phase 12/13 before creating child cards. See the kanban-orchestrator skill for the full enforcement procedure.
+
+**Root cause:** Slice 4/5 incident (runs/2026-06-05-003) — work dispatched without operator visibility or signed scope.
+
+## Worker mutation scope
+
+A Kanban worker may be scoped to its own task and unable to mutate sibling/child cards, even when it can read and comment on them. If your reconciliation result says child cards are stale duplicates but `kanban_complete`, `kanban_archive`, or sibling mutation is refused, do **not** complete the parent if that would promote stale children. Instead:
+
+1. Comment the exact disposition for each affected child.
+2. Block the parent with a board-admin action request naming the child IDs to archive/close.
+3. State whether completing the parent would incorrectly promote stale work.
+
+Flow Manager / Jake can then perform the board-admin cleanup.
+
+## Builder lane selection and fallback
+
+For repo-backed code/review/QA cards, do **not** do substantial implementation directly as a generic Hermes worker. Use a supervised coding-agent lane, then you verify and report through Kanban.
+
+### Available builder lanes
+
+| Lane | Tool | Primary use | Fallback when |
+|---|---|---|---|
+| `claude` | Claude Code (`claude -p`) | Default for all code-heavy work | Primary lane |
+| `codex` | Codex CLI (`codex exec`) | OpenAI-based builder; good for GPT-native code | Claude Code rate-limited or unavailable |
+| `kimi` | Kimi CLI (`kimi --prompt`) | Moonshot-based builder | Both Claude and Codex unavailable |
+| `opencode` | OpenCode (`opencode run`) | Free models (MiniMax-M3-free, DeepSeek-flash-free); zero-cost fallback | All paid lanes unavailable |
+
+### Lane selection rules
+
+1. **Default**: always try `claude` lane first.
+2. **Card-specified**: if the card body or PRD explicitly names a lane (`use codex lane`, `kimi preferred for this task`), use that lane.
+3. **Rate-limit fallback**: if the primary lane returns `unavailable` / `rate_limit` / `auth failed`, try the next lane in order: `claude` → `codex` → `kimi` → `opencode`.
+4. **Budget-aware**: if a card has a tight budget note, prefer `opencode` (free) or `codex`/`kimi` over `claude` for large tasks.
+5. **Kimi auth**: Kimi CLI uses OAuth (`kimi login`). If it fails with 401, the OAuth session expired. Run `kimi login` interactively on that host. Do NOT debug API keys — `KIMI_API_KEY` in `.env` is for Hermes provider fallback, not the CLI lane.
+
+### Z.AI and MiniMax as Hermes conversational fallbacks (NOT CLI lanes)
+
+Z.AI (GLM) and MiniMax are configured as **Hermes model provider fallbacks** for conversational/chat assistance only. They are NOT standalone CLI builder lanes and should NOT be used for repo-backed code implementation.
+
+If all CLI lanes fail and the task is conversational (research, planning, documentation), the Hermes agent can fall back to these providers. This is automatic via the profile's `fallback_providers` config.
+
+Conversational fallback chain (Hermes agent level):
+- Jake local / fluxlabs-cloud / Loki: GPT-5.5 → GLM-5-turbo → MiniMax-M3
+- Morgan: GLM-5-turbo
+
+**Kimi is NOT in the conversational fallback chain.** Kimi is reserved for the CLI builder lane only.
+
+### Claude Code lane (primary)
+
+Invoke when all are true:
+- `$HERMES_KANBAN_WORKSPACE` is a real repo/worktree/project directory
+- the card involves code, tests, build, refactor, code review, or QA of repo behavior
+- the card is not blocked on a human gate such as credentials, Supabase, production deploy, billing/spend, secrets, or owner approval
+
+Required command:
+```bash
+~/.hermes/scripts/kanban-claude-code-lane.sh "Card $HERMES_KANBAN_TASK: <specific task + acceptance criteria>. Work only in $HERMES_KANBAN_WORKSPACE. Do not push, deploy, read secrets, change credentials, delete destructively, or spend money. Run relevant tests/builds and report changed files, commands run, verification, and risks."
+```
+
+If Claude Code is unavailable/auth-broken, try the next lane instead of blocking:
+```bash
+~/.hermes/scripts/kanban-codex-lane.sh "<same prompt>"
+```
+
+### Codex lane (fallback #1)
+
+```bash
+~/.hermes/scripts/kanban-codex-lane.sh "Card $HERMES_KANBAN_TASK: <specific task + acceptance criteria>. Work only in $HERMES_KANBAN_WORKSPACE. Do not push, deploy, read secrets, change credentials, delete destructively, or spend money. Run relevant tests/builds and report changed files, commands run, verification, and risks."
+```
+
+If Codex is unavailable:
+```bash
+~/.hermes/scripts/kanban-kimi-lane.sh "<same prompt>"
+```
+
+### Kimi lane (fallback #2)
+
+```bash
+~/.hermes/scripts/kanban-kimi-lane.sh "Card $HERMES_KANBAN_TASK: <specific task + acceptance criteria>. Work only in $HERMES_KANBAN_WORKSPACE. Do not push, deploy, read secrets, change credentials, delete destructively, or spend money. Run relevant tests/builds and report changed files, commands run, verification, and risks."
+```
+
+**Kimi CLI auth: OAuth only.**
+- Kimi CLI uses OAuth (`kimi login`), not API keys.
+- The `KIMI_API_KEY` in `.env` is for Hermes `kimi-coding` provider fallback only — it does NOT authenticate the Kimi CLI.
+- If Kimi CLI fails with 401, the OAuth session has expired or the host is not trusted. Run `kimi login` interactively on that host to re-authenticate.
+- Do NOT set `KIMI_API_KEY` for the Kimi CLI lane — it is ignored.
+
+If Kimi is unavailable:
+```bash
+~/.hermes/scripts/kanban-opencode-lane.sh "<same prompt>"
+```
+
+### OpenCode lane (fallback #3)
+
+```bash
+~/.hermes/scripts/kanban-opencode-lane.sh "Card $HERMES_KANBAN_TASK: <specific task + acceptance criteria>. Work only in $HERMES_KANBAN_WORKSPACE. Do not push, deploy, read secrets, change credentials, delete destructively, or spend money. Run relevant tests/builds and report changed files, commands run, verification, and risks."
+```
+
+OpenCode supports free models out of the box (no API key required). See `references/opencode-free-models-setup.md` for installation and configuration.
+
+**User preference**: Keith prefers direct provider integration (Z.AI, MiniMax via Hermes config) over wrapper tools when paid models are available. Use OpenCode only as a zero-cost fallback when Claude/Codex/Kimi are unavailable.
+
+Available free models:
+- `opencode/minimax-m3-free` — default for build
+- `opencode/deepseek-v4-flash-free` — default for plan
+- `opencode/mimo-v2.5-free`
+- `opencode/nemotron-3-ultra-free`
+
+### All lanes exhausted
+
+If no lane is available, block mechanically with:
+```
+builder-lanes-unavailable: claude=<error>, codex=<error>, kimi=<error>, opencode=<error>; operator repair needed, not product input.
+```
+
+### Your job as lifecycle owner
+
+Your job remains the lifecycle owner regardless of which lane writes the code:
+1. Inspect the card first
+2. Call the appropriate lane for the repo work
+3. Inspect the lane output
+4. Verify `git diff` and tests yourself where needed
+5. Then `kanban_complete` or `kanban_block`
+
+The coding agent is not the release manager and must not mark the card done by prose alone.
+
+Do not use any builder lane for pure research, vault-only cleanup, or true human approval/credential gates.
+
+## Claude Code supervised repo lane (legacy — see Builder lane selection above)
 
 ## Workspace handling
 
@@ -142,6 +288,24 @@ kanban_block(reason="Rate limit key choice: IP (simple, NAT-unsafe) or user_id (
 
 The block message is what appears in the dashboard / gateway notifier. The comment is the deeper context a human reads when they open the task.
 
+## Fixing reviewer-blocked cards (operator pattern)
+
+When a reviewer blocks a card with specific findings, the operator/Jake fix cycle is:
+
+1. **Read the reviewer's comment** — `hermes kanban show <id>` and read every finding. Do not guess what was wrong; the comment is the authoritative spec.
+2. **Fix each finding at the file level** — Create/patch/refresh the exact artifacts the reviewer named. If the reviewer cited line numbers in a specific file, update that file. If the reviewer said "doc X is missing," create doc X.
+3. **Run verification** — At minimum: secret scan (grep for API key / token / PEM patterns over changed files) and any project-specific lint. Record zero findings as evidence.
+4. **Comment before unblocking** — Write a structured comment on the card listing: (a) what was fixed, (b) which files changed, (c) verification results. This becomes the audit trail for the re-review.
+5. **Unblock** — `hermes kanban unblock <id>`. The reviewer re-runs with the comment thread for context.
+
+**Do not** unblock without commenting the fix evidence. The reviewer spawned a fresh context with no memory of your fix — the comment is their only signal that the findings were addressed.
+
+### Source-controlled evidence files (pitfall)
+
+Kanban card comments are ephemeral context. When a maintainer/ops card produces host inventories, install evidence, or verification results, **write a source-controlled file** in the vault/project docs — not just a Kanban comment. If the only record of "CLI parity completed on Loki" is a Kanban comment, the gap-matrix and evidence-file index become stale on the next review cycle.
+
+Pattern: write evidence files under the project's ops/docs path (e.g. `ops/fleet-mcp-gateway/hosts/<host>-cli-parity-e2.md`), then reference them from index docs (`hosts/README.md`, `gap-matrix.md`). Kanban comments supplement; source files are the audit trail.
+
 ## Heartbeats worth sending
 
 Good heartbeats name progress: `"epoch 12/50, loss 0.31"`, `"scanned 1.2M/2.4M rows"`, `"uploaded 47/120 videos"`.
@@ -174,6 +338,8 @@ You can configure the gateway to receive cross-profile Kanban task notifications
 - Complete a task you didn't actually finish. Block it instead.
 
 ## Pitfalls
+
+**Bash heredoc and quote escaping loops.** When writing multi-line scripts for remote execution, avoid bash heredocs (`cat <<'EOF'`). They break on nested quotes, variable expansion, and SSH command wrapping. Use `write_file` locally + `scp` + `ssh host 'bash script'` instead. See `references/bash-heredoc-quoting-pitfalls.md`.
 
 **Task state can change between dispatch and your startup.** Between when the dispatcher claimed and when your process actually booted, the task may have been blocked, reassigned, or archived. Always `kanban_show` first. If it reports `blocked` or `archived`, stop — you shouldn't be running.
 
