@@ -98,6 +98,18 @@ _log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+
+
+class PacketBeforeDispatchError(RuntimeError):
+    """Raised when decomposition is attempted without an on-file approval packet.
+
+    This is the F1 gate hardening against the Slice 4/5 incident pattern:
+    work was decomposed and dispatched without operator approval artifacts
+    on disk.  The orchestrator (or any caller of ``decompose_triage_task``)
+    must catch this and surface the diagnostic message to the operator.
+    """
+
+
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
@@ -2840,6 +2852,67 @@ def _synthesize_ended_run(
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
 
+def _has_gate_hold(
+    conn: sqlite3.Connection, task_id: str,
+) -> bool:
+    """Return True when ``task_id`` has an active R3-gate hold.
+
+    An R3-gate hold exists when the most recent ``blocked`` event for the
+    task contains a reason matching one of :data:`R3_GATE_PHRASES`
+    (case-insensitive), *and* no ``unblocked`` event has superseded it.
+
+    Unlike :func:`_has_sticky_block` (which returns True for *any*
+    worker-initiated block), this is narrower: only blocks whose reason
+    explicitly signals a dependency/approval gate trigger the hold.
+    The hold is resolved when either:
+      - An ``unblocked`` event appears (explicit ``kanban_unblock``), or
+      - A comment containing an unblock signal is added (see
+        :func:`_gate_hold_satisfied`).
+    """
+    row = conn.execute(
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row or row["kind"] != "blocked":
+        return False
+    payload = row["payload"]
+    if not payload:
+        return False
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            return False
+    if not isinstance(payload, dict):
+        return False
+    reason = str(payload.get("reason", "")).lower()
+    return any(phrase in reason for phrase in R3_GATE_PHRASES)
+
+
+def _gate_hold_satisfied(
+    conn: sqlite3.Connection, task_id: str,
+) -> bool:
+    """Return True when the gate hold on ``task_id`` is satisfied.
+
+    A gate hold is considered satisfied when the comment thread for the
+    task contains a comment whose body (case-insensitive) starts with or
+    contains an unblock signal: ``UNBLOCK:`` or an approval packet
+    reference.
+    """
+    rows = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ?",
+        (task_id,),
+    ).fetchall()
+    body_lower = " ".join(r["body"].lower() for r in rows if r["body"])
+    return (
+        "unblock:" in body_lower
+        or "approval packet:" in body_lower
+        or "approval packet " in body_lower
+    )
+
+
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return True when ``task_id`` is sticky-blocked by an explicit
     worker/operator ``kanban_block`` call (#28712).
@@ -2888,7 +2961,7 @@ def recompute_ready(
 
     ``blocked`` tasks are also considered for promotion (so a task
     blocked purely by a parent dependency unblocks itself when the
-    parent completes), *except* in two cases:
+    parent completes), *except* in three cases:
 
     1. The most recent block event was a worker-initiated
        ``kanban_block`` — those stay blocked until an explicit
@@ -2899,6 +2972,13 @@ def recompute_ready(
        repeatedly exhausts its iteration budget: without this guard the
        counter would reset on every recovery cycle and the circuit
        breaker could never trip (#35072).
+
+    3. An R3-gate hold is active (F2): the most recent ``blocked``
+       event reason contains an R3-gate phrase (e.g. "Waiting on
+       dependencies") and the comment thread does NOT contain an
+       unblock signal (``UNBLOCK:`` or ``Approval packet: …``).  The
+       task is not auto-promoted; the operator must add the
+       unblock signal in a comment and run ``recompute_ready`` again.
 
     The effective failure limit resolves in the same order as the
     circuit breaker in ``_record_task_failure`` so the two never
@@ -2920,11 +3000,42 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for human review — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
+            if cur_status == "blocked" and _has_gate_hold(conn, task_id):
+                # R3-gate hold (F2): the blocked reason signals the task
+                # requires an external approval packet (e.g. "Waiting on
+                # dependencies").  When a comment thread contains an
+                # unblock signal (``UNBLOCK:`` or ``Approval packet:``),
+                # the gate is satisfied and we fall through to the
+                # normal promotion logic.  When the signal is absent,
+                # refuse to auto-promote and emit a ``gate_hold`` event
+                # so operators can see why the task was skipped when
+                # reading `hermes kanban tail`.
+                if not _gate_hold_satisfied(conn, task_id):
+                    _append_event(
+                        conn, task_id, "gate_hold",
+                        {
+                            "reason": "R3 gate hold active; comment thread lacks unblock signal",
+                            "phrases": list(R3_GATE_PHRASES),
+                        },
+                    )
+                    continue
+                # Gate satisfied: fall through.  We deliberately do NOT
+                # short-circuit via _has_sticky_block — for gate-held
+                # tasks, the comment-UNBLOCK signal is the canonical
+                # unblock mechanism, not an explicit kanban_unblock
+                # call.  Emit an event so the audit trail shows the
+                # gate was satisfied.
+                _append_event(
+                    conn, task_id, "gate_satisfied",
+                    {
+                        "reason": "R3 gate hold satisfied by comment thread; promoting",
+                    },
+                )
+            elif cur_status == "blocked" and _has_sticky_block(conn, task_id):
+                # Worker / operator asked for human review (non-gate
+                # block) — do not silently auto-recover.  ``unblock_task``
+                # is the only legitimate exit (it emits ``"unblocked"``
+                # which flips this predicate back).
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
@@ -4464,6 +4575,56 @@ def decompose_triage_task(
     if _seen != len(children):
         raise ValueError("cyclic dependency detected in decomposed children list")
 
+    # ── F1 gate: packet-before-decomposition ──────────────────────
+    # Before creating any children, check if the root task body
+    # references an approval packet (APPROVAL-*.md).  If it does and
+    # the file does not exist on disk relative to the workspace path,
+    # raise PacketBeforeDispatchError to prevent the incident pattern
+    # where work was decomposed and dispatched without operator approval.
+    _root_row = conn.execute(
+        "SELECT body, workspace_kind, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if _root_row is not None and _root_row["body"]:
+        _packet_refs = re.findall(
+            r'(?:docs/prds/|docs/conductor/)?(APPROVAL-[A-Za-z0-9_-]+\.md)',
+            _root_row["body"],
+        )
+        if _packet_refs:
+            _ws_path = _root_row["workspace_path"]
+            _search_dirs = []
+            if _ws_path:
+                _ws = Path(_ws_path)
+                # Search common packet locations relative to the workspace.
+                # workspace_path might BE the project root (docs/prds/ is a
+                # child of it) or it might be a subdirectory whose parent is
+                # the project root.  Cover both.
+                _search_dirs.append(_ws / "docs" / "prds")
+                _search_dirs.append(_ws / "docs" / "conductor")
+                # Also search the parent in case workspace_path points at docs/
+                _search_dirs.append(_ws.parent / "docs" / "prds")
+                # And search workspace_path itself (might be the prds dir)
+                _search_dirs.append(_ws)
+            # If no workspace-based dirs resolved, try common project roots
+            if not _search_dirs:
+                for _env_val in os.environ.get("HERMES_KANBAN_WORKSPACE", ""), "":
+                    if _env_val:
+                        _search_dirs.append(Path(_env_val) / "docs" / "prds")
+            _found_any = False
+            for _ref in _packet_refs:
+                for _search_dir in _search_dirs:
+                    if (_search_dir / _ref).exists():
+                        _found_any = True
+                        break
+            if not _found_any and _search_dirs:
+                raise PacketBeforeDispatchError(
+                    f"Decomposition blocked: task {task_id} references approval "
+                    f"packet(s) {_packet_refs} but none found on disk. "
+                    f"Searched: {[str(d) for d in _search_dirs]}. "
+                    f"Create the approval packet before decomposing."
+                )
+    # ── end F1 gate ────────────────────────────────────────────────
+
     # We do the full decomposition in a SINGLE write_txn so it's
     # atomic: either every child is created AND the root flips to
     # ``todo``, or nothing changes. We deliberately do NOT call any
@@ -4812,6 +4973,18 @@ def schedule_task(
 # a human can investigate. Prevents retry storms when a worker repeatedly times
 # out, crashes, or cannot spawn.
 DEFAULT_FAILURE_LIMIT = 2
+
+# R3-gate phrases: substrings in a blocked event's reason that signal
+# the task requires an external approval packet before dispatch.  When
+# the most recent ``blocked`` event reason contains one of these phrases
+# (case-insensitive), ``recompute_ready`` refuses to promote the task
+# until the comment thread contains an unblock signal.
+R3_GATE_PHRASES = (
+    "waiting on dependencies",
+    "needs approval packet",
+    "requires approval packet",
+    "blocked pending approval",
+)
 # Legacy alias — callers / tests still reference the old name.
 DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 
