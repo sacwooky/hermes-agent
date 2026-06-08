@@ -1,0 +1,14 @@
+{
+  "name": "hermes-console",
+  "label": "Hermes Console",
+  "description": "Portfolio Board — multi-board, read-only view of canonical Hermes Kanban data with backlog/board/detail views and Hermes-style section layout",
+  "icon": "LayoutDashboard",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/console",
+    "position": "end"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

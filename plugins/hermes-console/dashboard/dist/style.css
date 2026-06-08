@@ -1,0 +1,913 @@
+/*
+ * Hermes Console — Portfolio Board dashboard plugin styles.
+ *
+ * All colors reference the host dashboard's theme CSS vars so the
+ * Portfolio reskins automatically with the active theme. No hardcoded
+ * palette. Mirrors the visual language of the kanban plugin (section
+ * heads, code reset, table chrome) so the two surfaces feel like the
+ * same operator console.
+ *
+ * Sections:
+ *   1. Layout shell
+ *   2. Header / summary
+ *   3. Filter bar
+ *   4. Hierarchy pane
+ *   5. Main column (tabs + backlog table)
+ *   6. Board view
+ *   7. Detail drawer
+ *   8. Hermes-style collapsible sections
+ *   9. Code/pre reset
+ */
+
+/* -------------------------------------------------------------------------
+ * 1. Layout shell
+ * -------------------------------------------------------------------------
+ *
+ * The plugin claims the entire page once mounted, but the host
+ * dashboard already gives us padding, so we use min-height: 0 inside
+ * flex to let children scroll independently.
+ */
+
+.hermes-console-root {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  width: 100%;
+  box-sizing: border-box;
+  gap: 0.75rem;
+}
+
+.hermes-console-body {
+  display: grid;
+  grid-template-columns: 220px 1fr 360px;
+  gap: 0.75rem;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.hermes-console-body > .hermes-console-hierarchy--collapsed {
+  grid-template-columns: 36px 1fr 360px;
+}
+
+.hermes-console-body > .hermes-console-detail--empty {
+  /* keep the slot reserved so the layout doesn't jump */
+}
+
+.hermes-console-main {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  background: var(--hermes-bg-elevated, transparent);
+  border: 1px solid var(--hermes-border, rgba(255, 255, 255, 0.08));
+  border-radius: 0.5rem;
+  padding: 0.75rem;
+  overflow: auto;
+}
+
+.hermes-console-muted {
+  color: var(--hermes-text-muted, #8b8b8b);
+  font-style: italic;
+}
+
+.hermes-console-error {
+  background: var(--hermes-warning-bg, rgba(255, 180, 0, 0.1));
+  border: 1px solid var(--hermes-warning-border, rgba(255, 180, 0, 0.4));
+  color: var(--hermes-warning-fg, #ffb400);
+  padding: 0.5rem 0.75rem;
+  border-radius: 0.4rem;
+  font-size: 0.85rem;
+}
+
+.hermes-console-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
+  color: var(--hermes-text-muted, #8b8b8b);
+  font-style: italic;
+  min-height: 6rem;
+}
+
+/* -------------------------------------------------------------------------
+ * 2. Header / summary
+ * -------------------------------------------------------------------------
+ */
+
+.hermes-console-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.75rem;
+  padding: 0.25rem 0.25rem 0;
+}
+
+.hermes-console-title {
+  font-size: 1.15rem;
+  font-weight: 600;
+  margin: 0;
+  letter-spacing: 0.01em;
+}
+
+.hermes-console-subtitle {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--hermes-text-muted, #8b8b8b);
+}
+
+.hermes-console-summary {
+  margin-left: auto;
+  display: flex;
+  gap: 0.75rem;
+  font-size: 0.8rem;
+  color: var(--hermes-text, inherit);
+}
+
+.hermes-console-summary-cell strong {
+  font-weight: 600;
+  margin-right: 0.2rem;
+  color: var(--hermes-accent, #6cf);
+}
+
+/* -------------------------------------------------------------------------
+ * 3. Filter bar
+ * -------------------------------------------------------------------------
+ */
+
+.hermes-console-filterbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  align-items: flex-end;
+  padding: 0.5rem 0.75rem;
+  background: var(--hermes-bg-elevated, rgba(255, 255, 255, 0.02));
+  border: 1px solid var(--hermes-border, rgba(255, 255, 255, 0.08));
+  border-radius: 0.4rem;
+}
+
+.hermes-console-filterbar-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 8rem;
+}
+
+.hermes-console-filterbar-row label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--hermes-text-muted, #8b8b8b);
+}
+
+.hermes-console-filter-input {
+  min-width: 14rem;
+}
+
+.hermes-console-filterbar-checks {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.75rem;
+  flex: 1 1 auto;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.hermes-console-inline-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.8rem;
+  text-transform: none;
+  color: var(--hermes-text, inherit);
+  cursor: pointer;
+}
+
+.hermes-console-inline-label input[type="checkbox"] {
+  margin: 0;
+}
+
+.hermes-console-filter-reset {
+  margin-left: 0.5rem;
+}
+
+/* -------------------------------------------------------------------------
+ * 4. Hierarchy pane
+ * -------------------------------------------------------------------------
+ */
+
+.hermes-console-hierarchy {
+  background: var(--hermes-bg-elevated, rgba(255, 255, 255, 0.02));
+  border: 1px solid var(--hermes-border, rgba(255, 255, 255, 0.08));
+  border-radius: 0.4rem;
+  padding: 0.5rem 0.75rem;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: auto;
+}
+
+.hermes-console-hierarchy--collapsed {
+  padding: 0.5rem 0.25rem;
+  align-items: center;
+}
+
+.hermes-console-hierarchy-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+  user-select: none;
+  font-size: 0.8rem;
+  font-weight: 600;
+  margin-bottom: 0.4rem;
+}
+
+.hermes-console-hierarchy-toggle {
+  font-size: 0.7rem;
+  color: var(--hermes-text-muted, #8b8b8b);
+}
+
+.hermes-console-hierarchy-help {
+  font-size: 0.72rem;
+  color: var(--hermes-text-muted, #8b8b8b);
+  margin-bottom: 0.5rem;
+  line-height: 1.4;
+}
+
+.hermes-console-hierarchy-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.hermes-console-hierarchy-bucket {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.8rem;
+  padding: 0.2rem 0.4rem;
+  border-radius: 0.25rem;
+  background: var(--hermes-bg, rgba(255, 255, 255, 0.03));
+}
+
+.hermes-console-hierarchy-selected {
+  margin-top: 0.75rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--hermes-border, rgba(255, 255, 255, 0.08));
+}
+
+.hermes-console-hierarchy-selected-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  color: var(--hermes-text-muted, #8b8b8b);
+  margin-bottom: 0.25rem;
+}
+
+.hermes-console-hierarchy-selected-id {
+  font-family: var(--hermes-font-mono, ui-monospace, SFMono-Regular, monospace);
+  font-size: 0.8rem;
+}
+
+/* -------------------------------------------------------------------------
+ * 5. Main column — tabs + backlog table
+ * -------------------------------------------------------------------------
+ */
+
+.hermes-console-main-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.5rem;
+}
+
+.hermes-console-tab-count {
+  display: inline-block;
+  margin-left: 0.4rem;
+  font-size: 0.7rem;
+  padding: 0.05rem 0.4rem;
+  border-radius: 0.6rem;
+  background: var(--hermes-bg, rgba(255, 255, 255, 0.06));
+  color: var(--hermes-text-muted, #8b8b8b);
+}
+
+.hermes-console-main-counts {
+  font-size: 0.8rem;
+  color: var(--hermes-text-muted, #8b8b8b);
+}
+
+.hermes-console-backlog-wrap {
+  overflow: auto;
+  border: 1px solid var(--hermes-border, rgba(255, 255, 255, 0.06));
+  border-radius: 0.4rem;
+}
+
+.hermes-console-backlog {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.hermes-console-backlog thead th {
+  text-align: left;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--hermes-text-muted, #8b8b8b);
+  padding: 0.4rem 0.5rem;
+  border-bottom: 1px solid var(--hermes-border, rgba(255, 255, 255, 0.08));
+  position: sticky;
+  top: 0;
+  background: var(--hermes-bg-elevated, rgba(0, 0, 0, 0.4));
+  z-index: 1;
+}
+
+.hermes-console-backlog tbody tr {
+  cursor: pointer;
+  border-bottom: 1px solid var(--hermes-border, rgba(255, 255, 255, 0.04));
+  transition: background 0.08s ease-in;
+}
+
+.hermes-console-backlog tbody tr:hover {
+  background: var(--hermes-bg-hover, rgba(255, 255, 255, 0.04));
+}
+
+.hermes-console-backlog-row--selected {
+  background: var(--hermes-bg-selected, rgba(108, 192, 255, 0.12)) !important;
+}
+
+.hermes-console-backlog td {
+  padding: 0.4rem 0.5rem;
+  vertical-align: top;
+}
+
+.hermes-console-backlog-title-text {
+  font-weight: 500;
+}
+
+.hermes-console-backlog-body-preview {
+  font-size: 0.75rem;
+  color: var(--hermes-text-muted, #8b8b8b);
+  margin-top: 0.15rem;
+  max-width: 60ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hermes-console-backlog-flags {
+  display: flex;
+  gap: 0.25rem;
+  flex-wrap: wrap;
+}
+
+.hermes-console-board-slug {
+  font-family: var(--hermes-font-mono, ui-monospace, SFMono-Regular, monospace);
+  font-size: 0.75rem;
+  color: var(--hermes-text-muted, #8b8b8b);
+}
+
+.hermes-console-status-badge {
+  font-size: 0.7rem;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.hermes-console-priority-chip {
+  font-size: 0.7rem;
+}
+
+.hermes-console-stale-flag,
+.hermes-console-keith-flag {
+  font-size: 0.7rem;
+}
+
+/* -------------------------------------------------------------------------
+ * 6. Board view
+ * -------------------------------------------------------------------------
+ */
+
+.hermes-console-board {
+  display: grid;
+  grid-template-columns: repeat(8, minmax(180px, 1fr));
+  gap: 0.5rem;
+  overflow-x: auto;
+  min-height: 0;
+}
+
+.hermes-console-board-col {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--hermes-bg-elevated, rgba(255, 255, 255, 0.02));
+  border: 1px solid var(--hermes-border, rgba(255, 255, 255, 0.08));
+  border-radius: 0.4rem;
+  padding: 0.5rem;
+  min-width: 180px;
+}
+
+.hermes-console-board-col-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.4rem;
+  font-size: 0.75rem;
+}
+
+.hermes-console-board-col-count {
+  color: var(--hermes-text-muted, #8b8b8b);
+  font-size: 0.75rem;
+}
+
+.hermes-console-board-col-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  overflow-y: auto;
+  min-height: 2rem;
+}
+
+.hermes-console-board-col-empty {
+  color: var(--hermes-text-muted, #8b8b8b);
+  text-align: center;
+  padding: 0.5rem 0;
+  font-style: italic;
+}
+
+.hermes-console-card {
+  background: var(--hermes-bg, rgba(255, 255, 255, 0.04));
+  border: 1px solid var(--hermes-border, rgba(255, 255, 255, 0.06));
+  border-radius: 0.4rem;
+  padding: 0.5rem 0.6rem;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  transition: background 0.08s ease-in, border-color 0.08s ease-in;
+}
+
+.hermes-console-card:hover {
+  background: var(--hermes-bg-hover, rgba(255, 255, 255, 0.07));
+  border-color: var(--hermes-border-strong, rgba(255, 255, 255, 0.15));
+}
+
+.hermes-console-card--selected {
+  border-color: var(--hermes-accent, #6cf);
+  background: var(--hermes-bg-selected, rgba(108, 192, 255, 0.1));
+}
+
+.hermes-console-card-title {
+  font-size: 0.85rem;
+  font-weight: 500;
+  line-height: 1.3;
+}
+
+.hermes-console-card-meta {
+  display: flex;
+  gap: 0.4rem;
+  align-items: baseline;
+  font-size: 0.7rem;
+  color: var(--hermes-text-muted, #8b8b8b);
+}
+
+.hermes-console-card-role {
+  font-family: var(--hermes-font-mono, ui-monospace, SFMono-Regular, monospace);
+}
+
+.hermes-console-card-flags {
+  display: flex;
+  gap: 0.25rem;
+  flex-wrap: wrap;
+}
+
+.hermes-console-card-preview {
+  font-size: 0.75rem;
+  color: var(--hermes-text-muted, #8b8b8b);
+  margin-top: 0.2rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+/* -------------------------------------------------------------------------
+ * 7. Detail drawer
+ * -------------------------------------------------------------------------
+ */
+
+.hermes-console-detail {
+  background: var(--hermes-bg-elevated, rgba(255, 255, 255, 0.02));
+  border: 1px solid var(--hermes-border, rgba(255, 255, 255, 0.08));
+  border-radius: 0.4rem;
+  padding: 0.5rem 0.75rem;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: auto;
+  gap: 0.4rem;
+}
+
+.hermes-console-detail--empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.hermes-console-detail-empty {
+  color: var(--hermes-text-muted, #8b8b8b);
+  font-style: italic;
+  padding: 1rem;
+}
+
+.hermes-console-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--hermes-border, rgba(255, 255, 255, 0.06));
+  padding-bottom: 0.4rem;
+  margin-bottom: 0.4rem;
+}
+
+.hermes-console-detail-id {
+  font-family: var(--hermes-font-mono, ui-monospace, SFMono-Regular, monospace);
+  font-size: 0.75rem;
+  color: var(--hermes-text-muted, #8b8b8b);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 18rem;
+}
+
+.hermes-console-detail-title {
+  font-size: 1.05rem;
+  font-weight: 600;
+  margin: 0;
+}
+
+.hermes-console-meta-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+
+.hermes-console-meta-table th {
+  text-align: left;
+  width: 8rem;
+  color: var(--hermes-text-muted, #8b8b8b);
+  font-weight: 500;
+  padding: 0.2rem 0.4rem;
+  vertical-align: top;
+  border-bottom: 1px dashed var(--hermes-border, rgba(255, 255, 255, 0.06));
+}
+
+.hermes-console-meta-table td {
+  padding: 0.2rem 0.4rem;
+  border-bottom: 1px dashed var(--hermes-border, rgba(255, 255, 255, 0.06));
+}
+
+.hermes-console-tag-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+
+.hermes-console-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.4rem;
+}
+
+.hermes-console-action-disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.hermes-console-action-note {
+  font-size: 0.75rem;
+  color: var(--hermes-text-muted, #8b8b8b);
+  margin: 0;
+}
+
+.hermes-console-description {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  font-size: 0.85rem;
+  margin: 0;
+  padding: 0.4rem 0.5rem;
+  background: var(--hermes-bg, rgba(0, 0, 0, 0.15));
+  border-radius: 0.3rem;
+  max-height: 14rem;
+  overflow: auto;
+}
+
+.hermes-console-link-group h4 {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--hermes-text-muted, #8b8b8b);
+  margin: 0.4rem 0 0.2rem;
+}
+
+.hermes-console-link-group ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-family: var(--hermes-font-mono, ui-monospace, SFMono-Regular, monospace);
+  font-size: 0.8rem;
+}
+
+.hermes-console-link-group li {
+  padding: 0.15rem 0;
+}
+
+.hermes-console-hierarchy-path {
+  margin-top: 0.5rem;
+}
+
+.hermes-console-hierarchy-path h4 {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--hermes-text-muted, #8b8b8b);
+  margin: 0.4rem 0 0.2rem;
+}
+
+.hermes-console-hierarchy-path ol {
+  list-style: decimal;
+  padding-left: 1.25rem;
+  margin: 0;
+  font-family: var(--hermes-font-mono, ui-monospace, SFMono-Regular, monospace);
+  font-size: 0.8rem;
+}
+
+.hermes-console-attachments,
+.hermes-console-comments,
+.hermes-console-events,
+.hermes-console-runs,
+.hermes-console-approvals {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.hermes-console-attachment {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 0.3rem 0.5rem;
+  background: var(--hermes-bg, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--hermes-border, rgba(255, 255, 255, 0.06));
+  border-radius: 0.3rem;
+  font-size: 0.8rem;
+}
+
+.hermes-console-attachment-name {
+  font-weight: 500;
+}
+
+.hermes-console-attachment-meta {
+  color: var(--hermes-text-muted, #8b8b8b);
+  font-size: 0.7rem;
+}
+
+.hermes-console-comment {
+  border: 1px solid var(--hermes-border, rgba(255, 255, 255, 0.06));
+  border-radius: 0.3rem;
+  padding: 0.4rem 0.5rem;
+  background: var(--hermes-bg, rgba(255, 255, 255, 0.03));
+}
+
+.hermes-console-comment-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.75rem;
+  color: var(--hermes-text-muted, #8b8b8b);
+  margin-bottom: 0.2rem;
+}
+
+.hermes-console-comment-author {
+  font-weight: 500;
+  color: var(--hermes-text, inherit);
+}
+
+.hermes-console-comment-body {
+  font-family: inherit;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+  max-height: 12rem;
+  overflow: auto;
+}
+
+.hermes-console-comment-body--redacted {
+  color: var(--hermes-warning-fg, #ffb400);
+  font-style: italic;
+}
+
+.hermes-console-event,
+.hermes-console-run {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding: 0.3rem 0.5rem;
+  background: var(--hermes-bg, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--hermes-border, rgba(255, 255, 255, 0.06));
+  border-radius: 0.3rem;
+  font-size: 0.8rem;
+}
+
+.hermes-console-event-head,
+.hermes-console-run-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.hermes-console-event-kind,
+.hermes-console-run-profile {
+  font-weight: 500;
+}
+
+.hermes-console-event-when {
+  color: var(--hermes-text-muted, #8b8b8b);
+  font-size: 0.7rem;
+}
+
+.hermes-console-event-payload,
+.hermes-console-run-summary,
+.hermes-console-run-error {
+  font-family: var(--hermes-font-mono, ui-monospace, SFMono-Regular, monospace);
+  font-size: 0.75rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+  padding: 0.25rem 0.4rem;
+  background: var(--hermes-bg-elevated, rgba(0, 0, 0, 0.2));
+  border-radius: 0.25rem;
+  max-height: 8rem;
+  overflow: auto;
+}
+
+.hermes-console-run-error {
+  color: var(--hermes-error-fg, #f88);
+}
+
+.hermes-console-approval {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.3rem 0.5rem;
+  background: var(--hermes-bg, rgba(255, 255, 255, 0.03));
+  border: 1px solid var(--hermes-border, rgba(255, 255, 255, 0.06));
+  border-radius: 0.3rem;
+  font-size: 0.8rem;
+}
+
+.hermes-console-approval-type {
+  font-weight: 500;
+}
+
+.hermes-console-approval-status {
+  color: var(--hermes-text-muted, #8b8b8b);
+}
+
+.hermes-console-composer-placeholder {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  align-items: flex-start;
+}
+
+.hermes-console-detail-footer {
+  margin-top: 0.5rem;
+  padding-top: 0.4rem;
+  border-top: 1px solid var(--hermes-border, rgba(255, 255, 255, 0.06));
+  font-size: 0.7rem;
+  color: var(--hermes-text-muted, #8b8b8b);
+}
+
+.hermes-console-detail-footer code {
+  word-break: break-all;
+}
+
+/* -------------------------------------------------------------------------
+ * 8. Hermes-style collapsible sections
+ * -------------------------------------------------------------------------
+ *
+ * The head is a clickable button-shaped row; the body collapses to
+ * height: 0 when closed. This pattern matches the kanban plugin's
+ * detail drawer so the two surfaces feel like one operator console.
+ */
+
+.hermes-console-section {
+  border-bottom: 1px solid var(--hermes-border, rgba(255, 255, 255, 0.06));
+  padding: 0.3rem 0;
+}
+
+.hermes-console-section-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+  user-select: none;
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--hermes-text-muted, #8b8b8b);
+  padding: 0.2rem 0;
+}
+
+.hermes-console-section-head:hover {
+  color: var(--hermes-text, inherit);
+}
+
+.hermes-console-section-toggle {
+  font-size: 0.7rem;
+  width: 0.9rem;
+  display: inline-block;
+  text-align: center;
+}
+
+.hermes-console-section-title {
+  flex: 1 1 auto;
+}
+
+.hermes-console-section-meta {
+  font-size: 0.7rem;
+  color: var(--hermes-text-muted, #8b8b8b);
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+}
+
+.hermes-console-section-body {
+  padding: 0.4rem 0 0.4rem 1.3rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.hermes-console-section--collapsed .hermes-console-section-body {
+  display: none;
+}
+
+/* -------------------------------------------------------------------------
+ * 9. Code/pre reset
+ * -------------------------------------------------------------------------
+ *
+ * Themes ship a global accent fill on <code> and <pre>. Reset
+ * transparently inside the plugin container so safe-preview payloads,
+ * event payloads, run summaries, and code chips read as plain text on
+ * the plugin's own background. Reuse the same pattern the kanban
+ * plugin uses to stay theme-immune.
+ */
+
+.hermes-console-root code,
+.hermes-console-root pre,
+.hermes-console-detail code,
+.hermes-console-detail pre {
+  background: transparent !important;
+  color: inherit;
+  font-family: var(--hermes-font-mono, ui-monospace, SFMono-Regular, monospace);
+}
+
+.hermes-console-root pre,
+.hermes-console-detail pre {
+  background: var(--hermes-bg-elevated, rgba(0, 0, 0, 0.18)) !important;
+  padding: 0.25rem 0.4rem;
+  border-radius: 0.25rem;
+  overflow: auto;
+}
+
+/* -------------------------------------------------------------------------
+ * Responsive: collapse to single column on narrow screens
+ * -------------------------------------------------------------------------
+ */
+
+@media (max-width: 1100px) {
+  .hermes-console-body {
+    grid-template-columns: 1fr;
+  }
+  .hermes-console-hierarchy,
+  .hermes-console-detail {
+    min-height: 6rem;
+  }
+  .hermes-console-board {
+    grid-template-columns: repeat(4, minmax(180px, 1fr));
+  }
+}
+
+@media (max-width: 700px) {
+  .hermes-console-board {
+    grid-template-columns: repeat(2, minmax(180px, 1fr));
+  }
+}
