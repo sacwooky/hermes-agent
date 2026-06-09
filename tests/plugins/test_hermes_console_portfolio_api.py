@@ -573,6 +573,174 @@ def test_item_detail_redacts_pem_block_in_comment(client, isolated_home):
 
 
 # ---------------------------------------------------------------------------
+# V1.1 task_metadata read model
+# ---------------------------------------------------------------------------
+
+
+def test_item_metadata_defaults_when_no_row_exists(
+    client, seeded_default_board,
+):
+    """Tasks with no task_metadata row show V1.0 defaults.
+
+    The read model must fall back to ``"unclassified"`` / ``None`` /
+    ``None`` / ``[]`` so the V1.0 contract is preserved for boards
+    that have not yet classified a card.
+    """
+    target = seeded_default_board[0]
+    r = client.get(
+        f"/api/plugins/hermes-console/portfolio/item/default/{target['id']}"
+    )
+    assert r.status_code == 200
+    meta = r.json()["metadata"]
+    assert meta["work_item_type"] == "unclassified"
+    assert meta["lifecycle_state"] is None
+    assert meta["agent_profile"] is None
+    assert meta["tags"] == []
+
+
+def test_item_metadata_reads_from_task_metadata_row(
+    client, isolated_home, seeded_default_board,
+):
+    """When a task_metadata row exists, its values appear in the API.
+
+    Writes via ``upsert_task_metadata`` (T02 helper) and confirms the
+    list + detail endpoints both surface the canonical values. This is
+    the V1.1 acceptance: ``work_item_type`` / ``lifecycle_state`` /
+    ``agent_profile`` / ``tags`` come from the table, not the old
+    hardcoded stubs.
+    """
+    target = seeded_default_board[1]  # "Investigation in progress"
+    kb.upsert_task_metadata(
+        target["id"],
+        work_item_type="epic",
+        lifecycle_state="customer-ready",
+        agent_profile="builder",
+        tags=["portfolio-v1.1", "regression"],
+    )
+
+    # Detail endpoint surfaces the metadata block.
+    r = client.get(
+        f"/api/plugins/hermes-console/portfolio/item/default/{target['id']}"
+    )
+    assert r.status_code == 200
+    detail = r.json()
+    assert detail["metadata"]["work_item_type"] == "epic"
+    assert detail["metadata"]["lifecycle_state"] == "customer-ready"
+    assert detail["metadata"]["agent_profile"] == "builder"
+    assert detail["metadata"]["tags"] == ["portfolio-v1.1", "regression"]
+
+    # List endpoint surfaces the same values on the item dict.
+    r = client.get("/api/plugins/hermes-console/portfolio/items")
+    assert r.status_code == 200
+    item = next(
+        it for it in r.json()["items"] if it["task_id"] == target["id"]
+    )
+    assert item["work_item_type"] == "epic"
+    assert item["lifecycle_state"] == "customer-ready"
+    assert item["agent_profile"] == "builder"
+    assert item["tags"] == ["portfolio-v1.1", "regression"]
+
+
+def test_item_metadata_partial_row_uses_defaults_for_missing_fields(
+    client, isolated_home, seeded_default_board,
+):
+    """A row that only sets ``work_item_type`` leaves the others at V1.0.
+
+    Mirrors the upsert partial-merge contract: callers may set one
+    field and leave the rest to fall back to defaults. The read model
+    must reflect that — it must not lift defaults to ``unclassified``
+    or any other non-default sentinel.
+    """
+    target = seeded_default_board[2]  # "Blocked on auth"
+    kb.upsert_task_metadata(target["id"], work_item_type="story")
+
+    r = client.get(
+        f"/api/plugins/hermes-console/portfolio/item/default/{target['id']}"
+    )
+    assert r.status_code == 200
+    meta = r.json()["metadata"]
+    assert meta["work_item_type"] == "story"
+    assert meta["lifecycle_state"] is None
+    assert meta["agent_profile"] is None
+    assert meta["tags"] == []
+
+
+def test_read_task_metadata_helper_defaults(plugin_module):
+    """``_read_task_metadata`` returns the V1.0 defaults on a closed conn.
+
+    The helper is called by ``_item_to_public`` which already holds a
+    connection. With no row present, the helper must return the same
+    shape ``_item_to_public`` expects — we exercise the miss path on
+    a hermetic in-memory DB so the test does not depend on
+    ``HERMES_HOME``.
+    """
+    import sqlite3
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    try:
+        # The helper runs a SELECT on task_metadata, so the table must
+        # exist even on the miss path. The shape mirrors kanban_db's
+        # T01 schema (only the columns the helper reads).
+        conn.execute(
+            "CREATE TABLE task_metadata ("
+            "    task_id TEXT PRIMARY KEY,"
+            "    work_item_type TEXT NOT NULL DEFAULT 'unclassified',"
+            "    lifecycle_state TEXT,"
+            "    agent_profile TEXT,"
+            "    tags_json TEXT NOT NULL DEFAULT '[]'"
+            ")"
+        )
+        result = plugin_module._read_task_metadata(conn, "t_no_such_row")
+    finally:
+        conn.close()
+    assert result == {
+        "work_item_type": "unclassified",
+        "lifecycle_state": None,
+        "agent_profile": None,
+        "tags": [],
+    }
+
+
+def test_read_task_metadata_helper_tolerates_corrupt_tags_json(
+    plugin_module,
+):
+    """A corrupt ``tags_json`` falls back to ``[]`` rather than raising.
+
+    The T02 helper already tolerates corrupt JSON, but the plugin's
+    read path is a second line of defence (it parses tags again to
+    avoid an extra hop). A broken row must not 500 the dashboard.
+    """
+    import sqlite3
+    # Build a throwaway DB shaped like task_metadata with one corrupt
+    # row, so we exercise the parse / fallback path.
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute(
+            "CREATE TABLE task_metadata ("
+            "    task_id TEXT PRIMARY KEY,"
+            "    work_item_type TEXT NOT NULL DEFAULT 'unclassified',"
+            "    lifecycle_state TEXT,"
+            "    agent_profile TEXT,"
+            "    tags_json TEXT NOT NULL DEFAULT '[]'"
+            ")"
+        )
+        conn.execute(
+            "INSERT INTO task_metadata (task_id, work_item_type, "
+            "lifecycle_state, agent_profile, tags_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("t_corrupt", "epic", "demo-ready", "builder", "not-json{"),
+        )
+        result = plugin_module._read_task_metadata(conn, "t_corrupt")
+    finally:
+        conn.close()
+    assert result["work_item_type"] == "epic"
+    assert result["lifecycle_state"] == "demo-ready"
+    assert result["agent_profile"] == "builder"
+    assert result["tags"] == []
+
+
+# ---------------------------------------------------------------------------
 # /events
 # ---------------------------------------------------------------------------
 
