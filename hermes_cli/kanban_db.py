@@ -97,7 +97,17 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {
+    "triage",
+    "todo",
+    "scheduled",
+    "ready",
+    "running",
+    "blocked",
+    "review",
+    "done",
+    "archived",
+}
 
 
 class PacketBeforeDispatchError(RuntimeError):
@@ -205,9 +215,7 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
     the next tick) — useful for tests that want to assert the task becomes
     spawnable again immediately.
     """
-    raw = os.environ.get(
-        "HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", ""
-    ).strip()
+    raw = os.environ.get("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "").strip()
     if raw:
         try:
             parsed = int(raw)
@@ -223,11 +231,11 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
 # summaries). Values chosen to fit a typical 100k-char LLM prompt with
 # plenty of headroom. Each constant is tuned independently so users
 # who need to relax one don't have to relax all of them.
-_CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
-_CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
-_CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
-_CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
-_CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
+_CTX_MAX_PRIOR_ATTEMPTS = 10  # most recent N prior runs shown in full
+_CTX_MAX_COMMENTS = 30  # most recent N comments shown in full
+_CTX_MAX_FIELD_BYTES = 4 * 1024  # 4 KB per summary/error/metadata/result
+_CTX_MAX_BODY_BYTES = 8 * 1024  # 8 KB per task.body (opening post)
+_CTX_MAX_COMMENT_BYTES = 2 * 1024  # 2 KB per comment
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +257,7 @@ def scoped_current_board(slug: str):
         yield
     finally:
         _CURRENT_BOARD_OVERRIDE.reset(token)
+
 
 # Slug validator: lowercase alphanumerics, digits, hyphens; 1–64 chars.
 # Strict enough to stop traversal (`..`) and embedded path separators, loose
@@ -293,6 +302,7 @@ def kanban_home() -> Path:
     if override:
         return Path(override).expanduser()
     from hermes_constants import get_default_hermes_root
+
     return get_default_hermes_root()
 
 
@@ -534,7 +544,12 @@ def _default_board_display_name(slug: str) -> str:
     ``board.json`` but the default should look presentable in the
     dashboard without any follow-up editing.
     """
-    return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
+    return (
+        " ".join(
+            part.capitalize() for part in slug.replace("_", "-").split("-") if part
+        )
+        or slug
+    )
 
 
 def read_board_metadata(board: Optional[str] = None) -> dict:
@@ -733,6 +748,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         return {"slug": normed, "action": "archived", "new_path": str(target)}
     else:
         import shutil
+
         shutil.rmtree(d)
         return {"slug": normed, "action": "deleted", "new_path": ""}
 
@@ -740,6 +756,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class Task:
@@ -844,9 +861,12 @@ class Task:
             claim_expires=row["claim_expires"],
             tenant=row["tenant"] if "tenant" in keys else None,
             result=row["result"] if "result" in keys else None,
-            idempotency_key=row["idempotency_key"] if "idempotency_key" in keys else None,
+            idempotency_key=row["idempotency_key"]
+            if "idempotency_key" in keys
+            else None,
             consecutive_failures=(
-                row["consecutive_failures"] if "consecutive_failures" in keys
+                row["consecutive_failures"]
+                if "consecutive_failures" in keys
                 # Pre-migration fallback: ``_migrate_add_optional_columns`` always
                 # adds ``consecutive_failures`` now, so this branch is only reachable
                 # on a DB that was never opened since pre-#20410 code ran. Keep for
@@ -855,7 +875,8 @@ class Task:
             ),
             worker_pid=row["worker_pid"] if "worker_pid" in keys else None,
             last_failure_error=(
-                row["last_failure_error"] if "last_failure_error" in keys
+                row["last_failure_error"]
+                if "last_failure_error" in keys
                 # Same belt-and-suspenders fallback as consecutive_failures above.
                 else (row["last_spawn_error"] if "last_spawn_error" in keys else None)
             ),
@@ -875,19 +896,21 @@ class Task:
                 row["current_step_key"] if "current_step_key" in keys else None
             ),
             skills=skills_value,
-            model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
-            max_retries=(
-                row["max_retries"] if "max_retries" in keys else None
-            ),
+            model_override=row["model_override"]
+            if "model_override" in keys and row["model_override"]
+            else None,
+            max_retries=(row["max_retries"] if "max_retries" in keys else None),
             goal_mode=(
-                bool(row["goal_mode"]) if "goal_mode" in keys and row["goal_mode"] else False
+                bool(row["goal_mode"])
+                if "goal_mode" in keys and row["goal_mode"]
+                else False
             ),
             goal_max_turns=(
-                row["goal_max_turns"] if "goal_max_turns" in keys and row["goal_max_turns"] else None
+                row["goal_max_turns"]
+                if "goal_max_turns" in keys and row["goal_max_turns"]
+                else None
             ),
-            session_id=(
-                row["session_id"] if "session_id" in keys else None
-            ),
+            session_id=(row["session_id"] if "session_id" in keys else None),
         )
 
 
@@ -1147,6 +1170,32 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
+-- Portfolio task metadata (V1.1). Augments ``tasks`` with work-item type,
+-- lifecycle state, owning fleet agent profile, tags, and an open-ended
+-- JSON blob. Keyed by ``task_id`` (1:1 with ``tasks.id``) so the read
+-- model can fall back to a safe default when the row is missing: tasks
+-- without a ``task_metadata`` row are treated as ``work_item_type =
+-- 'unclassified'`` with ``lifecycle_state = NULL``, ``agent_profile =
+-- NULL``, ``tags = []``. That fallback is the V1.0 read-model behaviour
+-- the Portfolio already implements, so adding this table is a
+-- zero-regression change for boards that have not yet classified a
+-- card. See PORTFOLIO_BOARD_T9_METADATA_APPROVAL_STORAGE_DESIGN_2026-06-04
+-- §3.1 for the design rationale.
+CREATE TABLE IF NOT EXISTS task_metadata (
+    task_id          TEXT NOT NULL,
+    work_item_type   TEXT NOT NULL DEFAULT 'unclassified',
+    lifecycle_state   TEXT,
+    agent_profile     TEXT,
+    tags_json         TEXT NOT NULL DEFAULT '[]',
+    metadata_json     TEXT,
+    updated_at        INTEGER NOT NULL,
+    updated_by        TEXT,
+    PRIMARY KEY (task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_metadata_type      ON task_metadata(work_item_type);
+CREATE INDEX IF NOT EXISTS idx_metadata_lifecycle ON task_metadata(lifecycle_state);
+CREATE INDEX IF NOT EXISTS idx_metadata_agent     ON task_metadata(agent_profile);
 """
 
 
@@ -1249,7 +1298,7 @@ def _looks_like_tls_record_at(data: bytes, offset: int) -> bool:
     content_type = data[offset]
     major = data[offset + 1]
     minor = data[offset + 2]
-    length = int.from_bytes(data[offset + 3:offset + 5], "big")
+    length = int.from_bytes(data[offset + 3 : offset + 5], "big")
     return (
         content_type in {0x14, 0x15, 0x16, 0x17}
         and major == 0x03
@@ -1473,6 +1522,7 @@ def connect(
                 # falls back to DELETE with one WARNING so kanban stays usable there.
                 # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
                 from hermes_state import apply_wal_with_fallback
+
                 apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
                 # FULL (was NORMAL): fsync before each checkpoint to narrow the
                 # crash window that can leave a b-tree page header torn.
@@ -1494,6 +1544,7 @@ def connect(
                     # stale PRAGMA snapshots during gateway startup.
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
+                    _run_additive_migrations(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -1598,9 +1649,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "branch_name" not in cols:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
     if "idempotency_key" not in cols:
-        _add_column_if_missing(
-            conn, "tasks", "idempotency_key", "idempotency_key TEXT"
-        )
+        _add_column_if_missing(conn, "tasks", "idempotency_key", "idempotency_key TEXT")
     # ``idx_tasks_idempotency`` is created unconditionally below alongside
     # the other additive-column indexes — see the block after the
     # legacy-column migration. Creating it here too would be redundant.
@@ -1642,9 +1691,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "last_failure_error", "last_failure_error TEXT"
         )
         if added and "last_spawn_error" in cols:
-            conn.execute(
-                "UPDATE tasks SET last_failure_error = last_spawn_error"
-            )
+            conn.execute("UPDATE tasks SET last_failure_error = last_spawn_error")
     if "max_runtime_seconds" not in cols:
         _add_column_if_missing(
             conn, "tasks", "max_runtime_seconds", "max_runtime_seconds INTEGER"
@@ -1701,9 +1748,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # created from within an agent loop that propagated
         # ``HERMES_SESSION_ID`` (e.g. ACP). NULL on legacy rows and on any
         # creation path that doesn't set the env var (CLI, dashboard).
-        _add_column_if_missing(
-            conn, "tasks", "session_id", "session_id TEXT"
-        )
+        _add_column_if_missing(conn, "tasks", "session_id", "session_id TEXT")
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -1716,9 +1761,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)"
     )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
-    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)")
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -1729,14 +1772,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # Same ordering rule as the additive ``tasks`` indexes above: create the
     # index after the additive column migration so legacy ``task_events``
     # tables don't fail during SCHEMA_SQL execution before ``run_id`` exists.
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_events_run "
-        "ON task_events(run_id, id)"
-    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_run ON task_events(run_id, id)")
 
-    notify_table_exists = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
-    ).fetchone() is not None
+    notify_table_exists = (
+        conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
+        ).fetchone()
+        is not None
+    )
     if notify_table_exists:
         notify_cols = {
             row["name"] for row in conn.execute("PRAGMA table_info(kanban_notify_subs)")
@@ -1753,9 +1796,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # against any concurrent dispatcher, and the per-row UPDATE uses
     # ``current_run_id IS NULL`` as a CAS guard so a racing claim can't
     # produce an orphaned row if it interleaves with the backfill pass.
-    runs_exist = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
-    ).fetchone() is not None
+    runs_exist = (
+        conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
+        ).fetchone()
+        is not None
+    )
     if runs_exist:
         with write_txn(conn):
             inflight = conn.execute(
@@ -1776,9 +1822,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                     ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        row["id"], row["assignee"], row["claim_lock"],
-                        row["claim_expires"], row["worker_pid"],
-                        row["max_runtime_seconds"], row["last_heartbeat_at"],
+                        row["id"],
+                        row["assignee"],
+                        row["claim_lock"],
+                        row["claim_expires"],
+                        row["worker_pid"],
+                        row["max_runtime_seconds"],
+                        row["last_heartbeat_at"],
                         started,
                     ),
                 )
@@ -1806,8 +1856,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # per DB because after the UPDATE no rows match the old kinds.
     _EVENT_RENAMES = (
         # (old, new)
-        ("ready",              "promoted"),
-        ("priority",           "reprioritized"),
+        ("ready", "promoted"),
+        ("priority", "reprioritized"),
         ("spawn_auto_blocked", "gave_up"),
     )
     for old, new in _EVENT_RENAMES:
@@ -1817,6 +1867,59 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+
+
+def _run_additive_migrations(conn: sqlite3.Connection) -> None:
+    """Run idempotent structural migrations (V1.1+).
+
+    Mirrors the role of :func:`_migrate_add_optional_columns` but for
+    whole-table additions instead of column-level backfills. SCHEMA_SQL
+    already creates every table on a fresh DB, so on a fresh database
+    this function is a no-op (the ``IF NOT EXISTS`` guards fire and the
+    indexes already exist). On a legacy board that pre-dates the V1.1
+    Portfolio work, opening the board via :func:`connect` triggers this
+    pass and the table appears with zero data loss and zero schema
+    conflict. The function is safe to call multiple times: every
+    statement uses ``CREATE … IF NOT EXISTS``.
+
+    See PORTFOLIO_BOARD_T9_METADATA_APPROVAL_STORAGE_DESIGN_2026-06-04
+    §3.1 for the design rationale and the "no row = unclassified" read
+    model the table sits on top of.
+    """
+    # task_metadata — Portfolio V1.1 (T01 in the V1.1 phase-A plan).
+    # The full DDL matches SCHEMA_SQL so a fresh DB and a migrated legacy
+    # DB are byte-identical (test_rebuilt_schema_matches_fresh_db style
+    # guarantees stay valid for the V1.0 tables; the V1.1 addition has
+    # no V1.0 counterpart to drift from).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS task_metadata (
+            task_id          TEXT NOT NULL,
+            work_item_type   TEXT NOT NULL DEFAULT 'unclassified',
+            lifecycle_state   TEXT,
+            agent_profile     TEXT,
+            tags_json         TEXT NOT NULL DEFAULT '[]',
+            metadata_json     TEXT,
+            updated_at        INTEGER NOT NULL,
+            updated_by        TEXT,
+            PRIMARY KEY (task_id)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_metadata_type ON task_metadata(work_item_type)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_metadata_lifecycle "
+        "ON task_metadata(lifecycle_state)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_metadata_agent ON task_metadata(agent_profile)"
+    )
+    # task_approvals is reserved for a later V1.1 card (T07+). The
+    # SCHEMA_SQL block intentionally does not include it yet so the
+    # additive migration that introduces it lands as a single atomic
+    # change in that card's commit.
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -2025,6 +2128,7 @@ def write_txn(conn: sqlite3.Connection):
 # ID generation
 # ---------------------------------------------------------------------------
 
+
 def _new_task_id() -> str:
     """Generate a short, URL-safe task id.
 
@@ -2041,6 +2145,7 @@ def _new_task_id() -> str:
 def _claimer_id() -> str:
     """Return a ``host:pid`` string that identifies this claimer."""
     import socket
+
     try:
         host = socket.gethostname() or "unknown"
     except Exception:
@@ -2051,6 +2156,7 @@ def _claimer_id() -> str:
 # ---------------------------------------------------------------------------
 # Task creation / mutation
 # ---------------------------------------------------------------------------
+
 
 def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     """Lowercase-assignee normalization for Kanban rows (dashboard/CLI parity)."""
@@ -2162,7 +2268,9 @@ def create_task(
             cleaned.append(name)
         if toolset_typos:
             quoted = ", ".join(repr(n) for n in toolset_typos)
-            noun = "is a toolset name" if len(toolset_typos) == 1 else "are toolset names"
+            noun = (
+                "is a toolset name" if len(toolset_typos) == 1 else "are toolset names"
+            )
             raise ValueError(
                 f"{quoted} {noun}, not skill name(s). "
                 "Put toolsets in the assignee profile's `toolsets:` config "
@@ -2218,7 +2326,9 @@ def create_task(
                     if parents:
                         missing = _find_missing_parents(conn, parents)
                         if missing:
-                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                            raise ValueError(
+                                f"unknown parent task(s): {', '.join(missing)}"
+                            )
                 elif triage:
                     task_status = "triage"
                 else:
@@ -2226,7 +2336,9 @@ def create_task(
                     if parents:
                         missing = _find_missing_parents(conn, parents)
                         if missing:
-                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                            raise ValueError(
+                                f"unknown parent task(s): {', '.join(missing)}"
+                            )
                         # If any parent is not yet done, we're todo.
                         rows = conn.execute(
                             "SELECT status FROM tasks WHERE id IN "
@@ -2240,7 +2352,9 @@ def create_task(
                 if triage and parents:
                     missing = _find_missing_parents(conn, parents)
                     if missing:
-                        raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                        raise ValueError(
+                            f"unknown parent task(s): {', '.join(missing)}"
+                        )
 
                 conn.execute(
                     """
@@ -2265,7 +2379,9 @@ def create_task(
                         branch_name,
                         tenant,
                         idempotency_key,
-                        int(max_runtime_seconds) if max_runtime_seconds is not None else None,
+                        int(max_runtime_seconds)
+                        if max_runtime_seconds is not None
+                        else None,
                         json.dumps(skills_list) if skills_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
                         1 if goal_mode else 0,
@@ -2301,7 +2417,9 @@ def create_task(
     raise RuntimeError("unreachable")
 
 
-def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:
+def _find_missing_parents(
+    conn: sqlite3.Connection, parents: Iterable[str]
+) -> list[str]:
     parents = list(parents)
     if not parents:
         return []
@@ -2413,7 +2531,9 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 (profile, task_id),
             )
         else:
-            conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
+            conn.execute(
+                "UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id)
+            )
         _append_event(conn, task_id, "assigned", {"assignee": profile})
         return True
 
@@ -2421,6 +2541,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
 # ---------------------------------------------------------------------------
 # Links
 # ---------------------------------------------------------------------------
+
 
 def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
     if parent_id == child_id:
@@ -2430,9 +2551,7 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
         if _would_cycle(conn, parent_id, child_id):
-            raise ValueError(
-                f"linking {parent_id} -> {child_id} would create a cycle"
-            )
+            raise ValueError(f"linking {parent_id} -> {child_id} would create a cycle")
         conn.execute(
             "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
             (parent_id, child_id),
@@ -2447,7 +2566,9 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
                 (child_id,),
             )
         _append_event(
-            conn, child_id, "linked",
+            conn,
+            child_id,
+            "linked",
             {"parent": parent_id, "child": child_id},
         )
 
@@ -2483,7 +2604,9 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
         )
         if cur.rowcount:
             _append_event(
-                conn, child_id, "unlinked",
+                conn,
+                child_id,
+                "unlinked",
                 {"parent": parent_id, "child": child_id},
             )
         removed = cur.rowcount > 0
@@ -2512,7 +2635,9 @@ def child_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     return [r["child_id"] for r in rows]
 
 
-def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Optional[str]]]:
+def parent_results(
+    conn: sqlite3.Connection, task_id: str
+) -> list[tuple[str, Optional[str]]]:
     """Return ``(parent_id, result)`` for every done parent of ``task_id``."""
     rows = conn.execute(
         """
@@ -2531,18 +2656,15 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # Comments & events
 # ---------------------------------------------------------------------------
 
-def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
-) -> int:
+
+def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
     now = int(time.time())
     with write_txn(conn):
-        if not conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone():
+        if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
             raise ValueError(f"unknown task {task_id}")
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
@@ -2574,6 +2696,7 @@ def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
 # Attachments
 # ---------------------------------------------------------------------------
 
+
 def add_attachment(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2596,9 +2719,7 @@ def add_attachment(
         raise ValueError("attachment stored_path is required")
     now = int(time.time())
     with write_txn(conn):
-        if not conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone():
+        if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
             raise ValueError(f"unknown task {task_id}")
         cur = conn.execute(
             "INSERT INTO task_attachments "
@@ -2643,7 +2764,9 @@ def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]
     ]
 
 
-def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Attachment]:
+def get_attachment(
+    conn: sqlite3.Connection, attachment_id: int
+) -> Optional[Attachment]:
     r = conn.execute(
         "SELECT * FROM task_attachments WHERE id = ?", (attachment_id,)
     ).fetchone()
@@ -2661,7 +2784,9 @@ def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Att
     )
 
 
-def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Attachment]:
+def delete_attachment(
+    conn: sqlite3.Connection, attachment_id: int
+) -> Optional[Attachment]:
     """Delete an attachment row and its on-disk blob. Returns the removed row.
 
     Returns ``None`` when no row matched. The blob is removed best-effort
@@ -2703,7 +2828,11 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
                 kind=r["kind"],
                 payload=payload,
                 created_at=r["created_at"],
-                run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
+                run_id=(
+                    int(r["run_id"])
+                    if "run_id" in r.keys() and r["run_id"] is not None
+                    else None
+                ),
             )
         )
     return out
@@ -2754,7 +2883,8 @@ def _end_run(
     """
     now = int(time.time())
     row = conn.execute(
-        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+        "SELECT current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
     if not row or not row["current_run_id"]:
         return None
@@ -2785,14 +2915,16 @@ def _end_run(
         ),
     )
     conn.execute(
-        "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
+        "UPDATE tasks SET current_run_id = NULL WHERE id = ?",
+        (task_id,),
     )
     return run_id
 
 
 def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
     row = conn.execute(
-        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+        "SELECT current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
     ).fetchone()
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
 
@@ -2838,11 +2970,16 @@ def _synthesize_ended_run(
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            task_id, profile, step_key,
-            outcome, outcome,
-            summary, error,
+            task_id,
+            profile,
+            step_key,
+            outcome,
+            outcome,
+            summary,
+            error,
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
-            now, now,
+            now,
+            now,
         ),
     )
     return int(cur.lastrowid or 0)
@@ -2852,8 +2989,10 @@ def _synthesize_ended_run(
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
 
+
 def _has_gate_hold(
-    conn: sqlite3.Connection, task_id: str,
+    conn: sqlite3.Connection,
+    task_id: str,
 ) -> bool:
     """Return True when ``task_id`` has an active R3-gate hold.
 
@@ -2892,7 +3031,8 @@ def _has_gate_hold(
 
 
 def _gate_hold_satisfied(
-    conn: sqlite3.Connection, task_id: str,
+    conn: sqlite3.Connection,
+    task_id: str,
 ) -> bool:
     """Return True when the gate hold on ``task_id`` is satisfied.
 
@@ -2952,7 +3092,8 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def recompute_ready(
-    conn: sqlite3.Connection, failure_limit: int = None,
+    conn: sqlite3.Connection,
+    failure_limit: int = None,
 ) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
@@ -3012,7 +3153,9 @@ def recompute_ready(
                 # reading `hermes kanban tail`.
                 if not _gate_hold_satisfied(conn, task_id):
                     _append_event(
-                        conn, task_id, "gate_hold",
+                        conn,
+                        task_id,
+                        "gate_hold",
                         {
                             "reason": "R3 gate hold active; comment thread lacks unblock signal",
                             "phrases": list(R3_GATE_PHRASES),
@@ -3026,7 +3169,9 @@ def recompute_ready(
                 # call.  Emit an event so the audit trail shows the
                 # gate was satisfied.
                 _append_event(
-                    conn, task_id, "gate_satisfied",
+                    conn,
+                    task_id,
+                    "gate_satisfied",
                     {
                         "reason": "R3 gate hold satisfied by comment thread; promoting",
                     },
@@ -3056,7 +3201,8 @@ def recompute_ready(
                     failures = int(row["consecutive_failures"] or 0)
                     task_limit = row["max_retries"]
                     effective_limit = (
-                        int(task_limit) if task_limit is not None
+                        int(task_limit)
+                        if task_limit is not None
                         else int(failure_limit)
                     )
                     if failures >= effective_limit:
@@ -3079,6 +3225,7 @@ def recompute_ready(
 # ---------------------------------------------------------------------------
 # Claim / complete / block
 # ---------------------------------------------------------------------------
+
 
 def claim_task(
     conn: sqlite3.Connection,
@@ -3112,12 +3259,13 @@ def claim_task(
         ).fetchone()
         if undone:
             conn.execute(
-                "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status = 'ready'",
+                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (task_id,),
             )
             _append_event(
-                conn, task_id, "claim_rejected",
+                conn,
+                task_id,
+                "claim_rejected",
                 {"reason": "parents_not_done"},
             )
             return None
@@ -3187,7 +3335,9 @@ def claim_task(
             (run_id, task_id),
         )
         _append_event(
-            conn, task_id, "claimed",
+            conn,
+            task_id,
+            "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id},
             run_id=run_id,
         )
@@ -3261,9 +3411,15 @@ def claim_review_task(
             (run_id, task_id),
         )
         _append_event(
-            conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review"},
+            conn,
+            task_id,
+            "claimed",
+            {
+                "lock": lock,
+                "expires": expires,
+                "run_id": run_id,
+                "source_status": "review",
+            },
             run_id=run_id,
         )
         return get_task(conn, task_id)
@@ -3377,7 +3533,9 @@ def release_stale_claims(
                         (new_expires, run_id),
                     )
                 _append_event(
-                    conn, row["id"], "claim_extended",
+                    conn,
+                    row["id"],
+                    "claim_extended",
                     {
                         "reason": "pid_alive",
                         "worker_pid": int(row["worker_pid"]),
@@ -3395,7 +3553,9 @@ def release_stale_claims(
             continue
 
         termination = _terminate_reclaimed_worker(
-            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            row["worker_pid"],
+            row["claim_lock"],
+            signal_fn=signal_fn,
         )
         with write_txn(conn):
             cur = conn.execute(
@@ -3408,21 +3568,23 @@ def release_stale_claims(
             if cur.rowcount != 1:
                 continue
             run_id = _end_run(
-                conn, row["id"],
-                outcome="reclaimed", status="reclaimed",
+                conn,
+                row["id"],
+                outcome="reclaimed",
+                status="reclaimed",
                 error=f"stale_lock={row['claim_lock']}",
                 metadata=termination,
             )
             payload = {
                 "stale_lock": row["claim_lock"],
                 "worker_pid": (
-                    int(row["worker_pid"])
-                    if row["worker_pid"] is not None else None
+                    int(row["worker_pid"]) if row["worker_pid"] is not None else None
                 ),
                 "claim_expires": int(row["claim_expires"]),
                 "last_heartbeat_at": (
                     int(row["last_heartbeat_at"])
-                    if row["last_heartbeat_at"] is not None else None
+                    if row["last_heartbeat_at"] is not None
+                    else None
                 ),
                 "now": now,
                 "host_local": host_local,
@@ -3430,7 +3592,9 @@ def release_stale_claims(
             }
             payload.update(termination)
             _append_event(
-                conn, row["id"], "reclaimed",
+                conn,
+                row["id"],
+                "reclaimed",
                 payload,
                 run_id=run_id,
             )
@@ -3467,7 +3631,9 @@ def reclaim_task(
         return False
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        row["worker_pid"],
+        prev_lock,
+        signal_fn=signal_fn,
     )
     with write_txn(conn):
         cur = conn.execute(
@@ -3480,10 +3646,13 @@ def reclaim_task(
         if cur.rowcount != 1:
             return False
         run_id = _end_run(
-            conn, task_id,
-            outcome="reclaimed", status="reclaimed",
+            conn,
+            task_id,
+            outcome="reclaimed",
+            status="reclaimed",
             error=(
-                f"manual_reclaim: {reason}" if reason
+                f"manual_reclaim: {reason}"
+                if reason
                 else f"manual_reclaim lock={prev_lock}"
             ),
             metadata=termination,
@@ -3495,7 +3664,9 @@ def reclaim_task(
         }
         payload.update(termination)
         _append_event(
-            conn, task_id, "reclaimed",
+            conn,
+            task_id,
+            "reclaimed",
             payload,
             run_id=run_id,
         )
@@ -3575,7 +3746,8 @@ def _verify_created_cards(
             ordered.append(cid)
 
     row = conn.execute(
-        "SELECT assignee FROM tasks WHERE id = ?", (completing_task_id,),
+        "SELECT assignee FROM tasks WHERE id = ?",
+        (completing_task_id,),
     ).fetchone()
     if row is None:
         # Completing task not found — nothing resolves.
@@ -3722,7 +3894,9 @@ def complete_task(
         if phantom_cards:
             with write_txn(conn):
                 _append_event(
-                    conn, task_id, "completion_blocked_hallucination",
+                    conn,
+                    task_id,
+                    "completion_blocked_hallucination",
                     {
                         "phantom_cards": phantom_cards,
                         "verified_cards": verified_cards,
@@ -3772,8 +3946,10 @@ def complete_task(
         if cur.rowcount != 1:
             return False
         run_id = _end_run(
-            conn, task_id,
-            outcome="completed", status="done",
+            conn,
+            task_id,
+            outcome="completed",
+            status="done",
             summary=summary if summary is not None else result,
             metadata=metadata,
         )
@@ -3783,7 +3959,8 @@ def complete_task(
         # attempt history instead of silently lost.
         if run_id is None and (summary or metadata or result):
             run_id = _synthesize_ended_run(
-                conn, task_id,
+                conn,
+                task_id,
                 outcome="completed",
                 summary=summary if summary is not None else result,
                 metadata=metadata,
@@ -3810,12 +3987,16 @@ def complete_task(
             md_artifacts = metadata.get("artifacts")
             if isinstance(md_artifacts, (list, tuple)):
                 cleaned_artifacts = [
-                    str(p).strip() for p in md_artifacts if isinstance(p, str) and str(p).strip()
+                    str(p).strip()
+                    for p in md_artifacts
+                    if isinstance(p, str) and str(p).strip()
                 ]
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
         _append_event(
-            conn, task_id, "completed",
+            conn,
+            task_id,
+            "completed",
             completed_payload,
             run_id=run_id,
         )
@@ -3833,7 +4014,9 @@ def complete_task(
         if phantom_refs:
             with write_txn(conn):
                 _append_event(
-                    conn, task_id, "suspected_hallucinated_references",
+                    conn,
+                    task_id,
+                    "suspected_hallucinated_references",
                     {
                         "phantom_refs": phantom_refs,
                         "source": "completion_summary",
@@ -3855,6 +4038,7 @@ def complete_task(
 # ---------------------------------------------------------------------------
 # Workspace / tmux cleanup
 # ---------------------------------------------------------------------------
+
 
 def _is_managed_scratch_path(p: Path) -> bool:
     """Return True iff *p* is a strict descendant of a kanban-managed scratch root.
@@ -3972,6 +4156,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             )
             return
         import shutil
+
         wp = Path(path)
         if wp.is_dir():
             # Containment guard (#28818): a board's ``default_workdir`` can
@@ -3987,7 +4172,8 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
                     "Refusing to remove out-of-scratch workspace for task %s: %s "
                     "(workspace_kind='scratch' but path is outside any "
                     "kanban-managed workspaces root)",
-                    task_id, wp,
+                    task_id,
+                    wp,
                 )
         # Also kill the tmux session for the worker that owned this task,
         # if the tmux session is now dead (worker process exited).
@@ -4054,12 +4240,15 @@ def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
         # Check if session exists and pane is dead before killing
         out = subprocess.run(
             ["tmux", "list-panes", "-t", session, "-F", "#{pane_dead}"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if out.stdout.strip() == "1":
             subprocess.run(
                 ["tmux", "kill-session", "-t", session],
-                capture_output=True, timeout=5,
+                capture_output=True,
+                timeout=5,
             )
             _log.debug("Killed stale tmux session: %s", session)
     except Exception:
@@ -4143,7 +4332,9 @@ def _maybe_emit_scratch_tip(
         _log.warning("kanban: %s (task %s)", _SCRATCH_TIP_MESSAGE, task_id)
         with write_txn(conn):
             _append_event(
-                conn, task_id, "tip_scratch_workspace",
+                conn,
+                task_id,
+                "tip_scratch_workspace",
                 {"message": _SCRATCH_TIP_MESSAGE},
             )
     except Exception:
@@ -4165,7 +4356,8 @@ def edit_completed_task_result(
     handoff_summary = summary if summary is not None else result
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if not row or row["status"] != "done":
             return False
@@ -4186,7 +4378,8 @@ def edit_completed_task_result(
         run_id = int(run["id"]) if run else None
         if run_id is None:
             run_id = _synthesize_ended_run(
-                conn, task_id,
+                conn,
+                task_id,
                 outcome="completed",
                 summary=handoff_summary,
                 metadata=metadata,
@@ -4202,11 +4395,12 @@ def edit_completed_task_result(
                     (json.dumps(metadata, ensure_ascii=False), run_id),
                 )
         ev_summary = (
-            handoff_summary.strip().splitlines()[0][:400]
-            if handoff_summary else ""
+            handoff_summary.strip().splitlines()[0][:400] if handoff_summary else ""
         )
         _append_event(
-            conn, task_id, "edited",
+            conn,
+            task_id,
+            "edited",
             {
                 "fields": (
                     ["result", "summary"]
@@ -4259,21 +4453,23 @@ def block_task(
         if cur.rowcount != 1:
             return False
         run_id = _end_run(
-            conn, task_id,
-            outcome="blocked", status="blocked",
+            conn,
+            task_id,
+            outcome="blocked",
+            status="blocked",
             summary=reason,
         )
         # Synthesize a run when blocking a never-claimed task so the
         # reason is preserved in attempt history.
         if run_id is None and reason:
             run_id = _synthesize_ended_run(
-                conn, task_id,
+                conn,
+                task_id,
                 outcome="blocked",
                 summary=reason,
             )
         _append_event(conn, task_id, "blocked", {"reason": reason}, run_id=run_id)
         return True
-
 
 
 def promote_task(
@@ -4295,9 +4491,7 @@ def promote_task(
     ``(False, reason)`` if refused. ``dry_run=True`` validates the
     promotion would succeed without mutating state.
     """
-    row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
+    row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
 
@@ -4316,8 +4510,7 @@ def promote_task(
             (task_id,),
         ).fetchall()
         unsatisfied = [
-            p["id"] for p in parents
-            if p["status"] not in ("done", "archived")
+            p["id"] for p in parents if p["status"] not in ("done", "archived")
         ]
         if unsatisfied:
             return False, (
@@ -4396,7 +4589,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         if cur.rowcount != 1:
             return False
         _append_event(
-            conn, task_id, "unblocked",
+            conn,
+            task_id,
+            "unblocked",
             {"status": new_status} if new_status != "ready" else None,
         )
         return True
@@ -4454,8 +4649,7 @@ def specify_triage_task(
             changed_fields.append("assignee")
         params.append(task_id)
         cur = conn.execute(
-            f"UPDATE tasks SET {', '.join(sets)} "
-            f"WHERE id = ? AND status = 'triage'",
+            f"UPDATE tasks SET {', '.join(sets)} WHERE id = ? AND status = 'triage'",
             tuple(params),
         )
         if cur.rowcount != 1:
@@ -4560,7 +4754,7 @@ def decompose_triage_task(
     _in_deg = [0] * len(children)
     _adj: list[list[int]] = [[] for _ in range(len(children))]
     for _i, _c in enumerate(children):
-        for _p in (_c.get("parents") or []):
+        for _p in _c.get("parents") or []:
             _adj[_p].append(_i)
             _in_deg[_i] += 1
     _queue = [_i for _i in range(len(children)) if _in_deg[_i] == 0]
@@ -4587,7 +4781,7 @@ def decompose_triage_task(
     ).fetchone()
     if _root_row is not None and _root_row["body"]:
         _packet_refs = re.findall(
-            r'(?:docs/prds/|docs/conductor/)?(APPROVAL-[A-Za-z0-9_-]+\.md)',
+            r"(?:docs/prds/|docs/conductor/)?(APPROVAL-[A-Za-z0-9_-]+\.md)",
             _root_row["body"],
         )
         if _packet_refs:
@@ -4691,7 +4885,9 @@ def decompose_triage_task(
                 ),
             )
             _append_event(
-                conn, new_id, "created",
+                conn,
+                new_id,
+                "created",
                 {"by": author or "decomposer", "from_decompose_of": task_id},
             )
             child_ids.append(new_id)
@@ -4707,7 +4903,9 @@ def decompose_triage_task(
                     (parent_id, child_id),
                 )
                 _append_event(
-                    conn, child_id, "linked",
+                    conn,
+                    child_id,
+                    "linked",
                     {"parent": parent_id, "child": child_id},
                 )
 
@@ -4717,8 +4915,7 @@ def decompose_triage_task(
         # only ever a child here, never a parent of children.
         for cid in child_ids:
             conn.execute(
-                "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
-                "VALUES (?, ?)",
+                "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                 (cid, task_id),
             )
 
@@ -4749,7 +4946,9 @@ def decompose_triage_task(
                 ),
             )
         _append_event(
-            conn, task_id, "decomposed",
+            conn,
+            task_id,
+            "decomposed",
             {
                 "child_ids": child_ids,
                 "root_assignee": root_assignee,
@@ -4780,8 +4979,10 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # archived a running task from the dashboard), close that run with
         # outcome='reclaimed' so attempt history isn't orphaned.
         run_id = _end_run(
-            conn, task_id,
-            outcome="reclaimed", status="reclaimed",
+            conn,
+            task_id,
+            outcome="reclaimed",
+            status="reclaimed",
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
@@ -4832,7 +5033,10 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
-        conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
+        conn.execute(
+            "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
+            (task_id, task_id),
+        )
         conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
@@ -4844,6 +5048,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 # ---------------------------------------------------------------------------
 # Workspace resolution
 # ---------------------------------------------------------------------------
+
 
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """Resolve (and create if needed) the workspace for a task.
@@ -4951,13 +5156,16 @@ def schedule_task(
         if cur.rowcount != 1:
             return False
         run_id = _end_run(
-            conn, task_id,
-            outcome="scheduled", status="scheduled",
+            conn,
+            task_id,
+            outcome="scheduled",
+            status="scheduled",
             summary=reason,
         )
         if run_id is None and reason:
             run_id = _synthesize_ended_run(
-                conn, task_id,
+                conn,
+                task_id,
                 outcome="scheduled",
                 summary=reason,
             )
@@ -4990,7 +5198,7 @@ DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 
 # Max bytes to keep in a single worker log file. The dispatcher truncates
 # and rotates on spawn if the file is larger than this at spawn time.
-DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
+DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024  # 2 MiB
 DEFAULT_LOG_BACKUP_COUNT = 1
 
 # Keep a little wall-clock budget for the worker to observe a terminal timeout
@@ -5215,6 +5423,7 @@ def _pid_alive(pid: Optional[int]) -> bool:
     if not pid or pid <= 0:
         return False
     from gateway.status import _pid_exists
+
     if not _pid_exists(int(pid)):
         return False
     # Still here → process exists. Check for zombie on platforms
@@ -5277,8 +5486,10 @@ def _terminate_reclaimed_worker(
         return info
     info["host_local"] = True
 
-    kill = signal_fn if signal_fn is not None else (
-        os.kill if hasattr(os, "kill") else None
+    kill = (
+        signal_fn
+        if signal_fn is not None
+        else (os.kill if hasattr(os, "kill") else None)
     )
     if kill is None:
         return info
@@ -5353,7 +5564,9 @@ def heartbeat_worker(
                 (now, run_id),
             )
         _append_event(
-            conn, task_id, "heartbeat",
+            conn,
+            task_id,
+            "heartbeat",
             {"note": note} if note else None,
             run_id=run_id,
         )
@@ -5378,6 +5591,7 @@ def enforce_max_runtime(
     test hook; defaults to ``os.kill`` on POSIX.
     """
     import signal
+
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -5409,8 +5623,10 @@ def enforce_max_runtime(
         # want a cleaner shutdown can install their own SIGTERM handler
         # before the grace expires.
         killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+        kill = (
+            signal_fn
+            if signal_fn is not None
+            else (os.kill if hasattr(os, "kill") else None)
         )
         if kill is not None:
             try:
@@ -5447,13 +5663,19 @@ def enforce_max_runtime(
                     "sigkill": killed,
                 }
                 run_id = _end_run(
-                    conn, tid,
-                    outcome="timed_out", status="timed_out",
+                    conn,
+                    tid,
+                    outcome="timed_out",
+                    status="timed_out",
                     error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
                     metadata=payload,
                 )
                 _append_event(
-                    conn, tid, "timed_out", payload, run_id=run_id,
+                    conn,
+                    tid,
+                    "timed_out",
+                    payload,
+                    run_id=run_id,
                 )
                 timed_out.append(tid)
         # Increment the unified failure counter. Outside the write_txn
@@ -5463,7 +5685,8 @@ def enforce_max_runtime(
         # already emitted.
         if cur.rowcount == 1:
             _record_task_failure(
-                conn, tid,
+                conn,
+                tid,
                 error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
                 outcome="timed_out",
                 release_claim=False,
@@ -5511,7 +5734,6 @@ def detect_stale_running(
     if stale_timeout_seconds <= 0:
         return []
 
-
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     reclaimed: list[str] = []
@@ -5544,7 +5766,9 @@ def detect_stale_running(
 
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn,
+            pid,
+            lock,
+            signal_fn=signal_fn,
         )
 
         with write_txn(conn):
@@ -5560,29 +5784,32 @@ def detect_stale_running(
 
             payload = {
                 "elapsed_seconds": int(elapsed),
-                "last_heartbeat_at": (
-                    int(last_hb) if last_hb is not None else None
-                ),
-                "heartbeat_age_seconds": (
-                    int(hb_age) if hb_age is not None else None
-                ),
+                "last_heartbeat_at": (int(last_hb) if last_hb is not None else None),
+                "heartbeat_age_seconds": (int(hb_age) if hb_age is not None else None),
                 "timeout_seconds": stale_timeout_seconds,
                 "pid": int(pid) if pid else None,
             }
             payload.update(termination)
 
             run_id = _end_run(
-                conn, tid,
-                outcome="stale", status="stale",
+                conn,
+                tid,
+                outcome="stale",
+                status="stale",
                 error=(
                     f"no heartbeat for {int(hb_age)}s "
                     if hb_age is not None
                     else "no heartbeat ever"
-                ) + f" after {int(elapsed)}s running",
+                )
+                + f" after {int(elapsed)}s running",
                 metadata=payload,
             )
             _append_event(
-                conn, tid, "stale", payload, run_id=run_id,
+                conn,
+                tid,
+                "stale",
+                payload,
+                run_id=run_id,
             )
             reclaimed.append(tid)
 
@@ -5605,8 +5832,8 @@ def _error_fingerprint(error_text: str) -> str:
     Strips host-specific details (PIDs, timestamps) so that errors
     with the same root cause produce the same fingerprint.
     """
-    fp = re.sub(r'\bpid \d+\b', 'pid N', error_text[:80])
-    fp = re.sub(r'\b\d{10,}\b', '<TS>', fp)
+    fp = re.sub(r"\bpid \d+\b", "pid N", error_text[:80])
+    fp = re.sub(r"\b\d{10,}\b", "<TS>", fp)
     return fp.lower().strip()
 
 
@@ -5734,13 +5961,17 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # history doesn't show a phantom crash for a quota wall.
                 _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
                 run_id = _end_run(
-                    conn, row["id"],
-                    outcome=_run_outcome, status=_run_outcome,
+                    conn,
+                    row["id"],
+                    outcome=_run_outcome,
+                    status=_run_outcome,
                     error=error_text,
                     metadata=dict(event_payload),
                 )
                 _append_event(
-                    conn, row["id"], event_kind,
+                    conn,
+                    row["id"],
+                    event_kind,
                     event_payload,
                     run_id=run_id,
                 )
@@ -5757,10 +5988,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     rate_limited.append(row["id"])
                 else:
                     crashed.append(row["id"])
-                    crash_details.append(
-                        (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
-                    )
+                    crash_details.append((
+                        row["id"],
+                        pid,
+                        row["claim_lock"],
+                        protocol_violation,
+                        error_text,
+                    ))
     # Outside the main txn: increment the unified failure counter for
     # each crashed task. If the breaker trips, the task transitions
     # ready → blocked with a ``gave_up`` event on top of the ``crashed``
@@ -5780,12 +6014,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
         for tid, pid, claimer, protocol_violation, error_text in crash_details:
             fp = _error_fingerprint(error_text)
-            is_systemic = (
-                not protocol_violation
-                and _fp_counts.get(fp, 0) >= 3
-            )
+            is_systemic = not protocol_violation and _fp_counts.get(fp, 0) >= 3
             tripped = _record_task_failure(
-                conn, tid,
+                conn,
+                tid,
                 error=error_text,
                 outcome="crashed",
                 failure_limit=1 if (protocol_violation or is_systemic) else None,
@@ -5856,8 +6088,8 @@ def _record_task_failure(
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
-            "FROM tasks WHERE id = ?", (task_id,),
+            "SELECT consecutive_failures, status, max_retries FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if row is None:
             return False
@@ -5866,9 +6098,7 @@ def _record_task_failure(
 
         # Per-task override wins over both caller-supplied and default
         # thresholds. None (the common case) falls through.
-        task_override = (
-            row["max_retries"] if "max_retries" in row.keys() else None
-        )
+        task_override = row["max_retries"] if "max_retries" in row.keys() else None
         if task_override is not None:
             effective_limit = int(task_override)
             limit_source = "task"
@@ -5901,8 +6131,10 @@ def _record_task_failure(
             if end_run:
                 # Only the spawn path has an open run to close.
                 run_id = _end_run(
-                    conn, task_id,
-                    outcome="gave_up", status="gave_up",
+                    conn,
+                    task_id,
+                    outcome="gave_up",
+                    status="gave_up",
                     error=error[:500],
                     metadata={
                         "failures": failures,
@@ -5921,7 +6153,11 @@ def _record_task_failure(
             if event_payload_extra:
                 payload.update(event_payload_extra)
             _append_event(
-                conn, task_id, "gave_up", payload, run_id=run_id,
+                conn,
+                task_id,
+                "gave_up",
+                payload,
+                run_id=run_id,
             )
             blocked = True
         else:
@@ -5946,13 +6182,17 @@ def _record_task_failure(
             if end_run:
                 # Spawn path: close the open run with outcome.
                 run_id = _end_run(
-                    conn, task_id,
-                    outcome=outcome, status=outcome,
+                    conn,
+                    task_id,
+                    outcome=outcome,
+                    status=outcome,
                     error=error[:500],
                     metadata={"failures": failures},
                 )
                 _append_event(
-                    conn, task_id, outcome,
+                    conn,
+                    task_id,
+                    outcome,
                     {"error": error[:500], "failures": failures},
                     run_id=run_id,
                 )
@@ -5970,7 +6210,9 @@ def _record_spawn_failure(
     failure_limit: int = None,
 ) -> bool:
     return _record_task_failure(
-        conn, task_id, error,
+        conn,
+        task_id,
+        error,
         outcome="spawn_failed",
         failure_limit=failure_limit,
         release_claim=True,
@@ -6093,10 +6335,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    if (
-        latest_run is not None
-        and latest_run["outcome"] == "rate_limited"
-    ):
+    if latest_run is not None and latest_run["outcome"] == "rate_limited":
         if rl_cooldown <= 0:
             # Cooldown disabled — respawn immediately, and skip the
             # blocker_auth regex so the stamped rate-limit text doesn't
@@ -6244,23 +6483,20 @@ def dispatch_once(
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
-        conn, stale_timeout_seconds=stale_timeout_seconds,
+        conn,
+        stale_timeout_seconds=stale_timeout_seconds,
     )
     result.crashed = detect_crashed_workers(conn)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
-    _crash_auto_blocked = getattr(
-        detect_crashed_workers, "_last_auto_blocked", []
-    )
+    _crash_auto_blocked = getattr(detect_crashed_workers, "_last_auto_blocked", [])
     if _crash_auto_blocked:
         result.auto_blocked.extend(_crash_auto_blocked)
     # Rate-limited requeues (quota wall, no failure counted) — surface for
     # telemetry / tests. These tasks went back to ``ready`` and the respawn
     # guard will defer them until the quota window clears.
-    _crash_rate_limited = getattr(
-        detect_crashed_workers, "_last_rate_limited", []
-    )
+    _crash_rate_limited = getattr(detect_crashed_workers, "_last_rate_limited", [])
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
@@ -6309,10 +6545,14 @@ def dispatch_once(
     # Tasks blocked this way go to skipped_per_profile_capped (not
     # skipped_unassigned — the operator-actionable signal is different:
     # "this profile is busy, try again later" not "this needs routing").
-    _per_profile_cap = max_in_progress_per_profile if (
-        isinstance(max_in_progress_per_profile, int)
-        and max_in_progress_per_profile > 0
-    ) else None
+    _per_profile_cap = (
+        max_in_progress_per_profile
+        if (
+            isinstance(max_in_progress_per_profile, int)
+            and max_in_progress_per_profile > 0
+        )
+        else None
+    )
     _per_profile_running: dict[str, int] = {}
     if _per_profile_cap is not None:
         for prow in conn.execute(
@@ -6329,6 +6569,7 @@ def dispatch_once(
     if _default_assignee:
         try:
             from hermes_cli.profiles import profile_exists as _pe
+
             _default_assignee_resolved = bool(_pe(_default_assignee))
         except Exception:
             # Profiles module not importable (test stubs, exotic envs).
@@ -6365,7 +6606,9 @@ def dispatch_once(
                                 (_default_assignee, row["id"]),
                             )
                             _append_event(
-                                conn, row["id"], "assigned",
+                                conn,
+                                row["id"],
+                                "assigned",
                                 {
                                     "assignee": _default_assignee,
                                     "source": "kanban.default_assignee",
@@ -6375,7 +6618,9 @@ def dispatch_once(
                         _log.debug(
                             "kanban dispatch: failed to apply default_assignee=%r "
                             "to task %s",
-                            _default_assignee, row["id"], exc_info=True,
+                            _default_assignee,
+                            row["id"],
+                            exc_info=True,
                         )
                         result.skipped_unassigned.append(row["id"])
                         continue
@@ -6416,9 +6661,11 @@ def dispatch_once(
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row_assignee, 0)
             if current >= _per_profile_cap:
-                result.skipped_per_profile_capped.append(
-                    (row["id"], row_assignee, current)
-                )
+                result.skipped_per_profile_capped.append((
+                    row["id"],
+                    row_assignee,
+                    current,
+                ))
                 continue
         # Respawn guard: refuse to re-spawn when useful work is already
         # in-flight/recent, or when the last failure is a deterministic
@@ -6437,7 +6684,9 @@ def dispatch_once(
             if not dry_run:
                 with write_txn(conn):
                     _append_event(
-                        conn, row["id"], "respawn_guarded",
+                        conn,
+                        row["id"],
+                        "respawn_guarded",
                         {"reason": guard_reason},
                     )
             continue
@@ -6459,7 +6708,9 @@ def dispatch_once(
             workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
             auto = _record_spawn_failure(
-                conn, claimed.id, f"workspace: {exc}",
+                conn,
+                claimed.id,
+                f"workspace: {exc}",
                 failure_limit=failure_limit,
             )
             if auto:
@@ -6474,6 +6725,7 @@ def dispatch_once(
             # (task, workspace). Test stubs in the suite rely on that.
             # Introspect the callable and pass `board` only when supported.
             import inspect
+
             try:
                 sig = inspect.signature(_spawn)
                 if "board" in sig.parameters:
@@ -6502,7 +6754,9 @@ def dispatch_once(
                 )
         except Exception as exc:
             auto = _record_spawn_failure(
-                conn, claimed.id, str(exc),
+                conn,
+                claimed.id,
+                str(exc),
                 failure_limit=failure_limit,
             )
             if auto:
@@ -6545,7 +6799,9 @@ def dispatch_once(
             workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
             auto = _record_spawn_failure(
-                conn, claimed.id, f"workspace: {exc}",
+                conn,
+                claimed.id,
+                f"workspace: {exc}",
                 failure_limit=failure_limit,
             )
             if auto:
@@ -6563,6 +6819,7 @@ def dispatch_once(
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
+
             try:
                 sig = inspect.signature(_spawn)
                 if "board" in sig.parameters:
@@ -6577,7 +6834,9 @@ def dispatch_once(
             spawned += 1
         except Exception as exc:
             auto = _record_spawn_failure(
-                conn, claimed.id, str(exc),
+                conn,
+                claimed.id,
+                str(exc),
                 failure_limit=failure_limit,
             )
             if auto:
@@ -6604,7 +6863,7 @@ def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, 
         try:
             from hermes_cli.config import load_config
 
-            kanban_cfg = (load_config().get("kanban") or {})
+            kanban_cfg = load_config().get("kanban") or {}
         except Exception:
             kanban_cfg = {}
     max_bytes = _positive_int(
@@ -6901,6 +7160,7 @@ def _default_spawn(
     from. Workers cannot accidentally see other boards.
     """
     import subprocess
+
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
@@ -6921,6 +7181,7 @@ def _default_spawn(
     # profile-specific config entirely.  Fixes profile-scoped fallback_providers
     # being invisible to kanban workers.
     from hermes_cli.profiles import resolve_profile_env
+
     try:
         env["HERMES_HOME"] = resolve_profile_env(profile_arg)
     except FileNotFoundError:
@@ -6979,7 +7240,8 @@ def _default_spawn(
 
     cmd = [
         *_resolve_hermes_argv(),
-        "-p", profile_arg,
+        "-p",
+        profile_arg,
         # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
         # so they see that profile's shell-hook allowlist instead of the
         # dispatcher's root allowlist. Pass --accept-hooks explicitly so
@@ -7020,7 +7282,8 @@ def _default_spawn(
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
         "chat",
-        "-q", prompt,
+        "-q",
+        prompt,
     ])
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
@@ -7062,6 +7325,7 @@ def _default_spawn(
 # ---------------------------------------------------------------------------
 # Long-lived dispatcher daemon
 # ---------------------------------------------------------------------------
+
 
 def run_daemon(
     *,
@@ -7114,6 +7378,7 @@ def run_daemon(
         except Exception:
             # Don't let any single tick kill the daemon.
             import traceback
+
             traceback.print_exc()
         stop_event.wait(timeout=interval)
 
@@ -7121,6 +7386,7 @@ def run_daemon(
 # ---------------------------------------------------------------------------
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
+
 
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     """Return the full text a worker should read to understand its task.
@@ -7165,13 +7431,17 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     lines.append(f"Status:   {task.status}")
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
-    lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
+    lines.append(
+        f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}"
+    )
     if task.max_runtime_seconds is not None:
         terminal_timeout = _worker_terminal_timeout_env(
             task.max_runtime_seconds,
             os.environ.get("TERMINAL_TIMEOUT"),
         )
-        effective_terminal_timeout = terminal_timeout or os.environ.get("TERMINAL_TIMEOUT")
+        effective_terminal_timeout = terminal_timeout or os.environ.get(
+            "TERMINAL_TIMEOUT"
+        )
         lines.append(f"Max runtime: {task.max_runtime_seconds}s")
         if effective_terminal_timeout:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
@@ -7237,7 +7507,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 lines.append(f"_error_: {_cap(run.error)}")
             if run.metadata:
                 try:
-                    meta_str = json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
+                    meta_str = json.dumps(
+                        run.metadata, ensure_ascii=False, sort_keys=True
+                    )
                     lines.append(f"_metadata_: `{_cap(meta_str)}`")
                 except Exception:
                     pass
@@ -7277,7 +7549,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 
             if run is not None and run.metadata:
                 try:
-                    meta_str = json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
+                    meta_str = json.dumps(
+                        run.metadata, ensure_ascii=False, sort_keys=True
+                    )
                     body_lines.append(f"_metadata_: `{_cap(meta_str)}`")
                 except Exception:
                     pass
@@ -7347,6 +7621,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 # Stats + SLA helpers
 # ---------------------------------------------------------------------------
 
+
 def board_stats(conn: sqlite3.Connection) -> dict:
     """Per-status + per-assignee counts, plus the oldest ``ready`` age in
     seconds (the clearest staleness signal for a router or HUD).
@@ -7372,7 +7647,8 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     now = int(time.time())
     oldest_ready_age = (
         (now - int(oldest_row["ts"]))
-        if oldest_row and oldest_row["ts"] is not None else None
+        if oldest_row and oldest_row["ts"] is not None
+        else None
     )
 
     return {
@@ -7405,6 +7681,7 @@ def _to_epoch(val) -> Optional[int]:
     # ISO-8601 fallback (e.g. '2026-05-10T15:00:00Z')
     try:
         from datetime import datetime
+
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         return int(dt.timestamp())
     except (ValueError, OSError):
@@ -7419,9 +7696,7 @@ def task_age(task: Task) -> dict:
     _co = _to_epoch(task.completed_at)
     age_since_created = now - _c if _c is not None else None
     age_since_started = now - _s if _s is not None else None
-    time_to_complete = (
-        _co - (_s or _c) if _co is not None else None
-    )
+    time_to_complete = _co - (_s or _c) if _co is not None else None
     return {
         "created_age_seconds": age_since_created,
         "started_age_seconds": age_since_started,
@@ -7432,6 +7707,7 @@ def task_age(task: Task) -> dict:
 # ---------------------------------------------------------------------------
 # Notification subscriptions (used by the gateway kanban-notifier)
 # ---------------------------------------------------------------------------
+
 
 def add_notify_sub(
     conn: sqlite3.Connection,
@@ -7453,7 +7729,15 @@ def add_notify_sub(
                 (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
+            (
+                task_id,
+                platform,
+                chat_id,
+                thread_id or "",
+                user_id,
+                notifier_profile,
+                now,
+            ),
         )
         if notifier_profile:
             # Self-heal legacy rows that predate notifier ownership by
@@ -7470,11 +7754,13 @@ def add_notify_sub(
 
 
 def list_notify_subs(
-    conn: sqlite3.Connection, task_id: Optional[str] = None,
+    conn: sqlite3.Connection,
+    task_id: Optional[str] = None,
 ) -> list[dict]:
     if task_id is not None:
         rows = conn.execute(
-            "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (task_id,),
+            "SELECT * FROM kanban_notify_subs WHERE task_id = ?",
+            (task_id,),
         ).fetchall()
     else:
         rows = conn.execute("SELECT * FROM kanban_notify_subs").fetchall()
@@ -7538,11 +7824,20 @@ def unseen_events_for_sub(
             payload = json.loads(r["payload"]) if r["payload"] else None
         except Exception:
             payload = None
-        out.append(Event(
-            id=r["id"], task_id=r["task_id"], kind=r["kind"],
-            payload=payload, created_at=r["created_at"],
-            run_id=(int(r["run_id"]) if "run_id" in r.keys() and r["run_id"] is not None else None),
-        ))
+        out.append(
+            Event(
+                id=r["id"],
+                task_id=r["task_id"],
+                kind=r["kind"],
+                payload=payload,
+                created_at=r["created_at"],
+                run_id=(
+                    int(r["run_id"])
+                    if "run_id" in r.keys() and r["run_id"] is not None
+                    else None
+                ),
+            )
+        )
         max_id = max(max_id, int(r["id"]))
     return max_id, out
 
@@ -7593,7 +7888,14 @@ def claim_unseen_events_for_sub(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
             "AND last_event_id = ?",
-            (int(new_cursor), task_id, platform, chat_id, thread_id or "", int(old_cursor)),
+            (
+                int(new_cursor),
+                task_id,
+                platform,
+                chat_id,
+                thread_id or "",
+                int(old_cursor),
+            ),
         )
         return old_cursor, new_cursor, events
 
@@ -7637,7 +7939,11 @@ def rewind_notify_cursor(
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
             "AND last_event_id = ?",
             (
-                int(old_cursor), task_id, platform, chat_id, thread_id or "",
+                int(old_cursor),
+                task_id,
+                platform,
+                chat_id,
+                thread_id or "",
                 int(claimed_cursor),
             ),
         )
@@ -7648,8 +7954,11 @@ def rewind_notify_cursor(
 # Retention + garbage collection
 # ---------------------------------------------------------------------------
 
+
 def gc_events(
-    conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600,
+    conn: sqlite3.Connection,
+    *,
+    older_than_seconds: int = 30 * 24 * 3600,
 ) -> int:
     """Delete task_events rows older than ``older_than_seconds`` for tasks
     in a terminal state (``done`` or ``archived``). Returns the number of
@@ -7666,7 +7975,8 @@ def gc_events(
 
 
 def gc_worker_logs(
-    *, older_than_seconds: int = 30 * 24 * 3600,
+    *,
+    older_than_seconds: int = 30 * 24 * 3600,
     board: Optional[str] = None,
 ) -> int:
     """Delete worker log files older than ``older_than_seconds``. Returns
@@ -7693,6 +8003,7 @@ def gc_worker_logs(
 # Worker log accessor
 # ---------------------------------------------------------------------------
 
+
 def worker_log_path(task_id: str, *, board: Optional[str] = None) -> Path:
     """Return the path to a worker's log file. The file may not exist
     (task never spawned, or log already GC'd).
@@ -7705,7 +8016,9 @@ def worker_log_path(task_id: str, *, board: Optional[str] = None) -> Path:
 
 
 def read_worker_log(
-    task_id: str, *, tail_bytes: Optional[int] = None,
+    task_id: str,
+    *,
+    tail_bytes: Optional[int] = None,
     board: Optional[str] = None,
 ) -> Optional[str]:
     """Read the worker log for ``task_id``. Returns None if the file
@@ -7739,6 +8052,7 @@ def read_worker_log(
 # Assignee enumeration (known profiles + per-profile board stats)
 # ---------------------------------------------------------------------------
 
+
 def list_profiles_on_disk() -> list[str]:
     """Return the set of assignee/profile names discovered on disk.
 
@@ -7752,6 +8066,7 @@ def list_profiles_on_disk() -> list[str]:
     """
     try:
         from hermes_constants import get_default_hermes_root
+
         default_root = get_default_hermes_root()
         profiles_dir = default_root / "profiles"
     except Exception:
@@ -7813,6 +8128,7 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
 # Runs (attempt history on a task)
 # ---------------------------------------------------------------------------
 
+
 def list_runs(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7850,7 +8166,8 @@ def list_runs(
 
 def get_run(conn: sqlite3.Connection, run_id: int) -> Optional[Run]:
     row = conn.execute(
-        "SELECT * FROM task_runs WHERE id = ?", (int(run_id),),
+        "SELECT * FROM task_runs WHERE id = ?",
+        (int(run_id),),
     ).fetchone()
     return Run.from_row(row) if row else None
 
