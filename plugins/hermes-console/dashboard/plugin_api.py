@@ -473,50 +473,63 @@ def _links_for(
 
 
 # ---------------------------------------------------------------------------
-# Work item metadata — V1 has no metadata table yet, so all tasks
-# return "unclassified" / null. Never invent a more specific value.
+# Work item metadata — V1.1 reads from the task_metadata table (T01/T02).
+# When no row exists for a task we fall back to the V1.0 defaults
+# (work_item_type='unclassified', lifecycle_state=None,
+# agent_profile=None, tags=[]), so the V1.0 contract is preserved for
+# boards that haven't yet classified a card.
 # ---------------------------------------------------------------------------
 
-def _infer_work_item_type(task: kanban_db.Task) -> str:
-    """Return the work item type for a task.
+# V1.0 fallback values used when a task has no row in task_metadata.
+# Kept as module constants so the read path is auditable in one place.
+_DEFAULT_WORK_ITEM_TYPE = "unclassified"
+_DEFAULT_LIFECYCLE_STATE: Optional[str] = None
+_DEFAULT_AGENT_PROFILE: Optional[str] = None
+_DEFAULT_TAGS: list[str] = []
 
-    V1 has no metadata column. The PRD says existing cards appear as
-    ``unclassified`` rather than hidden, and we do not infer
-    project/epic/feature/story/task labels from title text. Override
-    this once the T9 metadata table lands.
+
+def _read_task_metadata(
+    conn: sqlite3.Connection, task_id: str,
+) -> dict[str, Any]:
+    """Return the V1.1 metadata for ``task_id`` with V1.0 defaults on miss.
+
+    Performs a single SELECT on the caller's connection — the per-item
+    portfolio list and detail endpoints already hold a connection open,
+    so we reuse it rather than opening a fresh one via
+    :func:`kanban_db.get_task_metadata`. The returned shape matches
+    :func:`kanban_db.get_task_metadata` minus bookkeeping columns.
+
+    Keys: ``work_item_type`` (str, default ``"unclassified"``),
+    ``lifecycle_state`` (Optional[str]), ``agent_profile``
+    (Optional[str]), ``tags`` (list[str]). Tolerant of a corrupt
+    ``tags_json`` — falls back to ``[]`` rather than raising.
     """
-    return "unclassified"
-
-
-def _infer_lifecycle_state(task: kanban_db.Task) -> Optional[str]:
-    """Return the lifecycle state for a task, or ``None``.
-
-    The PRD says we return ``None`` when no metadata is available
-    rather than inferring ``demo-ready`` or ``customer-ready`` from
-    task percent. The UI shows ``Lifecycle: Not set``.
-    """
-    return None
-
-
-def _infer_agent_profile(task: kanban_db.Task) -> Optional[str]:
-    """Return the agent profile lane for a task, or ``None``.
-
-    Best-effort: the canonical Kanban DB does not yet carry a
-    metadata column for agent profile, so we have to return ``None``
-    until T9 lands. The filter dimension still exists in the API so
-    the UI can surface "Fleet lane: not set" honestly.
-    """
-    return None
-
-
-def _infer_tags(task: kanban_db.Task) -> list[str]:
-    """Return tags for a task. Empty list when no metadata is present.
-
-    Tags are derived from the future metadata table (T9) — not from
-    title/body text. Returning an empty list keeps the facet bucket
-    honest: the UI shows "Tags: 0" rather than fabricating entries.
-    """
-    return []
+    row = conn.execute(
+        "SELECT work_item_type, lifecycle_state, agent_profile, tags_json "
+        "FROM task_metadata WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return {
+            "work_item_type": _DEFAULT_WORK_ITEM_TYPE,
+            "lifecycle_state": _DEFAULT_LIFECYCLE_STATE,
+            "agent_profile": _DEFAULT_AGENT_PROFILE,
+            "tags": list(_DEFAULT_TAGS),
+        }
+    raw_tags = row["tags_json"]
+    try:
+        parsed_tags = json.loads(raw_tags) if raw_tags else []
+    except (TypeError, ValueError):
+        parsed_tags = []
+    if not isinstance(parsed_tags, list):
+        parsed_tags = []
+    tags: list[str] = [t for t in parsed_tags if isinstance(t, str)]
+    return {
+        "work_item_type": row["work_item_type"] or _DEFAULT_WORK_ITEM_TYPE,
+        "lifecycle_state": row["lifecycle_state"],
+        "agent_profile": row["agent_profile"],
+        "tags": tags,
+    }
 
 
 def _compute_progress(
@@ -613,6 +626,17 @@ def _item_to_public(
         comment_count = _row_count(conn, "task_comments", "task_id", task.id)
         run_count = _row_count(conn, "task_runs", "task_id", task.id)
         attachment_count = _row_count(conn, "task_attachments", "task_id", task.id)
+        # V1.1: read V1.1 metadata (work_item_type / lifecycle_state /
+        # agent_profile / tags) from the task_metadata table, falling
+        # back to V1.0 defaults when no row exists for this task.
+        meta = _read_task_metadata(conn, task.id)
+    else:
+        meta = {
+            "work_item_type": _DEFAULT_WORK_ITEM_TYPE,
+            "lifecycle_state": _DEFAULT_LIFECYCLE_STATE,
+            "agent_profile": _DEFAULT_AGENT_PROFILE,
+            "tags": list(_DEFAULT_TAGS),
+        }
     return {
         "portfolio_id": _portfolio_id(board_slug, task.id),
         "board_slug": board_slug,
@@ -623,7 +647,7 @@ def _item_to_public(
         "status_group": task.status,
         "assignee": task.assignee,
         "subagent_role": task.assignee,  # subagent_role == assignee in V1
-        "agent_profile": _infer_agent_profile(task),
+        "agent_profile": meta["agent_profile"],
         "priority": int(task.priority or 0),
         "created_by": task.created_by,
         "created_at": int(task.created_at or 0),
@@ -636,9 +660,9 @@ def _item_to_public(
         "comment_count": comment_count,
         "run_count": run_count,
         "attachment_count": attachment_count,
-        "work_item_type": _infer_work_item_type(task),
-        "lifecycle_state": _infer_lifecycle_state(task),
-        "tags": _infer_tags(task),
+        "work_item_type": meta["work_item_type"],
+        "lifecycle_state": meta["lifecycle_state"],
+        "tags": meta["tags"],
         "progress": progress,
         "needs_keith": _needs_keith(task),
         "stale": _is_stale(task),
