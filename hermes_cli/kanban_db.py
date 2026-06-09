@@ -5125,6 +5125,251 @@ def set_workspace_path(
 
 
 # ---------------------------------------------------------------------------
+# task_metadata CRUD (Portfolio V1.1 — T02)
+# ---------------------------------------------------------------------------
+# Source: PORTFOLIO_BOARD_T9_METADATA_APPROVAL_STORAGE_DESIGN_2026-06-04 §3.1.
+#
+# ``task_metadata`` is a per-task augmentation table keyed by ``task_id``.
+# It carries the work-item type / lifecycle / owning profile / tags / open
+# metadata blob the Portfolio Board reads on top of the V1.0 tasks table.
+# The schema and the V1.0 read-model defaults are in T01; these two helpers
+# are the only supported write/read surface for that table. Backed by
+# ``connect()`` so they pick up the active board via HERMES_KANBAN_BOARD /
+# the ``current`` symlink like every other top-level helper in this module.
+
+
+# Insert path: used when the row does not yet exist. The NOT-NULL DEFAULT
+# clauses on the schema handle the omitted-fields case naturally, EXCEPT
+# that Python ``None`` arriving via the parameter binding inserts literal
+# NULL — which trips the NOT NULL constraint on ``work_item_type`` /
+# ``tags_json``. COALESCE the Python None to the documented V1.0 default
+# on the way in.
+_METADATA_INSERT_SQL = """
+INSERT INTO task_metadata (
+    task_id,
+    work_item_type,
+    lifecycle_state,
+    agent_profile,
+    tags_json,
+    metadata_json,
+    updated_at,
+    updated_by
+) VALUES (
+    :task_id,
+    COALESCE(:work_item_type, 'unclassified'),
+    :lifecycle_state,
+    :agent_profile,
+    COALESCE(:tags_json, '[]'),
+    :metadata_json,
+    :updated_at,
+    COALESCE(:updated_by, 'system')
+)
+"""
+
+# Update path: partial merge on the existing row. Each user-supplied
+# column is overwritten with the new value; each omitted column
+# (Python ``None``) keeps whatever the existing row had. The
+# implementation uses a per-column CASE driven by a boolean "set"
+# flag (``*_set`` parameter), which is the only way in SQL to tell
+# "caller passed None" apart from "column is currently NULL" — and
+# the schema stores NULL for some columns legitimately, so the
+# NULL-as-sentinel trick would have been lossy.
+_METADATA_UPDATE_SQL = """
+UPDATE task_metadata SET
+    work_item_type = CASE WHEN :work_item_type_set
+                          THEN :work_item_type
+                          ELSE work_item_type END,
+    lifecycle_state = CASE WHEN :lifecycle_state_set
+                           THEN :lifecycle_state
+                           ELSE lifecycle_state END,
+    agent_profile   = CASE WHEN :agent_profile_set
+                           THEN :agent_profile
+                           ELSE agent_profile END,
+    tags_json       = CASE WHEN :tags_set
+                           THEN :tags_json
+                           ELSE tags_json END,
+    metadata_json   = CASE WHEN :metadata_set
+                           THEN :metadata_json
+                           ELSE metadata_json END,
+    updated_by      = CASE WHEN :updated_by_set
+                           THEN :updated_by
+                           ELSE updated_by END,
+    updated_at      = :updated_at
+WHERE task_id = :task_id
+"""
+
+
+def _encode_tags_json(tags: Optional[Iterable[str]]) -> Optional[str]:
+    """Serialize the ``tags`` argument for the ``tags_json`` column.
+
+    ``None`` means "the caller did not supply tags" (partial merge). An
+    empty list normalises to ``'[]'`` so we never write a NULL into the
+    NOT-NULL column. Strings pass through unchanged so an internal caller
+    that already serialised can use the helper without a round trip.
+    """
+    if tags is None:
+        return None
+    if isinstance(tags, str):
+        # Pre-serialised JSON — accept and let SQLite validate.
+        return tags
+    return json.dumps(list(tags), ensure_ascii=False)
+
+
+def _encode_metadata_json(metadata: Optional[dict]) -> Optional[str]:
+    """Serialize the open-ended ``metadata`` blob for the column.
+
+    ``None`` means "the caller did not supply a blob" (partial merge).
+    A pre-serialised string is passed through.
+    """
+    if metadata is None:
+        return None
+    if isinstance(metadata, str):
+        return metadata
+    return json.dumps(metadata, ensure_ascii=False)
+
+
+def _decode_tags_json(raw: Optional[str]) -> list:
+    """Inverse of :func:`_encode_tags_json` for the read path.
+
+    The schema's NOT NULL DEFAULT '[]' guarantees a string is always
+    present on the column; we still tolerate NULL defensively so a future
+    schema change cannot crash the reader.
+    """
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        # Corrupt / non-JSON in the column — fall back to the V1.0
+        # read-model default rather than crashing the caller.
+        return []
+    return list(parsed) if isinstance(parsed, list) else []
+
+
+def _decode_metadata_json(raw: Optional[str]) -> Optional[dict]:
+    """Inverse of :func:`_encode_metadata_json` for the read path."""
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def get_task_metadata(task_id: str) -> Optional[dict]:
+    """Return the Portfolio V1.1 metadata for ``task_id`` or ``None``.
+
+    The returned dict has keys ``work_item_type``, ``lifecycle_state``,
+    ``agent_profile``, ``tags`` (list of str), ``metadata`` (dict or
+    ``None``), ``updated_at`` (int epoch seconds), ``updated_by`` (str
+    or ``None``). Returns ``None`` when no row exists for ``task_id`` —
+    callers should treat that as the V1.0 read-model default
+    (``work_item_type='unclassified'``, ``lifecycle_state=None``,
+    ``agent_profile=None``, ``tags=[]``, ``metadata=None``).
+
+    The connection is opened via :func:`connect` with no args, so the
+    active board is the one selected by ``HERMES_KANBAN_BOARD`` /
+    ``<root>/kanban/current`` — same resolution chain every other
+    top-level helper in this module uses.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT work_item_type, lifecycle_state, agent_profile, "
+            "tags_json, metadata_json, updated_at, updated_by "
+            "FROM task_metadata WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "work_item_type": row["work_item_type"],
+        "lifecycle_state": row["lifecycle_state"],
+        "agent_profile": row["agent_profile"],
+        "tags": _decode_tags_json(row["tags_json"]),
+        "metadata": _decode_metadata_json(row["metadata_json"]),
+        "updated_at": row["updated_at"],
+        "updated_by": row["updated_by"],
+    }
+
+
+def upsert_task_metadata(
+    task_id: str,
+    *,
+    work_item_type: Optional[str] = None,
+    lifecycle_state: Optional[str] = None,
+    agent_profile: Optional[str] = None,
+    tags: Optional[Iterable[str]] = None,
+    metadata: Optional[dict] = None,
+    updated_by: Optional[str] = None,
+) -> None:
+    """Insert-or-merge the Portfolio V1.1 metadata row for ``task_id``.
+
+    Partial-merge semantics: every field defaults to ``None``, meaning
+    "leave the existing value alone". Only the fields the caller actually
+    supplies are written. On the INSERT path, omitted fields fall back to
+    the schema defaults (``'unclassified'`` / ``'[]'`` / ``'system'``)
+    per T01; on the UPDATE path, omitted fields keep their previous value.
+
+    ``updated_at`` is always set to ``int(time.time())`` on every write —
+    partial merge is "what fields change", not "which bookkeeping columns
+    change". ``updated_by`` defaults to ``'system'`` ONLY on the first
+    write (the INSERT path); subsequent upserts that omit ``updated_by``
+    keep the previous actor. The "leave it alone" rule for bookkeeping
+    columns matches every other Portfolio surface.
+
+    The connection is opened via :func:`connect`; see :func:`get_task_metadata`
+    for the resolution chain.
+    """
+    now = int(time.time())
+    tags_json = _encode_tags_json(tags)
+    metadata_json = _encode_metadata_json(metadata)
+    # The UPDATE path's per-column CASE statements need an explicit
+    # "was this set?" flag because SQL has no way to distinguish
+    # "caller passed None" from "column is NULL" — and the schema
+    # stores NULL for some of these legitimately.
+    params = {
+        "task_id": task_id,
+        "work_item_type": work_item_type,
+        "lifecycle_state": lifecycle_state,
+        "agent_profile": agent_profile,
+        "tags_json": tags_json,
+        "metadata_json": metadata_json,
+        "updated_at": now,
+        "updated_by": updated_by,
+        "work_item_type_set": 1 if work_item_type is not None else 0,
+        "lifecycle_state_set": 1 if lifecycle_state is not None else 0,
+        "agent_profile_set": 1 if agent_profile is not None else 0,
+        "tags_set": 1 if tags is not None else 0,
+        "metadata_set": 1 if metadata is not None else 0,
+        "updated_by_set": 1 if updated_by is not None else 0,
+    }
+    with connect() as conn:
+        with write_txn(conn):
+            existing = conn.execute(
+                "SELECT 1 FROM task_metadata WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if existing is None:
+                # Insert path. The COALESCE in the SQL handles None →
+                # V1.0 default for the NOT-NULL columns.
+                insert_params = {
+                    "task_id": task_id,
+                    "work_item_type": work_item_type,
+                    "lifecycle_state": lifecycle_state,
+                    "agent_profile": agent_profile,
+                    "tags_json": tags_json,
+                    "metadata_json": metadata_json,
+                    "updated_at": now,
+                    "updated_by": updated_by,
+                }
+                conn.execute(_METADATA_INSERT_SQL, insert_params)
+            else:
+                # Update path. Per-column CASE flags preserve existing
+                # values for fields the caller did not pass.
+                conn.execute(_METADATA_UPDATE_SQL, params)
+
+
+# ---------------------------------------------------------------------------
 def schedule_task(
     conn: sqlite3.Connection,
     task_id: str,
