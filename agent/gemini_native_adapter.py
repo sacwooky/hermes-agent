@@ -226,6 +226,24 @@ def _extract_multimodal_parts(content: Any) -> List[Dict[str, Any]]:
                     }
                 }
             )
+        elif ptype == "video_url":
+            url = ((item.get("video_url") or {}).get("url") or "")
+            if not isinstance(url, str) or not url.startswith("data:"):
+                continue
+            try:
+                header, encoded = url.split(",", 1)
+                mime = header.split(":", 1)[1].split(";", 1)[0]
+                raw = base64.b64decode(encoded)
+            except Exception:
+                continue
+            parts.append(
+                {
+                    "inlineData": {
+                        "mimeType": mime,
+                        "data": base64.b64encode(raw).decode("ascii"),
+                    }
+                }
+            )
     return parts
 
 

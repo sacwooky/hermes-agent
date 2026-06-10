@@ -28,7 +28,9 @@
   // Fall back to a native <input type="checkbox"> shim so older hosts that
   // predate the design-system rollout still render. The shim normalises
   // Radix's onCheckedChange(checked) signature to native onChange(event).
-  const Checkbox = SDK.components.Checkbox || function (props) {
+  const Checkbox = (typeof SDK.components.Checkbox === "function" || typeof SDK.components.Checkbox === "string")
+    ? SDK.components.Checkbox
+    : function (props) {
     const { checked, onCheckedChange, className, onClick, ...rest } = props;
     return h("input", Object.assign({
       type: "checkbox",
