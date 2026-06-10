@@ -1,10 +1,12 @@
 /**
- * Hermes Console — Portfolio Board dashboard plugin (V1.0, read-only).
+ * Hermes Console — Portfolio Board dashboard plugin (V1.0 chrome,
+ * V1.1 filter wiring).
  *
  * Calls the plugin's backend at /api/plugins/hermes-console/portfolio/
  * (mounted by the dashboard plugin system) and renders:
  *
- *   - Filter bar (keyword, board, subagent role, include done/archived)
+ *   - Filter bar (keyword, board, subagent role, agent profile,
+ *     work item type, tags, lifecycle, include done/archived)
  *   - Hierarchy pane (collapsible, left side)
  *   - Backlog tab (dense table, one row per item)
  *   - Board tab (columns enumerated from canonical statuses)
@@ -13,6 +15,12 @@
  * V1.0 is intentionally GET-only: every action button in the detail
  * pane is rendered as `disabled: true` and the comment composer is a
  * placeholder pointing to V1.1. No mutation API call is attempted.
+ *
+ * V1.1 step 4 wires the four ``task_metadata`` filter dimensions
+ * (agent_profiles / item_types / tags / lifecycle) into the chrome.
+ * The single-value Selects (and the open-vocab ``tags`` input)
+ * match the URL contract the backend exposes today; multi-select
+ * inside the chrome is a UX follow-up.
  *
  * Plain IIFE, no build step. Uses window.__HERMES_PLUGIN_SDK__ for
  * React + shadcn primitives; window.__HERMES_PLUGINS__.register to
@@ -291,6 +299,25 @@
     function onIncludeArchivedChange(e) {
       set({ include_archived: e.target.checked });
     }
+    // V1.1 step 4 — task_metadata filter dimensions. The
+    // underlying API takes CSV per dimension (OR within, AND
+    // across), but the chrome exposes a single-value Select for
+    // the three closed-vocabulary dimensions and a free-text
+    // Input for the open-vocab ``tags`` dimension. Multi-select
+    // inside the chrome is a UX follow-up; the URL contract
+    // already accepts CSV today.
+    function onAgentProfileChange(v) {
+      set({ agent_profiles: v || "" });
+    }
+    function onItemTypeChange(v) {
+      set({ item_types: v || "" });
+    }
+    function onLifecycleChange(v) {
+      set({ lifecycle: v || "" });
+    }
+    function onTagsChange(e) {
+      set({ tags: e.target.value });
+    }
 
     const boardValues = (facets.boards || []).map(function (b) {
       return h(SelectOption, { key: b.value, value: b.value },
@@ -300,6 +327,27 @@
     const assigneeValues = (facets.assignees || []).map(function (a) {
       return h(SelectOption, { key: a.value, value: a.value },
         a.value + " (" + a.count + ")"
+      );
+    });
+    // V1.1 metadata facet options. The backend always returns
+    // the canonical values for closed-vocab dimensions when
+    // there is data, so the dropdown chrome is just an iteration
+    // over ``facets.*``. Tags is open-vocab; we don't render a
+    // dropdown for it, just the free-text input.
+    const agentProfileValues = (facets.agent_profiles || []).map(function (a) {
+      return h(SelectOption, { key: a.value, value: a.value },
+        a.value + " (" + a.count + ")"
+      );
+    });
+    const itemTypeValues = (facets.item_types || []).map(function (a) {
+      return h(SelectOption, { key: a.value, value: a.value },
+        a.value + " (" + a.count + ")"
+      );
+    });
+    const lifecycleValues = (facets.lifecycle || []).map(function (a) {
+      const label = LIFECYCLE_LABEL[a.value] || a.value;
+      return h(SelectOption, { key: a.value, value: a.value },
+        label + " (" + a.count + ")"
       );
     });
 
@@ -338,6 +386,59 @@
           h(SelectOption, { value: "" }, "All roles"),
           assigneeValues
         )
+      ),
+      // V1.1 step 4 — four task_metadata filter rows. Each
+      // value defaults to "" (= no filter). Tags is the only
+      // open-vocab dimension; it uses an Input rather than a
+      // Select so the operator can filter on tags that haven't
+      // been seen yet.
+      h("div", { className: "hermes-console-filterbar-row" },
+        h(Label, { htmlFor: "hc-filter-agent-profile" }, "Agent profile"),
+        h(Select, {
+          id: "hc-filter-agent-profile",
+          value: filters.agent_profiles || "",
+          onValueChange: onAgentProfileChange,
+          placeholder: "All profiles",
+        },
+          h(SelectOption, { value: "" }, "All profiles"),
+          agentProfileValues
+        )
+      ),
+      h("div", { className: "hermes-console-filterbar-row" },
+        h(Label, { htmlFor: "hc-filter-item-type" }, "Work item type"),
+        h(Select, {
+          id: "hc-filter-item-type",
+          value: filters.item_types || "",
+          onValueChange: onItemTypeChange,
+          placeholder: "All types",
+        },
+          h(SelectOption, { value: "" }, "All types"),
+          itemTypeValues
+        )
+      ),
+      h("div", { className: "hermes-console-filterbar-row" },
+        h(Label, { htmlFor: "hc-filter-lifecycle" }, "Lifecycle"),
+        h(Select, {
+          id: "hc-filter-lifecycle",
+          value: filters.lifecycle || "",
+          onValueChange: onLifecycleChange,
+          placeholder: "All stages",
+        },
+          h(SelectOption, { value: "" }, "All stages"),
+          lifecycleValues
+        )
+      ),
+      h("div", { className: "hermes-console-filterbar-row" },
+        h(Label, { htmlFor: "hc-filter-tags" }, "Tags"),
+        h(Input, {
+          id: "hc-filter-tags",
+          type: "search",
+          placeholder: "tag, another…",
+          value: filters.tags || "",
+          onChange: onTagsChange,
+          className: "hermes-console-filter-input",
+          title: "Comma-separated tags (OR within; AND across other dimensions)",
+        })
       ),
       h("div", { className: "hermes-console-filterbar-row hermes-console-filterbar-checks" },
         h(Label, { className: "hermes-console-inline-label" },
@@ -822,6 +923,13 @@
       boards: "",
       assignees: "",
       statuses: "",
+      // V1.1 step 4 — task_metadata filter dimensions. Each is a
+      // single value for the chrome (CSV multi-select is a UX
+      // follow-up; the URL contract already accepts CSV today).
+      agent_profiles: "",
+      item_types: "",
+      tags: "",
+      lifecycle: "",
       include_done: true,
       include_archived: false,
       view: "backlog",
@@ -857,6 +965,14 @@
         boards: filters.boards,
         assignees: filters.assignees,
         statuses: filters.statuses,
+        // V1.1 step 4 — task_metadata filter dimensions. Each
+        // value is a CSV string per the API contract; an empty
+        // string means "no filter" (the backend treats it the
+        // same as the param being omitted).
+        agent_profiles: filters.agent_profiles,
+        item_types: filters.item_types,
+        tags: filters.tags,
+        lifecycle: filters.lifecycle,
         include_done: filters.include_done,
         include_archived: filters.include_archived,
         view: filters.view,
@@ -875,6 +991,7 @@
       return function () { cancelled = true; };
     }, [
       filters.q, filters.boards, filters.assignees, filters.statuses,
+      filters.agent_profiles, filters.item_types, filters.tags, filters.lifecycle,
       filters.include_done, filters.include_archived, filters.view,
     ]);
 
@@ -906,6 +1023,13 @@
           boards: filters.boards,
           assignees: filters.assignees,
           statuses: filters.statuses,
+          // V1.1 step 4 — keep polling in sync with the new
+          // task_metadata filter dimensions; otherwise an
+          // active filter would silently drop on the next tick.
+          agent_profiles: filters.agent_profiles,
+          item_types: filters.item_types,
+          tags: filters.tags,
+          lifecycle: filters.lifecycle,
           include_done: filters.include_done,
           include_archived: filters.include_archived,
           view: filters.view,
@@ -924,6 +1048,7 @@
       };
     }, [
       filters.q, filters.boards, filters.assignees, filters.statuses,
+      filters.agent_profiles, filters.item_types, filters.tags, filters.lifecycle,
       filters.include_done, filters.include_archived, filters.view,
     ]);
 
@@ -938,6 +1063,13 @@
         boards: "",
         assignees: "",
         statuses: "",
+        // V1.1 step 4 — also clear the four task_metadata
+        // filter dimensions so Reset returns the dashboard to
+        // a fully unfiltered state.
+        agent_profiles: "",
+        item_types: "",
+        tags: "",
+        lifecycle: "",
         include_done: true,
         include_archived: false,
         view: filters.view,

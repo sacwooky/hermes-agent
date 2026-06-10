@@ -757,6 +757,10 @@ def _parse_items_query(
     statuses: Optional[str],
     assignees: Optional[str],
     q: Optional[str],
+    agent_profiles: Optional[str],
+    item_types: Optional[str],
+    tags: Optional[str],
+    lifecycle: Optional[str],
     include_archived: bool,
     include_done: bool,
     view: Optional[str],
@@ -768,12 +772,42 @@ def _parse_items_query(
     The returned dict has stable keys consumed by :func:`_query_items`.
     Validation errors raise ``HTTPException(400)`` with a clear
     message; otherwise the dashboard gets a clean filter object.
+
+    V1.1 step 4 — the four ``task_metadata`` dimensions are parsed
+    here and consumed by :func:`_task_passes_filter`. Unknown
+    descriptive values (a future tag the catalogue hasn't catalogued
+    yet) are dropped silently rather than 400-ing the dashboard; a
+    strict 400 would break filters that haven't been wired up.
+    ``tags`` keeps every token (no allowlist) because the tag set is
+    open-ended by design; the other three are checked against the
+    canonical KNOWN_* constant so the filter dropdown never offers
+    values that can never match.
     """
     status_list = _parse_statuses(statuses)
     board_list = _parse_csv(boards) if boards else None
     if board_list:
         board_list = [_check_board_slug(b) for b in board_list]
     assignee_list = _parse_csv(assignees) if assignees else None
+    # V1.1 metadata dimensions. ``tags`` accepts any token (open
+    # vocabulary), the other three are filtered against the
+    # KNOWN_* catalogue so unknown values don't silently match
+    # nothing.
+    agent_profiles_list = _parse_csv(agent_profiles) if agent_profiles else None
+    if agent_profiles_list:
+        agent_profiles_list = _parse_known(
+            agent_profiles_list, KNOWN_AGENT_PROFILES, label="agent_profiles",
+        )
+    item_types_list = _parse_csv(item_types) if item_types else None
+    if item_types_list:
+        item_types_list = _parse_known(
+            item_types_list, KNOWN_ITEM_TYPES, label="item_types",
+        )
+    lifecycle_list = _parse_csv(lifecycle) if lifecycle else None
+    if lifecycle_list:
+        lifecycle_list = _parse_known(
+            lifecycle_list, KNOWN_LIFECYCLE_STATES, label="lifecycle",
+        )
+    tags_list = _parse_csv(tags) if tags else None
     view_norm = (view or "backlog").lower()
     if view_norm not in ("backlog", "board"):
         raise HTTPException(
@@ -784,6 +818,10 @@ def _parse_items_query(
         "statuses": status_list,
         "assignees": assignee_list,
         "q": (q or "").strip().lower() or None,
+        "agent_profiles": agent_profiles_list or None,
+        "item_types": item_types_list or None,
+        "tags": tags_list or None,
+        "lifecycle": lifecycle_list or None,
         "include_archived": bool(include_archived),
         "include_done": bool(include_done),
         "view": view_norm,
@@ -792,17 +830,27 @@ def _parse_items_query(
     }
 
 
-def _task_passes_filter(task: kanban_db.Task, flt: dict[str, Any]) -> bool:
+def _task_passes_filter(
+    task: kanban_db.Task,
+    flt: dict[str, Any],
+    meta: Optional[dict[str, Any]] = None,
+) -> bool:
     """Return True if ``task`` matches the parsed filter dict.
 
-    Filter semantics (PRD Section 6.3 / T2 Section 6.3):
+    Filter semantics (PRD Section 6.3 / T2 Section 6.3, V1.1 step 4):
       * AND across dimensions;
       * OR within a dimension (the parser already split CSV into
         lists, so membership check is OR);
       * empty dimension means "all";
       * ``include_done``/``include_archived`` are visibility
         controls, not statuses — they sit outside the canonical
-        status set.
+        status set;
+      * V1.1 metadata dimensions (``agent_profiles`` /
+        ``item_types`` / ``tags`` / ``lifecycle``) match on the
+        ``task_metadata`` row. The ``tags`` dimension uses OR
+        semantics across the CSV list but AND semantics against
+        a single task — i.e. the task must carry at least one
+        of the requested tags. Full AND-of-tags is a follow-up.
     """
     # Visibility controls come first — they shortcut the rest.
     if task.status == "archived" and not flt["include_archived"]:
@@ -817,6 +865,30 @@ def _task_passes_filter(task: kanban_db.Task, flt: dict[str, Any]) -> bool:
         text = (task.title or "") + " " + (task.body or "")
         if flt["q"] not in text.lower():
             return False
+    # V1.1 metadata dimensions. ``meta`` is always provided by
+    # :func:`_collect_items` (which has a connection open). The
+    # per-filter OR-within semantics mean: a single match in any
+    # of the requested values is enough to keep the task.
+    if any((flt["agent_profiles"], flt["item_types"],
+            flt["tags"], flt["lifecycle"])):
+        if meta is None:
+            # Caller didn't pre-fetch — defensively return False
+            # so a misconfigured call site can't accidentally let
+            # every task through the metadata filter.
+            return False
+        if (flt["agent_profiles"]
+                and (meta.get("agent_profile") or "") not in flt["agent_profiles"]):
+            return False
+        if (flt["item_types"]
+                and (meta.get("work_item_type") or "") not in flt["item_types"]):
+            return False
+        if (flt["lifecycle"]
+                and (meta.get("lifecycle_state") or "") not in flt["lifecycle"]):
+            return False
+        if flt["tags"]:
+            task_tags = set(meta.get("tags") or [])
+            if not task_tags.intersection(flt["tags"]):
+                return False
     return True
 
 
@@ -854,7 +926,15 @@ def _collect_items(flt: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str,
                 conn, [t.id for t in rows],
             )
             for task in rows:
-                if not _task_passes_filter(task, flt):
+                # V1.1: read metadata once per task and share it
+                # between the filter and the serializer. When no
+                # task_metadata row exists, the helper returns the
+                # V1.0 defaults (work_item_type='unclassified',
+                # lifecycle_state=None, agent_profile=None, tags=[])
+                # so an unclassified task is correctly excluded by
+                # any non-empty metadata filter.
+                meta_for_task = _read_task_metadata(conn, task.id)
+                if not _task_passes_filter(task, flt, meta_for_task):
                     continue
                 items.append(_item_to_public(
                     slug, task, conn=conn,
@@ -1075,6 +1155,32 @@ def portfolio_items(
     q: Optional[str] = Query(
         None, description="Substring search across title and body"
     ),
+    # V1.1 step 4 — task_metadata filter dimensions. Each is a CSV
+    # of values; OR within the dimension, AND across dimensions.
+    agent_profiles: Optional[str] = Query(
+        None, description=(
+            "Comma-separated agent profiles from KNOWN_AGENT_PROFILES "
+            "(OR within; AND across other dimensions)"
+        ),
+    ),
+    item_types: Optional[str] = Query(
+        None, description=(
+            "Comma-separated work item types (project/epic/feature/story/"
+            "task/unclassified) (OR within; AND across other dimensions)"
+        ),
+    ),
+    tags: Optional[str] = Query(
+        None, description=(
+            "Comma-separated tags; matches tasks carrying any of them "
+            "(OR semantics; full AND-of-tags is a follow-up)"
+        ),
+    ),
+    lifecycle: Optional[str] = Query(
+        None, description=(
+            "Comma-separated lifecycle states from KNOWN_LIFECYCLE_STATES "
+            "(OR within; AND across other dimensions)"
+        ),
+    ),
     include_archived: bool = Query(False),
     include_done: bool = Query(True),
     view: Optional[str] = Query("backlog"),
@@ -1086,9 +1192,20 @@ def portfolio_items(
     ``view=backlog`` (default) returns a flat, paged list. ``view=board``
     adds a ``by_status`` map so the dashboard can render the Kanban
     columns in one round-trip — the underlying list is the same.
+
+    V1.1 step 4 adds the four ``task_metadata`` filter dimensions
+    (``agent_profiles`` / ``item_types`` / ``tags`` / ``lifecycle``).
+    These are now wired up to the underlying task_metadata table —
+    pre-V1.1 they were accepted but never matched because every
+    item was unclassified. The dashboard's filter dropdowns for
+    these dimensions are now functional: the ``/filters`` endpoint
+    returns the catalogue, ``/items`` honours the query string,
+    and the ``facets`` payload returns real counts.
     """
     flt = _parse_items_query(
         boards=boards, statuses=statuses, assignees=assignees, q=q,
+        agent_profiles=agent_profiles, item_types=item_types,
+        tags=tags, lifecycle=lifecycle,
         include_archived=include_archived, include_done=include_done,
         view=view, limit=limit, offset=offset,
     )
@@ -1316,6 +1433,54 @@ def portfolio_filters() -> dict[str, Any]:
                 "type": "string",
                 "values": None,
                 "description": "Substring search across title and body",
+            },
+            # V1.1 step 4 — the four task_metadata filter
+            # dimensions. ``tags`` has an open vocabulary so values
+            # is a facet (the dashboard surfaces whatever the
+            # current item set has tagged); the other three are
+            # closed vocabularies keyed by the canonical KNOWN_*
+            # constant in plugin_api.py.
+            {
+                "key": "agent_profiles",
+                "label": "Agent profile",
+                "type": "csv",
+                "values": KNOWN_AGENT_PROFILES,
+                "description": (
+                    "Agent profile lane (jake / jake-cloud / morgan / "
+                    "loki); OR within, AND across other dimensions"
+                ),
+            },
+            {
+                "key": "item_types",
+                "label": "Item type",
+                "type": "csv",
+                "values": KNOWN_ITEM_TYPES,
+                "description": (
+                    "Work item type (project / epic / feature / story / "
+                    "task / unclassified); OR within, AND across other "
+                    "dimensions"
+                ),
+            },
+            {
+                "key": "tags",
+                "label": "Tags",
+                "type": "csv",
+                "values": "facet",
+                "description": (
+                    "Open-vocabulary tag list; OR-within (task matches "
+                    "if it carries any of the requested tags), AND "
+                    "across other dimensions"
+                ),
+            },
+            {
+                "key": "lifecycle",
+                "label": "Lifecycle",
+                "type": "csv",
+                "values": KNOWN_LIFECYCLE_STATES,
+                "description": (
+                    "Lifecycle / readiness state; OR within, AND across "
+                    "other dimensions"
+                ),
             },
             {
                 "key": "include_archived",

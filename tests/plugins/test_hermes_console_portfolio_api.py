@@ -741,6 +741,328 @@ def test_read_task_metadata_helper_tolerates_corrupt_tags_json(
 
 
 # ---------------------------------------------------------------------------
+# V1.1 step 4 — task_metadata filter dimensions
+# ---------------------------------------------------------------------------
+
+
+def _seed_metadata_for_filtering(client, seeded_default_board):
+    """Classify the 5 visible seed tasks so the new filter dimensions have data.
+
+    Layout (intentionally varied so the tests can target one or more
+    dimensions without overlap):
+
+      id[0] — "Ready for review"     — agent=jake, type=epic,
+                                        lifecycle=building,
+                                        tags=[approval, demo-ready]
+      id[1] — "Investigation in prog" — agent=morgan, type=story,
+                                        lifecycle=discovery,
+                                        tags=[regression, demo-ready]
+      id[2] — "Blocked on auth"       — agent=jake, type=task,
+                                        lifecycle=mvp,
+                                        tags=[approval]
+      id[3] — "Schedule followup"     — agent=loki, type=task,
+                                        lifecycle=planned,
+                                        tags=[followup]
+      id[4] — "Marked done"           — agent=jake-cloud, type=feature,
+                                        lifecycle=public-delivery,
+                                        tags=[shipped]
+      id[5] — "Archived task"         — UNCLASSIFIED (no row, also
+                                        status=archived so it's hidden
+                                        by default)
+
+    Agent profile values are chosen from ``KNOWN_AGENT_PROFILES`` so
+    the facet counts are not silently dropped by the closed-vocab
+    filter. The unclassified row exists so we can prove the filter
+    excludes rows with no task_metadata row when any metadata
+    filter is set.
+    """
+    for task, kwargs in zip(
+        seeded_default_board,
+        [
+            dict(agent_profile="jake", work_item_type="epic",
+                 lifecycle_state="building",
+                 tags=["approval", "demo-ready"]),
+            dict(agent_profile="morgan", work_item_type="story",
+                 lifecycle_state="discovery",
+                 tags=["regression", "demo-ready"]),
+            dict(agent_profile="jake", work_item_type="task",
+                 lifecycle_state="mvp", tags=["approval"]),
+            dict(agent_profile="loki", work_item_type="task",
+                 lifecycle_state="planned", tags=["followup"]),
+            dict(agent_profile="jake-cloud", work_item_type="feature",
+                 lifecycle_state="public-delivery", tags=["shipped"]),
+        ],
+    ):
+        kb.upsert_task_metadata(task["id"], **kwargs)
+    return seeded_default_board
+
+
+def test_items_filter_agent_profiles(
+    client, isolated_home, seeded_default_board,
+):
+    """``?agent_profiles=jake`` returns only tasks with that profile.
+
+    OR-within-dimension: ``?agent_profiles=jake,morgan`` returns
+    the union. The unclassified row (id[5]) is excluded because
+    its agent_profile is None.
+    """
+    _seed_metadata_for_filtering(client, seeded_default_board)
+    r = client.get(
+        "/api/plugins/hermes-console/portfolio/items"
+        "?agent_profiles=jake&limit=200"
+    )
+    assert r.status_code == 200
+    items = r.json()["items"]
+    assert {it["task_id"] for it in items} == {
+        seeded_default_board[0]["id"],
+        seeded_default_board[2]["id"],
+    }
+
+    # OR within dimension: jake + morgan → 3 tasks.
+    r = client.get(
+        "/api/plugins/hermes-console/portfolio/items"
+        "?agent_profiles=jake,morgan&limit=200"
+    )
+    items = r.json()["items"]
+    assert {it["task_id"] for it in items} == {
+        seeded_default_board[0]["id"],
+        seeded_default_board[1]["id"],
+        seeded_default_board[2]["id"],
+    }
+
+
+def test_items_filter_item_types(
+    client, isolated_home, seeded_default_board,
+):
+    """``?item_types=epic,feature`` returns the union of those types."""
+    _seed_metadata_for_filtering(client, seeded_default_board)
+    r = client.get(
+        "/api/plugins/hermes-console/portfolio/items"
+        "?item_types=epic,feature&limit=200"
+    )
+    items = r.json()["items"]
+    assert {it["task_id"] for it in items} == {
+        seeded_default_board[0]["id"],   # epic
+        seeded_default_board[4]["id"],   # feature
+    }
+    assert all(
+        it["work_item_type"] in ("epic", "feature") for it in items
+    )
+
+
+def test_items_filter_tags_or_semantics(
+    client, isolated_home, seeded_default_board,
+):
+    """``?tags=approval,demo-ready`` returns tasks with ANY of the tags.
+
+    Tasks 0 and 2 carry ``approval``; task 1 carries ``demo-ready``.
+    The intersection with the task's tags is non-empty for all
+    three. The unclassified task (id[5]) and the followup/shipped
+    rows are excluded because they carry none of the requested
+    tags.
+    """
+    _seed_metadata_for_filtering(client, seeded_default_board)
+    r = client.get(
+        "/api/plugins/hermes-console/portfolio/items"
+        "?tags=approval,demo-ready&limit=200"
+    )
+    items = r.json()["items"]
+    assert {it["task_id"] for it in items} == {
+        seeded_default_board[0]["id"],
+        seeded_default_board[1]["id"],
+        seeded_default_board[2]["id"],
+    }
+
+
+def test_items_filter_tags_unknown_value_dropped(
+    client, isolated_home, seeded_default_board,
+):
+    """Unknown tag values silently match nothing.
+
+    The dashboard would never surface a tag nobody has, so we
+    keep the no-400 contract: a request for ``?tags=nope`` simply
+    returns an empty list rather than raising. The route's job is
+    to translate the query into a SQL filter, not to police the
+    vocabulary.
+    """
+    _seed_metadata_for_filtering(client, seeded_default_board)
+    r = client.get(
+        "/api/plugins/hermes-console/portfolio/items?tags=nope"
+    )
+    assert r.status_code == 200
+    assert r.json()["items"] == []
+
+
+def test_items_filter_lifecycle(
+    client, isolated_home, seeded_default_board,
+):
+    """``?lifecycle=building,mvp`` returns the two tasks in those states."""
+    _seed_metadata_for_filtering(client, seeded_default_board)
+    r = client.get(
+        "/api/plugins/hermes-console/portfolio/items"
+        "?lifecycle=building,mvp&limit=200"
+    )
+    items = r.json()["items"]
+    assert {it["task_id"] for it in items} == {
+        seeded_default_board[0]["id"],   # building
+        seeded_default_board[2]["id"],   # mvp
+    }
+
+
+def test_items_filters_combine_and_across_dimensions(
+    client, isolated_home, seeded_default_board,
+):
+    """Multiple filters AND together across dimensions.
+
+    ``item_types=task`` narrows to ids 2 and 3; ``tags=approval``
+    narrows further to id 2 only. The combination must return
+    just the intersection.
+    """
+    _seed_metadata_for_filtering(client, seeded_default_board)
+    r = client.get(
+        "/api/plugins/hermes-console/portfolio/items"
+        "?item_types=task&tags=approval&limit=200"
+    )
+    items = r.json()["items"]
+    assert {it["task_id"] for it in items} == {
+        seeded_default_board[2]["id"],
+    }
+
+    # AND with a status filter, exercising the cross-dimension mix.
+    r = client.get(
+        "/api/plugins/hermes-console/portfolio/items"
+        "?statuses=blocked&item_types=task&agent_profiles=jake"
+        "&lifecycle=mvp&tags=approval&limit=200"
+    )
+    assert {it["task_id"] for it in items} == {
+        seeded_default_board[2]["id"],
+    }
+
+
+def test_items_filter_excludes_unclassified_when_set(
+    client, isolated_home, seeded_default_board,
+):
+    """A non-empty metadata filter must exclude unclassified rows.
+
+    Pre-V1.1 the items endpoint accepted these params and silently
+    returned zero results because every item was unclassified. The
+    T03 read model fixed the read path; T04 must show the filter
+    actually does the work. An unclassified task (no
+    task_metadata row) must drop out when any metadata filter is
+    active, because its values are all None / "unclassified" /
+    [].
+
+    Test signal: request an agent profile (``loki``) that exactly
+    one task carries, then check the result set is smaller than
+    the unfiltered set. If the filter were a no-op, the
+    unfiltered and filtered sets would be equal.
+    """
+    _seed_metadata_for_filtering(client, seeded_default_board)
+    r_unfiltered = client.get(
+        "/api/plugins/hermes-console/portfolio/items?limit=200"
+    )
+    unfiltered_ids = {it["task_id"] for it in r_unfiltered.json()["items"]}
+    r_filtered = client.get(
+        "/api/plugins/hermes-console/portfolio/items"
+        "?agent_profiles=loki&limit=200"
+    )
+    filtered_ids = {it["task_id"] for it in r_filtered.json()["items"]}
+    # Filtered set is strictly smaller than unfiltered (loki only
+    # matches one row out of the five classified tasks), proving
+    # the filter is actually doing work.
+    assert filtered_ids < unfiltered_ids
+    assert filtered_ids == {seeded_default_board[3]["id"]}
+
+
+def test_items_filter_unknown_known_values_are_dropped(
+    client, isolated_home, seeded_default_board,
+):
+    """Unknown KNOWN_* values are dropped silently.
+
+    ``item_types=epic,banana,task`` collapses to ``epic,task`` —
+    the parser uses :func:`_parse_known` which skips values not in
+    the catalogue. This keeps the dashboard's open-vocabulary
+    drift from 400-ing filters. The unfiltered items are returned
+    because the remaining values still match.
+    """
+    _seed_metadata_for_filtering(client, seeded_default_board)
+    r = client.get(
+        "/api/plugins/hermes-console/portfolio/items"
+        "?item_types=epic,banana,task&limit=200"
+    )
+    assert r.status_code == 200
+    items = r.json()["items"]
+    assert {it["task_id"] for it in items} == {
+        seeded_default_board[0]["id"],   # epic
+        seeded_default_board[2]["id"],   # task
+        seeded_default_board[3]["id"],   # task
+    }
+
+
+def test_items_facets_return_real_counts_for_metadata_dimensions(
+    client, isolated_home, seeded_default_board,
+):
+    """``facets`` populates real counts for the four V1.1 dimensions.
+
+    Pre-V1.1 the facets returned 0 / empty for agent_profiles,
+    item_types, tags, and lifecycle. After T04 they reflect the
+    underlying task_metadata table. ``tags`` is a list-valued
+    facet so each tag appears once with its item count.
+    """
+    _seed_metadata_for_filtering(client, seeded_default_board)
+    r = client.get("/api/plugins/hermes-console/portfolio/items?limit=200")
+    facets = r.json()["facets"]
+    # agent_profiles — counted by item, not by occurrence.
+    ap = {row["value"]: row["count"] for row in facets["agent_profiles"]}
+    assert ap == {"jake": 2, "morgan": 1, "loki": 1, "jake-cloud": 1}
+    # item_types — same.
+    it = {row["value"]: row["count"] for row in facets["item_types"]}
+    assert it == {
+        "epic": 1, "story": 1, "task": 2, "feature": 1,
+    }
+    # lifecycle.
+    lc = {row["value"]: row["count"] for row in facets["lifecycle"]}
+    assert lc == {
+        "building": 1, "discovery": 1, "mvp": 1, "planned": 1,
+        "public-delivery": 1,
+    }
+    # tags — list-valued; each tag counted once per carrying item.
+    tg = {row["value"]: row["count"] for row in facets["tags"]}
+    assert tg == {
+        "approval": 2, "demo-ready": 2, "regression": 1,
+        "followup": 1, "shipped": 1,
+    }
+
+
+def test_filters_catalogue_lists_metadata_dimensions(client):
+    """``/filters`` exposes all four V1.1 dimensions in its catalogue.
+
+    The dashboard uses the catalogue to render the filter bar and
+    to validate user input. The four V1.1 dimensions must appear
+    with the correct type / values (closed vocab vs facet).
+    """
+    r = client.get("/api/plugins/hermes-console/portfolio/filters")
+    assert r.status_code == 200
+    data = r.json()
+    by_key = {d["key"]: d for d in data["dimensions"]}
+    for key in ("agent_profiles", "item_types", "tags", "lifecycle"):
+        assert key in by_key, f"missing dimension {key}"
+        assert by_key[key]["type"] == "csv"
+    # The three closed-vocabularies carry the KNOWN_* list.
+    assert set(by_key["agent_profiles"]["values"]) == set(
+        _load_plugin_router().KNOWN_AGENT_PROFILES,
+    )
+    assert set(by_key["item_types"]["values"]) == set(
+        _load_plugin_router().KNOWN_ITEM_TYPES,
+    )
+    assert set(by_key["lifecycle"]["values"]) == set(
+        _load_plugin_router().KNOWN_LIFECYCLE_STATES,
+    )
+    # Tags is a facet, not a closed list.
+    assert by_key["tags"]["values"] == "facet"
+
+
+# ---------------------------------------------------------------------------
 # /events
 # ---------------------------------------------------------------------------
 
@@ -851,4 +1173,30 @@ def test_dist_assets_exist_and_have_content():
     for s in ("scheduled", "review", "blocked", "done", "archived"):
         assert f'"{s}"' in text or f"'{s}'" in text, (
             f"missing canonical status {s!r} in JS"
+        )
+    # V1.1 step 4 — the chrome exposes filter rows for the four
+    # task_metadata dimensions. The id is the public contract
+    # for the FilterBar Select/Input element; if any of these
+    # disappear the chrome has regressed and bullet 7 of T04 is
+    # no longer covered.
+    for fid in (
+        "hc-filter-agent-profile",
+        "hc-filter-item-type",
+        "hc-filter-lifecycle",
+        "hc-filter-tags",
+    ):
+        assert fid in text, f"FilterBar is missing id={fid!r}"
+    # The filter state object must include all four new keys
+    # (initial state, useEffect deps, and onResetFilters all
+    # reference them, so a single grep catches regressions in
+    # any of those three locations).
+    for state_key in (
+        "agent_profiles:",
+        "item_types:",
+        "tags:",
+        "lifecycle:",
+    ):
+        assert state_key in text, (
+            f"filter state is missing key {state_key!r} — the chrome "
+            "filter field won't survive a Reset or a re-render"
         )
