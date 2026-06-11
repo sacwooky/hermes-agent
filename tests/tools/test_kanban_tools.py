@@ -1220,7 +1220,9 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     assert "kanban_block" in prompt
     assert "kanban_create" in prompt
     # Anti-shell guidance
-    assert "Do not shell out" in prompt or "tools — they work" in prompt
+    assert "Do not shell out" in prompt or "tools -- they work" in prompt
+    # Completion verification — commit_hash required for code/repo tasks
+    assert "commit_hash" in prompt
 
 
 def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
@@ -1812,3 +1814,14 @@ def test_board_param_in_all_schemas():
         assert "board" not in schema["parameters"].get("required", []), (
             f"{schema['name']} marks board as required; must be optional"
         )
+
+
+def test_kanban_complete_schema_mentions_commit_hash():
+    """commit_hash must appear in the kanban_complete description so
+    workers are prompted to include it in their completion metadata."""
+    from tools import kanban_tools as kt
+    desc = kt.KANBAN_COMPLETE_SCHEMA["description"]
+    assert "commit_hash" in desc, (
+        "kanban_complete schema description must mention commit_hash "
+        "to prompt workers to provide git verification evidence"
+    )

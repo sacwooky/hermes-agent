@@ -983,7 +983,7 @@ KANBAN_COMPLETE_SCHEMA = {
         "downstream workers and humans. Prefer ``summary`` for a "
         "human-readable 1-3 sentence description of what you did; put "
         "machine-readable facts in ``metadata`` (changed_files, "
-        "tests_run, decisions, findings, etc). At least one of "
+        "tests_run, commit_hash, decisions, findings, etc). At least one of "
         "``summary`` or ``result`` is required. If you created new "
         "tasks via ``kanban_create`` during this run, list their ids "
         "in ``created_cards`` — the kernel verifies them so phantom "
@@ -1015,7 +1015,7 @@ KANBAN_COMPLETE_SCHEMA = {
                 "description": (
                     "Free-form dict of structured facts about this "
                     "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
-                    "\"findings\": [...]}. Surfaced to downstream "
+                    "\"commit_hash\": \"abc1234\", \"findings\": [...]}. Surfaced to "
                     "workers alongside ``summary``."
                 ),
             },
