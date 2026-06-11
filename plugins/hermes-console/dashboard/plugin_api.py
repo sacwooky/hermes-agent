@@ -599,6 +599,42 @@ def _is_stale(task: kanban_db.Task) -> bool:
     return (now - int(last_touch)) > 24 * 3600
 
 
+def _derive_approval_state(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Derive ``approval_state`` from ``task_approvals`` rows.
+
+    Returns one of ``'pending'``, ``'approved'``, ``'rejected'``,
+    ``'changes_requested'``, ``'expired'``, or ``None``.
+
+    Priority order (first match wins):
+      1. ``rejected``    — any approval with status ``'rejected'``
+      2. ``pending``     — any approval with status ``'pending'``
+      3. ``changes_requested`` — any ``'changes_requested'``, no
+         rejections or pending above
+      4. ``expired``     — any ``'expired'``, no higher-priority state
+      5. ``approved``    — all approvals are ``'approved'``
+      6. ``None``        — no approvals exist (V1.0 default preserved)
+    """
+    rows = conn.execute(
+        "SELECT status FROM task_approvals WHERE task_id = ?",
+        (task_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    statuses = {r["status"] for r in rows}
+    if "rejected" in statuses:
+        return "rejected"
+    if "pending" in statuses:
+        return "pending"
+    if "changes_requested" in statuses:
+        return "changes_requested"
+    if "expired" in statuses:
+        return "expired"
+    # All must be "approved".
+    return "approved"
+
+
 def _item_to_public(
     board_slug: str, task: kanban_db.Task, *,
     conn: Optional[sqlite3.Connection] = None,
@@ -620,6 +656,7 @@ def _item_to_public(
     comment_count = 0
     run_count = 0
     attachment_count = 0
+    approval_state: Optional[str] = None
     if conn is not None:
         progress = _compute_progress(task, conn)
         link_counts = _links_counts(conn, task.id)
@@ -630,6 +667,8 @@ def _item_to_public(
         # agent_profile / tags) from the task_metadata table, falling
         # back to V1.0 defaults when no row exists for this task.
         meta = _read_task_metadata(conn, task.id)
+        # V1.2: derive approval_state from task_approvals.
+        approval_state = _derive_approval_state(conn, task.id)
     else:
         meta = {
             "work_item_type": _DEFAULT_WORK_ITEM_TYPE,
@@ -666,7 +705,7 @@ def _item_to_public(
         "progress": progress,
         "needs_keith": _needs_keith(task),
         "stale": _is_stale(task),
-        "approval_state": None,
+        "approval_state": approval_state,
         "source": "kanban",
         "latest_summary": _safe_preview(latest_summary, limit=_PREVIEW_CHARS),
     }

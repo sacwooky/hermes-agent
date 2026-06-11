@@ -541,6 +541,42 @@ def test_add_comment_empty_rejected(client):
     assert r.status_code == 400
 
 
+def test_record_acceptance(client):
+    """POST /tasks/:id/acceptance records an accepted event and ACCEPTED comment."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "needs accept"}).json()["task"]
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/acceptance",
+        json={"accepted_by": "keith", "body": "verified"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["task_id"] == t["id"]
+    assert body["accepted_by"] == "keith"
+    # Verify the comment and event are visible.
+    detail = client.get(f"/api/plugins/kanban/tasks/{t['id']}").json()
+    assert any("ACCEPTED" in c["body"] for c in detail["comments"])
+
+
+def test_record_acceptance_unknown_task(client):
+    r = client.post(
+        "/api/plugins/kanban/tasks/t_nonexistent/acceptance",
+        json={"accepted_by": "keith"},
+    )
+    assert r.status_code == 404
+
+
+def test_record_acceptance_default_author(client):
+    """No accepted_by → defaults to 'operator'."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "anon"}).json()["task"]
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{t['id']}/acceptance",
+        json={},
+    )
+    assert r.status_code == 200
+    assert r.json()["accepted_by"] == "operator"
+
+
 def test_add_link_and_delete_link(client):
     a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
     b = client.post("/api/plugins/kanban/tasks", json={"title": "b"}).json()["task"]

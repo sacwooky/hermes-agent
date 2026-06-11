@@ -569,6 +569,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_unblock.add_argument("task_ids", nargs="+")
 
+    p_accept = sub.add_parser(
+        "accept",
+        help="Record per-task operator acceptance (enables completion on acceptance-gated boards)",
+    )
+    p_accept.add_argument("task_id", help="Task id to accept")
+    p_accept.add_argument(
+        "--by",
+        default=None,
+        help="Name of the accepter (default: $HERMES_PROFILE or 'operator')",
+    )
+    p_accept.add_argument(
+        "comment",
+        nargs="*",
+        help="Optional comment body appended to the acceptance record",
+    )
+
     p_promote = sub.add_parser(
         "promote",
         help="Manually move one or more todo/blocked tasks to ready (recovery path)",
@@ -941,6 +957,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "accept":   _cmd_accept,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
@@ -1892,15 +1909,27 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             print(f"kanban: --metadata: {exc}", file=sys.stderr)
             return 2
     failed: list[str] = []
-    with kb.connect_closing() as conn:
+    board = os.environ.get("HERMES_KANBAN_BOARD")
+    with kb.connect_closing(board=board) as conn:
         for tid in ids:
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                ok = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                    board=board,
+                )
+            except kb.AcceptanceRequiredError:
+                failed.append(tid)
+                print(
+                    f"acceptance-required: {tid} needs operator acceptance before "
+                    f"it can be marked done. Run: hermes kanban accept {tid}",
+                    file=sys.stderr,
+                )
+                continue
+            if not ok:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
@@ -2000,6 +2029,31 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_accept(args: argparse.Namespace) -> int:
+    """Record per-task operator acceptance."""
+    tid = args.task_id
+    if not tid:
+        print("task_id is required", file=sys.stderr)
+        return 1
+    accepted_by = getattr(args, "by", None) or _profile_author()
+    comment_parts = list(getattr(args, "comment", None) or [])
+    body = " ".join(comment_parts).strip() if comment_parts else "accepted"
+    try:
+        board = os.environ.get("HERMES_KANBAN_BOARD")
+        with kb.connect_closing(board=board) as conn:
+            kb.record_task_acceptance(
+                conn, tid, accepted_by, source="cli", body=body,
+            )
+        print(f"Accepted {tid} (by {accepted_by})")
+    except ValueError as e:
+        print(f"kanban accept: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"kanban accept: {e}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def _cmd_promote(args: argparse.Namespace) -> int:

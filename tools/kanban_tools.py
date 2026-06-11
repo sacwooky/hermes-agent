@@ -559,6 +559,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    board=board,
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
@@ -579,6 +580,14 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"Retry kanban_complete with the same summary/metadata "
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
+                )
+            except kb.AcceptanceRequiredError:
+                return tool_error(
+                    f"acceptance-required: {tid} needs operator acceptance "
+                    f"before it can be marked done. The operator must run "
+                    f"``hermes kanban accept {tid}`` (or use the dashboard "
+                    f"Accept action) first. Write evidence as a comment and "
+                    f"block with reason='acceptance-required: ...' instead."
                 )
             if not ok:
                 return tool_error(
