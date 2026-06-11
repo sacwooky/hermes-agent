@@ -1200,3 +1200,155 @@ def test_dist_assets_exist_and_have_content():
             f"filter state is missing key {state_key!r} — the chrome "
             "filter field won't survive a Reset or a re-render"
         )
+
+
+# ---------------------------------------------------------------------------
+# approval_state derivation (V1.2-T06)
+# ---------------------------------------------------------------------------
+
+
+def _derive_approval_state(plugin_mod, conn, task_id):
+    """Thin wrapper so tests can call the module helper."""
+    return plugin_mod._derive_approval_state(conn, task_id)
+
+
+class TestDeriveApprovalState:
+    """Unit tests for _derive_approval_state."""
+
+    def test_no_approvals_is_none(self, isolated_home, plugin_module):
+        """An item with no approvals has approval_state = None (V1.0 default)."""
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="plain task")
+            result = _derive_approval_state(plugin_module, conn, tid)
+        assert result is None
+
+    def test_single_pending_is_pending(self, isolated_home, plugin_module):
+        """An item with a pending approval has approval_state = 'pending'."""
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="needs gate")
+        kb.create_task_approval(tid, approval_type="wireframe")
+        with kb.connect() as conn:
+            result = _derive_approval_state(plugin_module, conn, tid)
+        assert result == "pending"
+
+    def test_all_approved_is_approved(self, isolated_home, plugin_module):
+        """An item where all approvals are approved has approval_state = 'approved'."""
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="all clear")
+        a1 = kb.create_task_approval(tid, approval_type="wireframe")
+        a2 = kb.create_task_approval(tid, approval_type="gate")
+        kb.decide_task_approval(a1, decision="approved", approver="keith")
+        kb.decide_task_approval(a2, decision="approved", approver="keith")
+        with kb.connect() as conn:
+            result = _derive_approval_state(plugin_module, conn, tid)
+        assert result == "approved"
+
+    def test_any_rejected_is_rejected(self, isolated_home, plugin_module):
+        """An item with a rejected approval has approval_state = 'rejected',
+        even if other approvals are approved."""
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="sent back")
+        a1 = kb.create_task_approval(tid, approval_type="wireframe")
+        a2 = kb.create_task_approval(tid, approval_type="gate")
+        kb.decide_task_approval(a1, decision="approved", approver="keith")
+        kb.decide_task_approval(a2, decision="rejected", approver="keith")
+        with kb.connect() as conn:
+            result = _derive_approval_state(plugin_module, conn, tid)
+        assert result == "rejected"
+
+    def test_changes_requested_no_rejection(self, isolated_home, plugin_module):
+        """'changes_requested' wins when there are no rejections or pending."""
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="revise me")
+        a1 = kb.create_task_approval(tid, approval_type="wireframe")
+        kb.decide_task_approval(a1, decision="changes_requested", approver="keith")
+        with kb.connect() as conn:
+            result = _derive_approval_state(plugin_module, conn, tid)
+        assert result == "changes_requested"
+
+    def test_expired_no_other_state(self, isolated_home, plugin_module):
+        """'expired' wins when there are no rejections, pending, or changes_requested."""
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="timed out")
+        a1 = kb.create_task_approval(tid, approval_type="gate")
+        # Directly set status to expired since decide only supports
+        # approved/rejected/changes_requested.
+        with kb.connect() as conn:
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE task_approvals SET status = 'expired' WHERE approval_id = ?",
+                    (a1,),
+                )
+            result = _derive_approval_state(plugin_module, conn, tid)
+        assert result == "expired"
+
+    def test_rejected_overrides_pending(self, isolated_home, plugin_module):
+        """'rejected' has highest priority — overrides 'pending'."""
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="mixed signals")
+        a1 = kb.create_task_approval(tid, approval_type="wireframe")
+        a2 = kb.create_task_approval(tid, approval_type="gate")
+        kb.decide_task_approval(a1, decision="rejected", approver="keith")
+        # a2 is still pending
+        with kb.connect() as conn:
+            result = _derive_approval_state(plugin_module, conn, tid)
+        assert result == "rejected"
+
+    def test_pending_overrides_changes_requested(self, isolated_home, plugin_module):
+        """'pending' has second-highest priority — overrides 'changes_requested'."""
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="mixed again")
+        a1 = kb.create_task_approval(tid, approval_type="wireframe")
+        a2 = kb.create_task_approval(tid, approval_type="gate")
+        kb.decide_task_approval(a1, decision="changes_requested", approver="keith")
+        # a2 is still pending
+        with kb.connect() as conn:
+            result = _derive_approval_state(plugin_module, conn, tid)
+        assert result == "pending"
+
+
+def test_approval_state_appears_in_items_payload(client, isolated_home):
+    """approval_state is populated in the GET /items response when approvals exist."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="needs wireframe ok")
+    kb.create_task_approval(tid, approval_type="wireframe")
+    resp = client.get("/api/plugins/hermes-console/portfolio/items")
+    assert resp.status_code == 200
+    data = resp.json()
+    items = data["items"]
+    # Find our task.
+    match = [i for i in items if i["task_id"] == tid]
+    assert len(match) == 1
+    assert match[0]["approval_state"] == "pending"
+
+
+def test_approval_state_null_when_no_approvals_in_items(client, isolated_home):
+    """approval_state is None in the GET /items response when no approvals exist."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="plain no approvals")
+    resp = client.get("/api/plugins/hermes-console/portfolio/items")
+    assert resp.status_code == 200
+    data = resp.json()
+    items = data["items"]
+    match = [i for i in items if i["task_id"] == tid]
+    assert len(match) == 1
+    assert match[0]["approval_state"] is None
+
+
+def test_approval_state_appears_in_item_detail(client, isolated_home):
+    """approval_state is populated in the GET /item/:id detail response."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="detail check")
+    kb.create_task_approval(tid, approval_type="gate")
+    kb.decide_task_approval(
+        kb.list_task_approvals(tid)[0]["approval_id"],
+        decision="approved",
+        approver="keith",
+    )
+    slug = kb.get_current_board()
+    resp = client.get(
+        f"/api/plugins/hermes-console/portfolio/item/{slug}/{tid}"
+    )
+    assert resp.status_code == 200
+    task_data = resp.json()["task"]
+    assert task_data["approval_state"] == "approved"

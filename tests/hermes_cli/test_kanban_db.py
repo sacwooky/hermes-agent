@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import sys
@@ -4372,3 +4373,251 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Approval decision event mirroring (V1.2-T03)
+# ---------------------------------------------------------------------------
+
+def test_approval_decision_writes_event(kanban_home):
+    """decide_task_approval mirrors the decision as an approval_decision event."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="needs approval")
+    approval_id = kb.create_task_approval(
+        tid, approval_type="gate", artifacts=["PR #42"],
+        unblock_target_id=tid, unblock_behavior="unblock",
+    )
+    result = kb.decide_task_approval(
+        approval_id, decision="approved", approver="keith",
+    )
+    # The function returned the updated row.
+    assert result["decision"] == "approved"
+    assert result["approver"] == "keith"
+    # Verify the event was written.
+    with kb.connect() as conn:
+        events = conn.execute(
+            "SELECT kind, payload, created_at FROM task_events WHERE task_id = ? ORDER BY id",
+            (tid,),
+        ).fetchall()
+    approval_events = [e for e in events if e["kind"] == "approval_decision"]
+    assert len(approval_events) == 1, (
+        f"Expected exactly 1 approval_decision event, got {len(approval_events)}"
+    )
+    payload = json.loads(approval_events[0]["payload"])
+    assert payload["approval_id"] == approval_id
+    assert payload["approval_type"] == "gate"
+    assert payload["decision"] == "approved"
+    assert payload["approver"] == "keith"
+    assert payload["artifacts"] == ["PR #42"]
+    assert payload["selected_option_id"] is None
+    assert payload["unblock_target_id"] == tid
+    assert payload["unblock_behavior"] == "unblock"
+
+
+def test_approval_decision_no_event_on_reject(kanban_home):
+    """If decide raises (non-pending / not found), no event is written."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="stale approval")
+    approval_id = kb.create_task_approval(tid, approval_type="gate")
+    # Decide it once — succeeds, writes event.
+    kb.decide_task_approval(approval_id, decision="approved", approver="keith")
+    # Second decide — should raise RuntimeError (non-pending).
+    with pytest.raises(RuntimeError, match="not pending"):
+        kb.decide_task_approval(approval_id, decision="approved", approver="keith")
+    # Only one approval_decision event (from the first successful decide).
+    with kb.connect() as conn:
+        events = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? AND kind = 'approval_decision'",
+            (tid,),
+        ).fetchall()
+    assert len(events) == 1
+
+
+def test_approval_decision_not_found_no_event(kanban_home):
+    """Deciding a nonexistent approval raises ValueError, no event written."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ghost target")
+    with pytest.raises(ValueError, match="not found"):
+        kb.decide_task_approval("apr_00000000", decision="approved", approver="keith")
+    with kb.connect() as conn:
+        events = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? AND kind = 'approval_decision'",
+            (tid,),
+        ).fetchall()
+    assert len(events) == 0
+
+
+# ---------------------------------------------------------------------------
+# Per-task operator acceptance guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def acceptance_board(kanban_home, monkeypatch):
+    """Board with ``require_operator_acceptance_for_done`` enabled."""
+    board_slug = "accept-test"
+    board_dir = kb.board_dir(board_slug)
+    board_dir.mkdir(parents=True, exist_ok=True)
+    board_json = board_dir / "board.json"
+    board_json.write_text(json.dumps({
+        "slug": board_slug,
+        "name": "Accept Test",
+        "require_operator_acceptance_for_done": True,
+    }), encoding="utf-8")
+    # Init a fresh DB for this board.
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board_slug)
+    kb.init_db()
+    return board_slug
+
+
+def test_complete_without_acceptance_raises(acceptance_board):
+    """On an acceptance-gated board, complete_task raises
+    AcceptanceRequiredError when no ``accepted`` event exists."""
+    with kb.connect(board=acceptance_board) as conn:
+        tid = kb.create_task(conn, title="needs acceptance")
+        kb.claim_task(conn, tid, claimer="test-worker", ttl_seconds=300)
+    with pytest.raises(kb.AcceptanceRequiredError, match="acceptance-required"):
+        with kb.connect(board=acceptance_board) as conn:
+            kb.complete_task(conn, tid, summary="done", board=acceptance_board)
+    # Status must NOT be done.
+    with kb.connect(board=acceptance_board) as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status != "done"
+    assert task.completed_at is None
+
+
+def test_complete_after_acceptance_succeeds(acceptance_board):
+    """After recording acceptance, complete_task succeeds normally."""
+    with kb.connect(board=acceptance_board) as conn:
+        tid = kb.create_task(conn, title="accepted task")
+        kb.claim_task(conn, tid, claimer="test-worker", ttl_seconds=300)
+    with kb.connect(board=acceptance_board) as conn:
+        kb.record_task_acceptance(conn, tid, "keith", source="test")
+    with kb.connect(board=acceptance_board) as conn:
+        ok = kb.complete_task(conn, tid, summary="shipped", board=acceptance_board)
+    assert ok is True
+    with kb.connect(board=acceptance_board) as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.status == "done"
+
+
+def test_has_task_acceptance_false_without_event(acceptance_board):
+    """_has_task_acceptance returns False when no accepted event exists."""
+    with kb.connect(board=acceptance_board) as conn:
+        tid = kb.create_task(conn, title="no event")
+    with kb.connect(board=acceptance_board) as conn:
+        assert kb._has_task_acceptance(conn, tid) is False
+
+
+def test_has_task_acceptance_true_after_record(acceptance_board):
+    """_has_task_acceptance returns True after record_task_acceptance."""
+    with kb.connect(board=acceptance_board) as conn:
+        tid = kb.create_task(conn, title="with event")
+        kb.record_task_acceptance(conn, tid, "keith", source="test")
+    with kb.connect(board=acceptance_board) as conn:
+        assert kb._has_task_acceptance(conn, tid) is True
+
+
+def test_record_acceptance_unknown_task_raises(kanban_home):
+    """record_task_acceptance raises ValueError for unknown task."""
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="unknown task"):
+            kb.record_task_acceptance(conn, "t_nonexistent", "keith")
+
+
+def test_record_acceptance_writes_event_and_comment(acceptance_board):
+    """record_task_acceptance writes an accepted event and an ACCEPTED comment."""
+    with kb.connect(board=acceptance_board) as conn:
+        tid = kb.create_task(conn, title="track artifacts")
+        kb.record_task_acceptance(
+            conn, tid, "keith", source="test", body="looks good",
+        )
+        events = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id",
+            (tid,),
+        ).fetchall()
+    accepted_events = [e for e in events if e["kind"] == "accepted"]
+    assert len(accepted_events) == 1
+    payload = json.loads(accepted_events[0]["payload"])
+    assert payload["accepted_by"] == "keith"
+    assert payload["source"] == "test"
+    assert payload["body"] == "looks good"
+    # Comment should be present too.
+    with kb.connect(board=acceptance_board) as conn:
+        comments = conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ?",
+            (tid,),
+        ).fetchall()
+    assert any("ACCEPTED" in c["body"] for c in comments)
+
+
+def test_acceptance_is_per_task_not_parent(acceptance_board):
+    """Accepting a parent does NOT satisfy acceptance for a child."""
+    with kb.connect(board=acceptance_board) as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+    with kb.connect(board=acceptance_board) as conn:
+        kb.record_task_acceptance(conn, parent, "keith", source="test")
+    # Parent can now be completed, but child cannot.
+    with kb.connect(board=acceptance_board) as conn:
+        kb.complete_task(conn, parent, summary="done", board=acceptance_board)
+    with pytest.raises(kb.AcceptanceRequiredError):
+        with kb.connect(board=acceptance_board) as conn:
+            kb.complete_task(conn, child, summary="done", board=acceptance_board)
+
+
+def test_parent_not_done_until_accepted_child_promotion(acceptance_board):
+    """Children are not promoted until the parent is both accepted AND done."""
+    with kb.connect(board=acceptance_board) as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        kb.claim_task(conn, parent, claimer="w", ttl_seconds=300)
+        kb.claim_task(conn, child, claimer="w", ttl_seconds=300)
+    # Without acceptance, parent stays non-done; child stays non-ready.
+    with pytest.raises(kb.AcceptanceRequiredError):
+        with kb.connect(board=acceptance_board) as conn:
+            kb.complete_task(conn, parent, summary="done", board=acceptance_board)
+    with kb.connect(board=acceptance_board) as conn:
+        child_task = kb.get_task(conn, child)
+        assert child_task is not None and child_task.status != "ready"
+    # Accept + complete parent → child should promote.
+    with kb.connect(board=acceptance_board) as conn:
+        kb.record_task_acceptance(conn, parent, "keith", source="test")
+        kb.complete_task(conn, parent, summary="done", board=acceptance_board)
+    with kb.connect(board=acceptance_board) as conn:
+        child_task = kb.get_task(conn, child)
+        assert child_task is not None and child_task.status == "ready"
+
+
+def test_approval_state_does_not_satisfy_acceptance(acceptance_board):
+    """task_approvals.status='approved' does NOT satisfy _has_task_acceptance."""
+    with kb.connect(board=acceptance_board) as conn:
+        tid = kb.create_task(conn, title="has approval")
+    # Create an approval and decide it approved.
+    approval_id = kb.create_task_approval(
+        tid, approval_type="gate", artifacts=["PR #1"],
+        unblock_target_id=tid, unblock_behavior="unblock",
+    )
+    kb.decide_task_approval(approval_id, decision="approved", approver="keith")
+    # But no acceptance event → complete_task should still raise.
+    with pytest.raises(kb.AcceptanceRequiredError):
+        with kb.connect(board=acceptance_board) as conn:
+            kb.complete_task(conn, tid, summary="done", board=acceptance_board)
+
+
+def test_board_without_acceptance_gate_allows_complete(kanban_home):
+    """On a board without the acceptance gate, complete_task works normally."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="no gate")
+        kb.claim_task(conn, tid, claimer="w", ttl_seconds=300)
+        # No acceptance recorded, but board doesn't require it.
+        ok = kb.complete_task(conn, tid, summary="done")
+    assert ok is True
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_board_requires_acceptance_returns_false_by_default(kanban_home):
+    """_board_requires_acceptance defaults to False."""
+    assert kb._board_requires_acceptance(None) is False

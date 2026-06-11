@@ -1196,6 +1196,32 @@ CREATE TABLE IF NOT EXISTS task_metadata (
 CREATE INDEX IF NOT EXISTS idx_metadata_type      ON task_metadata(work_item_type);
 CREATE INDEX IF NOT EXISTS idx_metadata_lifecycle ON task_metadata(lifecycle_state);
 CREATE INDEX IF NOT EXISTS idx_metadata_agent     ON task_metadata(agent_profile);
+
+-- task_approvals — Portfolio V1.2 (approval gate storage).
+-- Tracks approval requests, options presented to the operator, and the
+-- operator's decision.  A row is created when an agent requests approval
+-- and updated when the operator decides.  ``status = 'pending'`` is the
+-- default; downstream workers poll this table to discover whether they
+-- are still blocked or can proceed.
+CREATE TABLE IF NOT EXISTS task_approvals (
+    approval_id        TEXT PRIMARY KEY,
+    task_id             TEXT NOT NULL,
+    approval_type      TEXT NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'pending',
+    artifacts_json     TEXT NOT NULL DEFAULT '[]',
+    options_json       TEXT NOT NULL DEFAULT '[]',
+    selected_option_id TEXT,
+    decision           TEXT,
+    approver           TEXT,
+    decided_at         INTEGER,
+    comment            TEXT,
+    unblock_target_id  TEXT,
+    unblock_behavior   TEXT,
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_approvals_task   ON task_approvals(task_id);
+CREATE INDEX IF NOT EXISTS idx_approvals_status ON task_approvals(status);
 """
 
 
@@ -1916,10 +1942,37 @@ def _run_additive_migrations(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_metadata_agent ON task_metadata(agent_profile)"
     )
-    # task_approvals is reserved for a later V1.1 card (T07+). The
-    # SCHEMA_SQL block intentionally does not include it yet so the
-    # additive migration that introduces it lands as a single atomic
-    # change in that card's commit.
+
+    # task_approvals — Portfolio V1.2 (approval gate storage).
+    # Same rationale as task_metadata: fresh DBs get this via SCHEMA_SQL;
+    # legacy boards pick it up here on first open.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS task_approvals (
+            approval_id        TEXT PRIMARY KEY,
+            task_id             TEXT NOT NULL,
+            approval_type      TEXT NOT NULL,
+            status             TEXT NOT NULL DEFAULT 'pending',
+            artifacts_json     TEXT NOT NULL DEFAULT '[]',
+            options_json       TEXT NOT NULL DEFAULT '[]',
+            selected_option_id TEXT,
+            decision           TEXT,
+            approver           TEXT,
+            decided_at         INTEGER,
+            comment            TEXT,
+            unblock_target_id  TEXT,
+            unblock_behavior   TEXT,
+            created_at         INTEGER NOT NULL,
+            updated_at         INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_approvals_task ON task_approvals(task_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_approvals_status ON task_approvals(status)"
+    )
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -2845,6 +2898,7 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
+    created_at: Optional[int] = None,
 ) -> None:
     """Record an event row.  Called from within an already-open txn.
 
@@ -2852,13 +2906,17 @@ def _append_event(
     events by attempt. For events that aren't scoped to a single run
     (task created/edited/archived, dependency promotion) leave it None
     and the row carries NULL.
+
+    ``created_at`` is optional: defaults to the current epoch second.
+    Pass an explicit value when the event timestamp must match an
+    external anchor (e.g. an approval decision's decided_at).
     """
-    now = int(time.time())
+    ts = created_at if created_at is not None else int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
     conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
-        (task_id, run_id, kind, pl, now),
+        (task_id, run_id, kind, pl, ts),
     )
 
 
@@ -3842,6 +3900,109 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+class AcceptanceRequiredError(Exception):
+    """Raised by ``complete_task`` when the board requires per-task
+    operator acceptance but no ``accepted`` event has been recorded for
+    the task.
+
+    Callers (CLI, agent tool, dashboard API) should catch this and
+    surface a human-readable message explaining that the operator must
+    run ``hermes kanban accept <task_id>`` (or the equivalent gateway/
+    dashboard action) before the task can be marked done.
+
+    This is *not* a ``ValueError`` — it is a deliberate policy rejection,
+    not a malformed-input error.
+    """
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        super().__init__(
+            f"acceptance-required: operator must reply accepted for task "
+            f"{task_id} before it can be marked done"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Per-task operator acceptance
+# ---------------------------------------------------------------------------
+
+
+def record_task_acceptance(
+    conn: sqlite3.Connection,
+    task_id: str,
+    accepted_by: str,
+    *,
+    source: Optional[str] = None,
+    body: str = "accepted",
+) -> bool:
+    """Record a per-task operator acceptance event and comment.
+
+    Writes an ``accepted`` event to ``task_events`` and a
+    ``ACCEPTED: <body>`` comment to ``task_comments`` so the acceptance
+    is visible in both the event log and the comment thread.
+
+    Returns ``True`` on success.  Raises ``ValueError`` for unknown tasks.
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        if not conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone():
+            raise ValueError(f"unknown task {task_id}")
+        _append_event(
+            conn,
+            task_id,
+            "accepted",
+            {"accepted_by": accepted_by, "source": source, "body": body},
+        )
+        # Write a comment so the acceptance appears in the comment thread.
+        # Use add_comment for its validation; the event is the canonical
+        # record.
+        comment_body = f"ACCEPTED: {body}" if body != "accepted" else "ACCEPTED"
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (task_id, accepted_by.strip(), comment_body.strip(), now),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "commented",
+            {"author": accepted_by, "len": len(comment_body)},
+        )
+    return True
+
+
+def _has_task_acceptance(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return ``True`` when an ``accepted`` event exists for *task_id*.
+
+    Only a first-class ``accepted`` event satisfies this check.  Comments
+    containing ``go``, ``approved``, ``UNBLOCK:``, ``Approval packet:``,
+    or ``task_approvals.status='approved'`` do NOT satisfy it — those are
+    pre-work/gate signals, not post-work finality signals.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'accepted' "
+        "LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _board_requires_acceptance(board: Optional[str] = None) -> bool:
+    """Return ``True`` when the board's metadata enables the per-task
+    operator acceptance gate for task completion.
+
+    Reads ``require_operator_acceptance_for_done`` from ``board.json``.
+    Defaults to ``False`` so boards that don't opt in are unaffected.
+    """
+    try:
+        meta = read_board_metadata(board)
+        return bool(meta.get("require_operator_acceptance_for_done", False))
+    except Exception:
+        return False
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3851,12 +4012,19 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    board: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
     a claim/start/complete sequence.
+
+    When the board has ``require_operator_acceptance_for_done`` enabled
+    in its ``board.json`` metadata, this function raises
+    :class:`AcceptanceRequiredError` if no per-task ``accepted`` event
+    has been recorded for the task.  The acceptance is recorded via
+    ``record_task_acceptance`` (CLI: ``hermes kanban accept``).
 
     ``summary`` and ``metadata`` are stored on the closing run (if any)
     and surfaced to downstream children via :func:`build_worker_context`.
@@ -3881,6 +4049,15 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+
+    # ── Per-task operator acceptance gate ──
+    # When the board requires acceptance, *no* state mutation happens
+    # unless a first-class ``accepted`` event is on record for this
+    # exact task.  This runs before the phantom-card check so we don't
+    # accidentally emit audit events for a completion that was never
+    # going to be allowed.
+    if _board_requires_acceptance(board) and not _has_task_acceptance(conn, task_id):
+        raise AcceptanceRequiredError(task_id)
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -5367,6 +5544,411 @@ def upsert_task_metadata(
                 # Update path. Per-column CASE flags preserve existing
                 # values for fields the caller did not pass.
                 conn.execute(_METADATA_UPDATE_SQL, params)
+
+
+# ---------------------------------------------------------------------------
+# task_approvals — Portfolio V1.2 (approval gate CRUD)
+# ---------------------------------------------------------------------------
+
+def create_task_approval(
+    task_id: str,
+    *,
+    approval_type: str,
+    artifacts: Optional[Any] = None,
+    options: Optional[Any] = None,
+    unblock_target_id: Optional[str] = None,
+    unblock_behavior: Optional[str] = None,
+    created_by: Optional[str] = None,
+) -> str:
+    """Create a new approval row for *task_id* and return the ``approval_id``.
+
+    The returned id has the form ``"apr_" + 8-hex`` (e.g. ``"apr_3a7f1b2c"``).
+    ``status`` is initialised to ``'pending'``, and both ``created_at`` and
+    ``updated_at`` are set to the current epoch second.
+
+    *artifacts* and *options* are JSON-serialisable values (lists/dicts/None).
+    They are stored as JSON text in ``artifacts_json`` and ``options_json``.
+    ``None`` becomes the schema default ``'[]'``.
+
+    The connection is opened via :func:`connect`; see :func:`get_task_metadata`
+    for the resolution chain.
+    """
+    approval_id = "apr_" + secrets.token_hex(4)
+    now = int(time.time())
+    artifacts_json = json.dumps(artifacts if artifacts is not None else [], ensure_ascii=False)
+    options_json = json.dumps(options if options is not None else [], ensure_ascii=False)
+    with connect() as conn:
+        with write_txn(conn):
+            conn.execute(
+                """
+                INSERT INTO task_approvals (
+                    approval_id, task_id, approval_type,
+                    status, artifacts_json, options_json,
+                    selected_option_id, decision, approver,
+                    decided_at, comment,
+                    unblock_target_id, unblock_behavior,
+                    created_at, updated_at
+                ) VALUES (
+                    :approval_id, :task_id, :approval_type,
+                    'pending', :artifacts_json, :options_json,
+                    NULL, NULL, NULL,
+                    NULL, NULL,
+                    :unblock_target_id, :unblock_behavior,
+                    :now, :now
+                )
+                """,
+                {
+                    "approval_id": approval_id,
+                    "task_id": task_id,
+                    "approval_type": approval_type,
+                    "artifacts_json": artifacts_json,
+                    "options_json": options_json,
+                    "unblock_target_id": unblock_target_id,
+                    "unblock_behavior": unblock_behavior,
+                    "now": now,
+                },
+            )
+    return approval_id
+
+
+def list_task_approvals(task_id: str) -> list[dict]:
+    """Return every approval for *task_id*, newest first.
+
+    Each dict is the full row with ``artifacts_json`` and ``options_json``
+    decoded back into Python objects.  Returns an empty list when no
+    approvals exist for the task.
+
+    The connection is opened via :func:`connect`.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT approval_id, task_id, approval_type,
+                   status, artifacts_json, options_json,
+                   selected_option_id, decision, approver,
+                   decided_at, comment,
+                   unblock_target_id, unblock_behavior,
+                   created_at, updated_at
+              FROM task_approvals
+             WHERE task_id = ?
+             ORDER BY created_at DESC
+            """,
+            (task_id,),
+        ).fetchall()
+    result: list[dict] = []
+    for row in rows:
+        result.append({
+            "approval_id": row["approval_id"],
+            "task_id": row["task_id"],
+            "approval_type": row["approval_type"],
+            "status": row["status"],
+            "artifacts": json.loads(row["artifacts_json"]) if row["artifacts_json"] else [],
+            "options": json.loads(row["options_json"]) if row["options_json"] else [],
+            "selected_option_id": row["selected_option_id"],
+            "decision": row["decision"],
+            "approver": row["approver"],
+            "decided_at": row["decided_at"],
+            "comment": row["comment"],
+            "unblock_target_id": row["unblock_target_id"],
+            "unblock_behavior": row["unblock_behavior"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        })
+    return result
+
+
+def decide_task_approval(
+    approval_id: str,
+    *,
+    decision: str,
+    approver: str,
+    selected_option_id: Optional[str] = None,
+    comment: Optional[str] = None,
+    decided_at: Optional[int] = None,
+) -> dict:
+    """Record an operator decision on a pending approval.
+
+    Sets ``status`` to *decision* (typically ``'approved'``,
+    ``'rejected'``, or ``'changes_requested'``), records the
+    *approver*, and refreshes ``updated_at``.
+
+    Raises :class:`RuntimeError` if the approval is not currently in the
+    ``'pending'`` state — this is the idempotency guard: re-deciding an
+    already-decided approval is a conflict (HTTP 409 analogue).
+
+    Returns the full updated row as a dict (same shape as
+    :func:`list_task_approvals` items).
+
+    The connection is opened via :func:`connect`.
+    """
+    now = int(time.time())
+    resolved_decided_at = decided_at if decided_at is not None else now
+    with connect() as conn:
+        with write_txn(conn):
+            row = conn.execute(
+                "SELECT status FROM task_approvals WHERE approval_id = ?",
+                (approval_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"approval {approval_id!r} not found")
+            if row["status"] != "pending":
+                raise RuntimeError(
+                    f"approval {approval_id!r} is not pending (status={row['status']!r}); "
+                    "re-decide is a conflict"
+                )
+            conn.execute(
+                """
+                UPDATE task_approvals
+                   SET status             = :decision,
+                       decision           = :decision,
+                       approver           = :approver,
+                       selected_option_id = :selected_option_id,
+                       decided_at         = :decided_at,
+                       comment            = :comment,
+                       updated_at         = :updated_at
+                 WHERE approval_id = :approval_id
+                """,
+                {
+                    "decision": decision,
+                    "approver": approver,
+                    "selected_option_id": selected_option_id,
+                    "decided_at": resolved_decided_at,
+                    "comment": comment,
+                    "updated_at": now,
+                    "approval_id": approval_id,
+                },
+            )
+            # Re-fetch to return the full updated row.
+            updated = conn.execute(
+                """
+                SELECT approval_id, task_id, approval_type,
+                       status, artifacts_json, options_json,
+                       selected_option_id, decision, approver,
+                       decided_at, comment,
+                       unblock_target_id, unblock_behavior,
+                       created_at, updated_at
+                  FROM task_approvals
+                 WHERE approval_id = ?
+                """,
+                (approval_id,),
+            ).fetchone()
+            # Mirror the decision into the task event stream so consumers
+            # (WebUI, CLI, plugins) see it without querying task_approvals.
+            _append_event(
+                conn,
+                updated["task_id"],
+                "approval_decision",
+                {
+                    "approval_id": updated["approval_id"],
+                    "approval_type": updated["approval_type"],
+                    "decision": updated["decision"],
+                    "approver": updated["approver"],
+                    "artifacts": json.loads(updated["artifacts_json"]) if updated["artifacts_json"] else [],
+                    "selected_option_id": updated["selected_option_id"],
+                    "unblock_target_id": updated["unblock_target_id"],
+                    "unblock_behavior": updated["unblock_behavior"],
+                },
+                created_at=resolved_decided_at,
+            )
+    return {
+        "approval_id": updated["approval_id"],
+        "task_id": updated["task_id"],
+        "approval_type": updated["approval_type"],
+        "status": updated["status"],
+        "artifacts": json.loads(updated["artifacts_json"]) if updated["artifacts_json"] else [],
+        "options": json.loads(updated["options_json"]) if updated["options_json"] else [],
+        "selected_option_id": updated["selected_option_id"],
+        "decision": updated["decision"],
+        "approver": updated["approver"],
+        "decided_at": updated["decided_at"],
+        "comment": updated["comment"],
+        "unblock_target_id": updated["unblock_target_id"],
+        "unblock_behavior": updated["unblock_behavior"],
+        "created_at": updated["created_at"],
+        "updated_at": updated["updated_at"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Approval unblock / route — V1.2 T05
+# ---------------------------------------------------------------------------
+
+VALID_UNBLOCK_BEHAVIORS: frozenset[str] = frozenset({
+    "unblock",
+    "promote-to-ready",
+    "route-to-assignee",
+    "complete",
+})
+
+
+def process_approval_unblock(
+    *,
+    unblock_target_id: str,
+    unblock_behavior: str,
+    approval_id: str,
+    decision: str,
+    approver: str,
+    selected_option_id: Optional[str] = None,
+) -> dict:
+    """Apply gated unblock/route logic after an approval is approved.
+
+    Called by the mutation layer when ``decide_task_approval`` returns with
+    ``decision='approved'`` and the approval row has a non-NULL
+    ``unblock_target_id``.  This function performs:
+
+    1. Target existence check — raises ``ValueError`` if the target task
+       does not exist in the same board DB (no cross-board in V1.2).
+    2. Target status check — if the target is NOT in ``'blocked'`` status,
+       writes a ``skipped_unblock`` event on the **target** task and returns
+       a no-op result (does NOT raise).
+    3. Behavior dispatch:
+       - ``'unblock'`` → sets target status to ``'todo'``.
+       - ``'promote-to-ready'`` → sets target status to ``'ready'``.
+       - ``'route-to-assignee'`` → sets target status to ``'todo'``
+         AND updates ``assignee`` from ``selected_option_id`` (or leaves
+         unchanged if no option selected).
+       - ``'complete'`` → does NOT auto-complete the target (too
+         dangerous); writes a ``completion_requested`` event on the target
+         task.
+
+    Every action (and every no-op) writes a ``task_event`` on the **target**
+    task for auditability.
+
+    Returns a dict describing what happened:
+    ``{ action, target_id, target_status_before, target_status_after,
+       event_kind, detail? }``.
+
+    Raises:
+        ValueError: target task not found or unknown unblock_behavior.
+    """
+    if unblock_behavior not in VALID_UNBLOCK_BEHAVIORS:
+        raise ValueError(
+            f"unknown unblock_behavior {unblock_behavior!r}; "
+            f"allowed: {sorted(VALID_UNBLOCK_BEHAVIORS)}"
+        )
+
+    now = int(time.time())
+    with connect() as conn:
+        with write_txn(conn):
+            # 1. Target existence check.
+            target_row = conn.execute(
+                "SELECT id, status, assignee FROM tasks WHERE id = ?",
+                (unblock_target_id,),
+            ).fetchone()
+            if target_row is None:
+                raise ValueError(
+                    f"unblock target task {unblock_target_id!r} not found"
+                )
+
+            previous_status = target_row["status"]
+            previous_assignee = target_row["assignee"]
+
+            # 2. Status check — only 'blocked' triggers action.
+            if previous_status != "blocked":
+                # Write a skipped_unblock event for audit and return no-op.
+                _append_event(
+                    conn,
+                    unblock_target_id,
+                    "skipped_unblock",
+                    {
+                        "approval_id": approval_id,
+                        "reason": f"target status was {previous_status!r}, not 'blocked'",
+                        "approver": approver,
+                        "unblock_behavior": unblock_behavior,
+                    },
+                    created_at=now,
+                )
+                return {
+                    "action": "no_op",
+                    "target_id": unblock_target_id,
+                    "target_status_before": previous_status,
+                    "target_status_after": previous_status,
+                    "event_kind": "skipped_unblock",
+                    "detail": f"target was in {previous_status!r}, not 'blocked'",
+                }
+
+            # 3. Behavior dispatch.
+            new_status: Optional[str] = None
+            event_kind: str
+            event_payload: dict
+            new_assignee: Optional[str] = None
+
+            if unblock_behavior == "unblock":
+                new_status = "todo"
+                event_kind = "unblocked_by_approval"
+                event_payload = {
+                    "approval_id": approval_id,
+                    "behavior": "unblock",
+                    "approver": approver,
+                }
+
+            elif unblock_behavior == "promote-to-ready":
+                new_status = "ready"
+                event_kind = "promoted_by_approval"
+                event_payload = {
+                    "approval_id": approval_id,
+                    "behavior": "promote-to-ready",
+                    "approver": approver,
+                }
+
+            elif unblock_behavior == "route-to-assignee":
+                new_status = "todo"
+                new_assignee = selected_option_id or previous_assignee
+                event_kind = "routed_by_approval"
+                event_payload = {
+                    "approval_id": approval_id,
+                    "behavior": "route-to-assignee",
+                    "approver": approver,
+                    "assigned_to": new_assignee,
+                }
+
+            elif unblock_behavior == "complete":
+                # Does NOT auto-complete — too dangerous.
+                event_kind = "completion_requested"
+                event_payload = {
+                    "approval_id": approval_id,
+                    "behavior": "complete",
+                    "approver": approver,
+                }
+
+            else:
+                # Unreachable — validated above. Satisfies type checkers.
+                raise ValueError(f"unhandled behavior {unblock_behavior!r}")
+
+            # Apply status change (skip for 'complete' — no status change).
+            if new_status is not None:
+                if new_assignee is not None:
+                    conn.execute(
+                        "UPDATE tasks SET status = ?, assignee = ?, "
+                        "current_run_id = NULL, consecutive_failures = 0, "
+                        "last_failure_error = NULL WHERE id = ?",
+                        (new_status, new_assignee, unblock_target_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE tasks SET status = ?, current_run_id = NULL, "
+                        "consecutive_failures = 0, last_failure_error = NULL "
+                        "WHERE id = ?",
+                        (new_status, unblock_target_id),
+                    )
+
+            # Write audit event on the target task.
+            _append_event(
+                conn,
+                unblock_target_id,
+                event_kind,
+                event_payload,
+                created_at=now,
+            )
+
+    return {
+        "action": unblock_behavior,
+        "target_id": unblock_target_id,
+        "target_status_before": previous_status,
+        "target_status_after": new_status or previous_status,
+        "event_kind": event_kind,
+        "assigned_to": new_assignee,
+    }
 
 
 # ---------------------------------------------------------------------------

@@ -843,12 +843,24 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             s = payload.status
             ok = True
             if s == "done":
-                ok = kanban_db.complete_task(
-                    conn, task_id,
-                    result=payload.result,
-                    summary=payload.summary,
-                    metadata=payload.metadata,
-                )
+                try:
+                    ok = kanban_db.complete_task(
+                        conn, task_id,
+                        result=payload.result,
+                        summary=payload.summary,
+                        metadata=payload.metadata,
+                        board=board,
+                    )
+                except kanban_db.AcceptanceRequiredError:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"acceptance-required: {task_id} needs operator "
+                            f"acceptance before it can be marked done. "
+                            f"Run `hermes kanban accept {task_id}` or use "
+                            f"the Accept action in the task drawer."
+                        ),
+                    )
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "scheduled":
@@ -1106,6 +1118,42 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
 
 
 # ---------------------------------------------------------------------------
+# Per-task operator acceptance
+# ---------------------------------------------------------------------------
+
+class AcceptanceBody(BaseModel):
+    accepted_by: Optional[str] = None
+    body: str = "accepted"
+
+
+@router.post("/tasks/{task_id}/acceptance")
+def record_acceptance(
+    task_id: str, payload: AcceptanceBody, board: Optional[str] = Query(None),
+):
+    """Record per-task operator acceptance.
+
+    Writes an ``accepted`` event and an ``ACCEPTED`` comment so the
+    acceptance is durable and visible.  After acceptance the task can
+    be marked done on boards with
+    ``require_operator_acceptance_for_done`` enabled.
+    """
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        if kanban_db.get_task(conn, task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        accepted_by = payload.accepted_by or "operator"
+        kanban_db.record_task_acceptance(
+            conn, task_id, accepted_by, source="dashboard", body=payload.body,
+        )
+        return {"ok": True, "task_id": task_id, "accepted_by": accepted_by}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Links
 # ---------------------------------------------------------------------------
 
@@ -1186,12 +1234,24 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 if payload.status is not None and not payload.archive:
                     s = payload.status
                     if s == "done":
-                        ok = kanban_db.complete_task(
-                            conn, tid,
-                            result=payload.result,
-                            summary=payload.summary,
-                            metadata=payload.metadata,
-                        )
+                        try:
+                            ok = kanban_db.complete_task(
+                                conn, tid,
+                                result=payload.result,
+                                summary=payload.summary,
+                                metadata=payload.metadata,
+                                board=board,
+                            )
+                        except kanban_db.AcceptanceRequiredError:
+                            entry.update(
+                                ok=False,
+                                error=(
+                                    f"acceptance-required: {tid} needs "
+                                    f"operator acceptance before marking done"
+                                ),
+                            )
+                            results.append(entry)
+                            continue
                     elif s == "blocked":
                         ok = kanban_db.block_task(conn, tid)
                     elif s == "ready":
