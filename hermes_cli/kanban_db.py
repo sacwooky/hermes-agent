@@ -1217,6 +1217,7 @@ CREATE TABLE IF NOT EXISTS task_approvals (
     comment            TEXT,
     unblock_target_id  TEXT,
     unblock_behavior   TEXT,
+    created_by         TEXT,
     created_at         INTEGER NOT NULL,
     updated_at         INTEGER NOT NULL
 );
@@ -1962,6 +1963,7 @@ def _run_additive_migrations(conn: sqlite3.Connection) -> None:
             comment            TEXT,
             unblock_target_id  TEXT,
             unblock_behavior   TEXT,
+            created_by         TEXT,
             created_at         INTEGER NOT NULL,
             updated_at         INTEGER NOT NULL
         )
@@ -1973,6 +1975,18 @@ def _run_additive_migrations(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_approvals_status ON task_approvals(status)"
     )
+
+    # task_approvals additive column migrations. V1.2 P2 needs ``created_by``
+    # round-trip from POST /approvals → GET /approvals, and pre-P2 boards
+    # created the table without that column. ``_add_column_if_missing`` is
+    # idempotent so a board that already has the column is a no-op.
+    appr_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(task_approvals)")
+    }
+    if "created_by" not in appr_cols:
+        _add_column_if_missing(
+            conn, "task_approvals", "created_by", "created_by TEXT"
+        )
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -5132,6 +5146,25 @@ def decompose_triage_task(
             },
         )
 
+        # Three-gate autonomy: classify the graph. The decompose root is
+        # the epic; children default to stories (a child dict can override
+        # via 'work_item_type', e.g. 'qa' / 'integrate'). The epic stamp is
+        # what makes generate_epic_acceptances() pick the root up when it
+        # completes — without it the board simply never grows a G3 gate
+        # (backward-compatible for boards that don't use the typing).
+        _meta_sql = (
+            "INSERT INTO task_metadata "
+            "(task_id, work_item_type, tags_json, updated_at, updated_by) "
+            "VALUES (?, ?, '[]', ?, 'decomposer') "
+            "ON CONFLICT(task_id) DO UPDATE SET "
+            "work_item_type = excluded.work_item_type, "
+            "updated_at = excluded.updated_at"
+        )
+        conn.execute(_meta_sql, (task_id, "epic", now))
+        for idx, child in enumerate(children):
+            child_type = str(child.get("work_item_type") or "story")
+            conn.execute(_meta_sql, (child_ids[idx], child_type, now))
+
     # Outside the write_txn: promote parent-free children to 'ready'
     # so the dispatcher picks them up on its next tick. Same pattern
     # specify_triage_task uses.  When auto_promote is False children
@@ -5299,6 +5332,122 @@ def set_workspace_path(
             "UPDATE tasks SET workspace_path = ? WHERE id = ?",
             (str(path), task_id),
         )
+
+
+def update_task_fields(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    title: Optional[str] = None,
+    body: Optional[str] = None,
+    priority: Optional[int] = None,
+    updated_by: Optional[str] = None,
+) -> dict[str, Any]:
+    """Partial-merge update of the canonical ``tasks`` row's basic content columns.
+
+    The Portfolio Board V1.1 detail drawer needs to let operators edit
+    ``title``, ``body`` and ``priority`` inline. These three columns are
+    the closest thing to "free text" on the canonical tasks table — they
+    have no separate augmentation table — so the mutation lands directly
+    on ``tasks``. The helper mirrors the partial-merge contract used by
+    :func:`upsert_task_metadata`: every field defaults to ``None``,
+    meaning "leave the existing value alone". Pass only the fields the
+    caller actually wants to change.
+
+    A single ``task_events`` row of kind ``fields_updated`` is appended
+    inside the same write transaction so the audit trail reflects the
+    mutation atomically. The payload is a small JSON object listing which
+    of the three fields actually changed (so a no-op call — e.g. the
+    caller passed the same value the row already had — is detectable
+    downstream).
+
+    Returns a dict with the keys ``changed`` (a list of field names that
+    were actually written), ``noop`` (True when nothing was written, e.g.
+    the task didn't exist or every supplied value matched the stored
+    value) and ``task`` (the post-update task row as a dict, or ``None``
+    if the task is unknown).
+
+    Raises ``ValueError`` if ``task_id`` is unknown — callers should map
+    that to a 404 at the API boundary.
+    """
+    sets: list[str] = []
+    params: list[Any] = []
+    field_changes: dict[str, Any] = {}
+    if title is not None:
+        sets.append("title = ?")
+        params.append(title)
+        field_changes["title"] = title
+    if body is not None:
+        sets.append("body = ?")
+        params.append(body)
+        field_changes["body"] = body
+    if priority is not None:
+        sets.append("priority = ?")
+        params.append(priority)
+        field_changes["priority"] = priority
+    if not sets:
+        # Caller asked us to write nothing. Read the row and return.
+        existing = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if existing is None:
+            return {"changed": [], "noop": True, "task": None}
+        return {
+            "changed": [],
+            "noop": True,
+            "task": dict(existing),
+        }
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT title, body, priority FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if existing is None:
+            raise ValueError(f"unknown task {task_id}")
+        # Build the per-field "actually changed" list so the event payload
+        # accurately reflects what landed in the DB — not just what the
+        # caller sent. A redundant write (title matches existing) still
+        # goes through, because we already paid the cost of a SQL
+        # statement, but we record only the deltas.
+        changed: list[str] = []
+        if title is not None and title != existing["title"]:
+            changed.append("title")
+        if body is not None and body != existing["body"]:
+            changed.append("body")
+        if priority is not None and priority != existing["priority"]:
+            changed.append("priority")
+        # Build a per-field previous-values dict for the audit payload so a
+        # reviewer can see what the task looked like before the edit.
+        previous = {
+            "title": existing["title"],
+            "body": existing["body"],
+            "priority": existing["priority"],
+        }
+        params.append(task_id)
+        conn.execute(
+            f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?",
+            tuple(params),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "fields_updated",
+            {
+                "fields": list(field_changes.keys()),
+                "changed": changed,
+                "previous": previous,
+                "by": updated_by,
+                "source": "portfolio-ui",
+            },
+        )
+        # Re-read for the return value.
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+    return {
+        "changed": changed,
+        "noop": not changed,
+        "task": dict(row) if row is not None else None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -5587,14 +5736,14 @@ def create_task_approval(
                     selected_option_id, decision, approver,
                     decided_at, comment,
                     unblock_target_id, unblock_behavior,
-                    created_at, updated_at
+                    created_by, created_at, updated_at
                 ) VALUES (
                     :approval_id, :task_id, :approval_type,
                     'pending', :artifacts_json, :options_json,
                     NULL, NULL, NULL,
                     NULL, NULL,
                     :unblock_target_id, :unblock_behavior,
-                    :now, :now
+                    :created_by, :now, :now
                 )
                 """,
                 {
@@ -5605,8 +5754,30 @@ def create_task_approval(
                     "options_json": options_json,
                     "unblock_target_id": unblock_target_id,
                     "unblock_behavior": unblock_behavior,
+                    "created_by": created_by,
                     "now": now,
                 },
+            )
+            # Mirror the create into the task event stream so consumers
+            # (WebUI, CLI, plugins) see approvals as part of the canonical
+            # audit log, not just the side-table. Pairs with the
+            # ``approval_decision`` event written by ``decide_task_approval``;
+            # together they make the approval lifecycle (created → decided)
+            # auditable from ``task_events`` alone.
+            _append_event(
+                conn,
+                task_id,
+                "approval_created",
+                {
+                    "approval_id": approval_id,
+                    "approval_type": approval_type,
+                    "created_by": created_by,
+                    "artifacts": json.loads(artifacts_json) if artifacts_json else [],
+                    "options": json.loads(options_json) if options_json else [],
+                    "unblock_target_id": unblock_target_id,
+                    "unblock_behavior": unblock_behavior,
+                },
+                created_at=now,
             )
     return approval_id
 
@@ -5628,7 +5799,7 @@ def list_task_approvals(task_id: str) -> list[dict]:
                    selected_option_id, decision, approver,
                    decided_at, comment,
                    unblock_target_id, unblock_behavior,
-                   created_at, updated_at
+                   created_by, created_at, updated_at
               FROM task_approvals
              WHERE task_id = ?
              ORDER BY created_at DESC
@@ -5651,6 +5822,7 @@ def list_task_approvals(task_id: str) -> list[dict]:
             "comment": row["comment"],
             "unblock_target_id": row["unblock_target_id"],
             "unblock_behavior": row["unblock_behavior"],
+            "created_by": row["created_by"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         })
@@ -6120,6 +6292,11 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    autonomy: Optional[dict] = None
+    """Summary of the three-gate autonomy sweeps for this tick (epic
+    acceptances created/resolved, integrate tasks created). ``None`` when
+    ``kanban.autonomy`` is not enabled for the board. See
+    :mod:`hermes_cli.kanban_autonomy`."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -7274,6 +7451,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    autonomy_cfg: Optional[dict] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -7328,6 +7506,20 @@ def dispatch_once(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+
+    # Three-gate autonomy sweeps (epic acceptance generation/resolution,
+    # unintegrated-work reconciliation). Feature-gated by config; a sweep
+    # failure never breaks the tick — workers must keep dispatching even
+    # when an autonomy sweep hits a bad row.
+    if autonomy_cfg and not dry_run:
+        try:
+            from hermes_cli import kanban_autonomy as _autonomy
+
+            result.autonomy = _autonomy.run_autonomy_tick(
+                conn, board=board, cfg=autonomy_cfg
+            )
+        except Exception:
+            _log.exception("dispatch: autonomy tick failed (board=%s)", board)
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -8112,6 +8304,28 @@ def _default_spawn(
         "-q",
         prompt,
     ])
+    # Three-gate autonomy: seed the workspace with the worker-scoped
+    # Claude Code settings so coding-agent lanes spawned inside it run
+    # headless-autonomous (acceptEdits + deny-list) instead of hanging
+    # on permission prompts no human will answer. Only when absent — an
+    # operator- or repo-committed .claude/settings.json always wins.
+    try:
+        _tmpl = (
+            Path(__file__).resolve().parent.parent
+            / "templates"
+            / "worker-claude-settings.json"
+        )
+        if _tmpl.is_file() and os.path.isdir(workspace):
+            _dest_dir = Path(workspace) / ".claude"
+            _dest = _dest_dir / "settings.json"
+            if not _dest.exists():
+                _dest_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(_tmpl, _dest)
+    except OSError:
+        _log.debug(
+            "worker settings template seed failed for %s", workspace, exc_info=True
+        )
+
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
@@ -8341,6 +8555,53 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 except Exception:
                     pass
             lines.append("")
+
+    # Resume context (three-gate autonomy, retry-with-resume): when the
+    # previous attempt did not complete (crash, iteration-budget exit,
+    # timeout) and the workspace is a git checkout, show the worker the
+    # actual on-disk state so a fresh session continues instead of
+    # restarting from zero. The prior-attempt summaries above carry the
+    # narrative; this carries the ground truth.
+    if (
+        shown
+        and shown[-1].outcome != "completed"
+        and task.workspace_path
+        and os.path.isdir(task.workspace_path)
+    ):
+        try:
+            import subprocess as _sp
+
+            _status = _sp.run(  # noqa: S603 -- fixed argv
+                ["git", "status", "--porcelain", "--branch"],
+                cwd=task.workspace_path,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            _recent = _sp.run(  # noqa: S603 -- fixed argv
+                ["git", "log", "--oneline", "-5"],
+                cwd=task.workspace_path,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if _status.returncode == 0:
+                lines.append("## RESUME CONTEXT — workspace state")
+                lines.append(
+                    "The previous attempt ended without completing. The "
+                    "workspace below reflects its actual progress — verify "
+                    "and continue from here; do NOT restart from scratch."
+                )
+                lines.append("```")
+                lines.append(_cap(_status.stdout, 2000) or "(clean tree)")
+                if _recent.returncode == 0 and _recent.stdout.strip():
+                    lines.append("# recent commits:")
+                    lines.append(_cap(_recent.stdout, 1000))
+                lines.append("```")
+                lines.append("")
+        except Exception:
+            # Resume context is best-effort — never fail prompt assembly.
+            pass
 
     # Parents: prefer the most-recent 'completed' run's summary + metadata,
     # fall back to ``task.result`` when no run rows exist (legacy DBs,

@@ -5142,6 +5142,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # simply don't use kanban; this loop becomes a no-op.
         asyncio.create_task(self._kanban_dispatcher_watcher())
 
+        # Start background kanban escalation watcher — three-gate autonomy's
+        # "nothing waits silently" guarantee: blocked tasks, stuck review
+        # queues, and epic-acceptance pings reach the operator as one-line
+        # decision asks. Gated by `kanban.escalation.enabled` (default off).
+        asyncio.create_task(self._kanban_escalation_watcher())
+
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
             logger.info(
