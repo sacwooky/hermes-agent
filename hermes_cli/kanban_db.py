@@ -8256,6 +8256,13 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+    # Workers run with HOME sandboxed to the profile home, which hides
+    # the operator's Claude Code credentials (~/.claude) from the
+    # builder lane — `claude` then reports "Not logged in" and workers
+    # block on a phantom auth failure (P2 incident 2026-06-12). Pin the
+    # real config dir for every worker; per-workspace .claude/settings
+    # still governs tool permissions.
+    env.setdefault("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))
 
     cmd = [
         *_resolve_hermes_argv(),
