@@ -719,6 +719,32 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
+        # Three-gate autonomy config (kanban.autonomy) with per-board
+        # overrides (kanban.boards.<slug>.autonomy). The merge is shallow
+        # per top-level key (epic_acceptance / integration) so a pilot
+        # board can enable one sweep while the fleet default stays off.
+        autonomy_global = kanban_cfg.get("autonomy")
+        if not isinstance(autonomy_global, dict):
+            autonomy_global = {}
+        boards_overrides = kanban_cfg.get("boards")
+        if not isinstance(boards_overrides, dict):
+            boards_overrides = {}
+
+        def _merged_autonomy_cfg(slug: str) -> "Optional[dict]":
+            merged = {
+                k: (dict(v) if isinstance(v, dict) else v)
+                for k, v in autonomy_global.items()
+            }
+            board_cfg = boards_overrides.get(slug)
+            ov = board_cfg.get("autonomy") if isinstance(board_cfg, dict) else None
+            if isinstance(ov, dict):
+                for k, v in ov.items():
+                    if isinstance(v, dict) and isinstance(merged.get(k), dict):
+                        merged[k] = {**merged[k], **v}
+                    else:
+                        merged[k] = v
+            return merged or None
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -812,6 +838,7 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    autonomy_cfg=_merged_autonomy_cfg(slug),
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -1058,6 +1085,266 @@ class GatewayKanbanWatchersMixin:
 
             # Sleep in 1s slices so shutdown is snappy — otherwise a stop()
             # waits up to `interval` seconds for the current sleep to finish.
+            slept = 0.0
+            while slept < interval and self._running:
+                await asyncio.sleep(min(1.0, interval - slept))
+                slept += 1.0
+
+    async def _kanban_escalation_watcher(self, interval: float = 300.0) -> None:
+        """Nothing waits silently: surface stuck kanban state to the operator.
+
+        Three-gate autonomy (decision-autonomous-three-gate-orchestration-v1)
+        removes per-task human gates, so the operator only hears from the
+        system when (a) an epic is ready for acceptance or (b) automation is
+        genuinely stuck. This watcher scans every board every ``interval``
+        seconds for:
+
+        - ``blocked`` tasks with no ``escalated`` event since the block
+          (or whose last escalation is older than ``reping_hours``),
+        - ``review``-status tasks whose latest ``review_queued`` event is
+          older than ``review_queue_alert_hours`` (Robin unreachable),
+        - ``acceptance_requested`` events on still-blocked acceptance
+          tasks (the G3 ping, with demo URL).
+
+        Each finding becomes ONE short decision-ask message to the
+        configured destinations (existing gateway adapters — this watcher
+        sends through the same connected platforms as the notifier and
+        has no other privileges). Successful delivery appends an
+        ``escalated`` event for dedup; re-pings happen every
+        ``reping_hours`` until the state clears.
+
+        Config (``kanban.escalation``)::
+
+            escalation:
+              enabled: true
+              destinations:
+                - {platform: slack, chat_id: "C0XXXX"}
+                - {platform: telegram, chat_id: "123456"}
+              reping_hours: 24
+              review_queue_alert_hours: 4
+        """
+        try:
+            from hermes_cli.config import load_config as _load_config
+            from hermes_cli import kanban_db as _kb
+        except Exception:
+            logger.warning("kanban escalation: imports unavailable; disabled")
+            return
+        from gateway.config import Platform as _Platform
+
+        try:
+            cfg = _load_config()
+        except Exception as exc:
+            logger.warning("kanban escalation: cannot load config (%s); disabled", exc)
+            return
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        esc_cfg = kanban_cfg.get("escalation")
+        if not isinstance(esc_cfg, dict) or not esc_cfg.get("enabled"):
+            logger.info("kanban escalation: disabled (kanban.escalation.enabled is falsy)")
+            return
+        destinations = esc_cfg.get("destinations")
+        if not isinstance(destinations, list) or not destinations:
+            logger.warning(
+                "kanban escalation: enabled but no destinations configured; disabled"
+            )
+            return
+        try:
+            reping_seconds = float(esc_cfg.get("reping_hours", 24)) * 3600.0
+        except (TypeError, ValueError):
+            reping_seconds = 24 * 3600.0
+        try:
+            review_alert_seconds = (
+                float(esc_cfg.get("review_queue_alert_hours", 4)) * 3600.0
+            )
+        except (TypeError, ValueError):
+            review_alert_seconds = 4 * 3600.0
+
+        def _latest_event_at(conn, task_id: str, kind: str) -> int:
+            row = conn.execute(
+                "SELECT MAX(created_at) AS ts FROM task_events "
+                "WHERE task_id = ? AND kind = ?",
+                (task_id, kind),
+            ).fetchone()
+            return int(row["ts"]) if row and row["ts"] else 0
+
+        def _collect() -> list[dict]:
+            findings: list[dict] = []
+            now = int(time.time())
+            try:
+                boards = _kb.list_boards(include_archived=False)
+            except Exception:
+                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            for board_meta in boards:
+                slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                try:
+                    conn = _kb.connect(board=slug)
+                except Exception as exc:
+                    logger.debug("kanban escalation: cannot open board %s: %s", slug, exc)
+                    continue
+                try:
+                    # (a) blocked tasks — includes acceptance tasks, which get
+                    # the friendlier G3 phrasing below.
+                    for row in conn.execute(
+                        "SELECT id, title FROM tasks WHERE status = 'blocked'"
+                    ).fetchall():
+                        tid = row["id"]
+                        blocked_at = _latest_event_at(conn, tid, "blocked")
+                        escalated_at = _latest_event_at(conn, tid, "escalated")
+                        acceptance_at = _latest_event_at(
+                            conn, tid, "acceptance_requested"
+                        )
+                        signal_at = max(blocked_at, acceptance_at)
+                        if escalated_at >= signal_at and (
+                            now - escalated_at
+                        ) < reping_seconds:
+                            continue
+                        if acceptance_at and acceptance_at >= blocked_at:
+                            ev = conn.execute(
+                                "SELECT payload FROM task_events WHERE task_id = ? "
+                                "AND kind = 'acceptance_requested' "
+                                "ORDER BY id DESC LIMIT 1",
+                                (tid,),
+                            ).fetchone()
+                            demo = ""
+                            try:
+                                import json as _json
+
+                                payload = ev["payload"]
+                                if isinstance(payload, str):
+                                    payload = _json.loads(payload)
+                                urls = (payload or {}).get("demo_urls") or []
+                                if urls:
+                                    demo = f" Demo: {', '.join(urls)}."
+                            except Exception:
+                                pass
+                            msg = (
+                                f"🟢 Epic ready for acceptance — {slug}/{tid}: "
+                                f"{row['title'][:120]}.{demo} "
+                                f"Accept: `hermes kanban --board {slug} accept {tid}`"
+                            )
+                        else:
+                            reason = ""
+                            ev = conn.execute(
+                                "SELECT payload FROM task_events WHERE task_id = ? "
+                                "AND kind = 'blocked' ORDER BY id DESC LIMIT 1",
+                                (tid,),
+                            ).fetchone()
+                            try:
+                                import json as _json
+
+                                payload = ev["payload"] if ev else None
+                                if isinstance(payload, str):
+                                    payload = _json.loads(payload)
+                                if payload and payload.get("reason"):
+                                    reason = f": {str(payload['reason'])[:160]}"
+                            except Exception:
+                                pass
+                            msg = (
+                                f"⛔ BLOCKED {slug}/{tid} — {row['title'][:100]}"
+                                f"{reason}. Decide: `hermes kanban --board {slug} "
+                                f"unblock {tid}` or comment guidance."
+                            )
+                        findings.append({"board": slug, "task_id": tid, "msg": msg})
+                    # (b) review queue stuck (Robin unreachable / quota wall,
+                    # or the review courier keeps dying). Generic signal: the
+                    # task sits in 'review' with no event activity (other
+                    # than escalations) for longer than the threshold.
+                    for row in conn.execute(
+                        "SELECT id, title FROM tasks WHERE status = 'review' "
+                        "AND claim_lock IS NULL"
+                    ).fetchall():
+                        tid = row["id"]
+                        last_row = conn.execute(
+                            "SELECT MAX(created_at) AS ts FROM task_events "
+                            "WHERE task_id = ? AND kind != 'escalated'",
+                            (tid,),
+                        ).fetchone()
+                        queued_at = (
+                            int(last_row["ts"]) if last_row and last_row["ts"] else 0
+                        )
+                        if not queued_at or (now - queued_at) < review_alert_seconds:
+                            continue
+                        escalated_at = _latest_event_at(conn, tid, "escalated")
+                        if escalated_at >= queued_at and (
+                            now - escalated_at
+                        ) < reping_seconds:
+                            continue
+                        hours = (now - queued_at) / 3600.0
+                        findings.append({
+                            "board": slug,
+                            "task_id": tid,
+                            "msg": (
+                                f"🕗 Review queued {hours:.1f}h — {slug}/{tid}: "
+                                f"{row['title'][:100]}. Robin appears unreachable "
+                                "or quota-walled; reviews queue and never skip. "
+                                "Check `ssh robin` / the Robin WebUI."
+                            ),
+                        })
+                finally:
+                    conn.close()
+            return findings
+
+        def _mark_escalated(board: str, task_id: str) -> None:
+            conn = _kb.connect(board=board)
+            try:
+                with _kb.write_txn(conn):
+                    _kb._append_event(
+                        conn,
+                        task_id,
+                        "escalated",
+                        {"by": "gateway-escalation"},
+                    )
+            finally:
+                conn.close()
+
+        logger.info(
+            "kanban escalation: watching all boards (interval=%.0fs, "
+            "%d destination(s))",
+            interval,
+            len(destinations),
+        )
+        await asyncio.sleep(10)
+        while self._running:
+            try:
+                findings = await asyncio.to_thread(_collect)
+                for finding in findings:
+                    delivered = False
+                    for dest in destinations:
+                        if not isinstance(dest, dict):
+                            continue
+                        platform_str = str(dest.get("platform") or "").lower()
+                        chat_id = dest.get("chat_id")
+                        if not platform_str or not chat_id:
+                            continue
+                        try:
+                            plat = _Platform(platform_str)
+                        except ValueError:
+                            continue
+                        adapter = self.adapters.get(plat)
+                        if adapter is None:
+                            continue
+                        metadata: dict[str, Any] = {}
+                        if dest.get("thread_id"):
+                            metadata["thread_id"] = dest["thread_id"]
+                        try:
+                            await adapter.send(
+                                str(chat_id), finding["msg"], metadata=metadata
+                            )
+                            delivered = True
+                        except Exception as exc:
+                            logger.warning(
+                                "kanban escalation: send to %s/%s failed: %s",
+                                platform_str,
+                                chat_id,
+                                exc,
+                            )
+                    if delivered:
+                        await asyncio.to_thread(
+                            _mark_escalated, finding["board"], finding["task_id"]
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("kanban escalation: tick failed")
             slept = 0.0
             while slept < interval and self._running:
                 await asyncio.sleep(min(1.0, interval - slept))

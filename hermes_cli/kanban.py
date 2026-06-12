@@ -860,6 +860,34 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
 
+    # --- verdict (three-gate autonomy: Robin review verdict integrity) ---
+    p_verdict = sub.add_parser(
+        "verdict",
+        help="Sign / verify / record Robin review verdicts (HMAC, out-of-band provenance)",
+    )
+    verdict_sub = p_verdict.add_subparsers(dest="verdict_action", required=True)
+    v_sign = verdict_sub.add_parser("sign", help="Sign a verdict payload file (run on Robin)")
+    v_sign.add_argument("payload_file", help="Path to the verdict JSON payload")
+    v_sign.add_argument("--key", default=None, help="Verdict key path override")
+    v_verify = verdict_sub.add_parser("verify", help="Verify a payload + signature pair")
+    v_verify.add_argument("payload_file")
+    v_verify.add_argument("signature")
+    v_verify.add_argument("--key", default=None, help="Verdict key path override")
+    v_record = verdict_sub.add_parser(
+        "record",
+        help="Verify and honor a verdict against a task (the only path out of review)",
+    )
+    v_record.add_argument("task_id")
+    v_record.add_argument("payload_file")
+    v_record.add_argument("signature")
+    v_record.add_argument(
+        "--fetched-via",
+        required=True,
+        choices=["robin-api", "robin-ssh"],
+        help="Out-of-band channel the payload was pulled through",
+    )
+    v_record.add_argument("--key", default=None, help="Verdict key path override")
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -976,6 +1004,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
             "gc":       _cmd_gc,
+            "verdict":  _cmd_verdict,
         }
         handler = handlers.get(action)
         if not handler:
@@ -2054,6 +2083,50 @@ def _cmd_accept(args: argparse.Namespace) -> int:
         print(f"kanban accept: {e}", file=sys.stderr)
         return 1
     return 0
+
+
+def _cmd_verdict(args: argparse.Namespace) -> int:
+    """Robin verdict integrity helper (sign / verify / record).
+
+    The HMAC key never enters any agent context: this handler reads the
+    key file in-process and only ever prints hex digests / booleans.
+    """
+    from hermes_cli import kanban_autonomy as ka
+
+    action = getattr(args, "verdict_action", None)
+    try:
+        payload = Path(args.payload_file).read_bytes()
+    except OSError as e:
+        print(f"kanban verdict: cannot read payload: {e}", file=sys.stderr)
+        return 1
+    key_path = getattr(args, "key", None)
+    if action == "sign":
+        try:
+            print(ka.sign_verdict_payload(payload, key_path=key_path))
+        except (FileNotFoundError, ValueError) as e:
+            print(f"kanban verdict: {e}", file=sys.stderr)
+            return 1
+        return 0
+    if action == "verify":
+        ok = ka.verify_verdict_signature(payload, args.signature, key_path=key_path)
+        print("VALID" if ok else "INVALID")
+        return 0 if ok else 1
+    if action == "record":
+        board = os.environ.get("HERMES_KANBAN_BOARD")
+        with kb.connect_closing(board=board) as conn:
+            out = ka.record_review_verdict(
+                conn,
+                args.task_id,
+                payload.decode("utf-8"),
+                args.signature,
+                fetched_via=args.fetched_via,
+                key_path=key_path,
+                board=board,
+            )
+        print(json.dumps(out, ensure_ascii=False))
+        return 0 if out.get("ok") else 1
+    print(f"kanban verdict: unknown action {action!r}", file=sys.stderr)
+    return 2
 
 
 def _cmd_promote(args: argparse.Namespace) -> int:
