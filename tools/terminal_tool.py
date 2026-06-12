@@ -1916,6 +1916,25 @@ def terminal_tool(
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 
+        # Backstop for kanban builder lanes: a `kanban-*-lane.sh` invocation
+        # spawns a Claude Code / Codex / Kimi build that routinely runs many
+        # minutes. Driver models (esp. small ones) tend to pass a short
+        # timeout and then mis-report the resulting exit-124 kill as "lane
+        # unavailable" (P2 overnight stall, 2026-06-12). Floor the foreground
+        # timeout for these specific commands to the worker's TERMINAL_TIMEOUT
+        # env (derived from the task's max_runtime) so the build gets its full
+        # window regardless of what the driver passed. Only ever RAISES the
+        # timeout, never lowers it, and is scoped to lane scripts.
+        if not background and "kanban-" in command and "-lane.sh" in command:
+            try:
+                _lane_floor = int(os.environ.get("TERMINAL_TIMEOUT", "0") or 0)
+            except (TypeError, ValueError):
+                _lane_floor = 0
+            if _lane_floor <= 0:
+                _lane_floor = 1700
+            if _lane_floor > effective_timeout:
+                effective_timeout = _lane_floor
+
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
         if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:

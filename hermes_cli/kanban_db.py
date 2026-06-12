@@ -3155,12 +3155,41 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     for that path.
     """
     row = conn.execute(
-        "SELECT kind FROM task_events "
+        "SELECT kind, payload FROM task_events "
         "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    if not row or row["kind"] != "blocked":
+        return False
+
+    # Infra-failure auto-recovery (P2 overnight stall, 2026-06-12): a worker
+    # that blocks because a builder lane *timed out* or was *transiently
+    # unavailable* hit an environment problem, NOT a real product/human gate.
+    # Those should retry like the circuit-breaker path, not sit sticky until
+    # an operator unblocks. Treat such blocks as non-sticky (auto-recover) —
+    # but BOUND it: after INFRA_RETRY_LIMIT such blocks with no successful
+    # run in between, fall back to sticky so a genuinely broken lane still
+    # surfaces to a human instead of looping forever.
+    payload = row["payload"]
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+    reason = ""
+    if isinstance(payload, dict):
+        reason = str(payload.get("reason", "")).lower()
+    if reason and any(p in reason for p in INFRA_RETRY_PHRASES):
+        infra_blocks = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'blocked'",
+            (task_id,),
+        ).fetchone()[0]
+        if int(infra_blocks or 0) <= INFRA_RETRY_LIMIT:
+            return False  # auto-recover; dispatcher re-promotes + retries
+
+    return True
 
 
 def recompute_ready(
@@ -6180,6 +6209,23 @@ def schedule_task(
 # a human can investigate. Prevents retry storms when a worker repeatedly times
 # out, crashes, or cannot spawn.
 DEFAULT_FAILURE_LIMIT = 2
+
+# Infra-failure block reasons that should AUTO-RECOVER (retry) rather than sit
+# sticky-blocked waiting for an operator. A worker hits these when a builder
+# lane times out or is transiently missing — an environment problem, not a
+# product/human gate. Bounded by INFRA_RETRY_LIMIT so a genuinely broken lane
+# still escalates instead of looping. See _has_sticky_block.
+INFRA_RETRY_PHRASES = (
+    "timed out",
+    "timeout",
+    "lanes-unavailable",
+    "lane-unavailable",
+    "command not found",
+    "script not found",
+    "exit 124",
+    "exit code 124",
+)
+INFRA_RETRY_LIMIT = 4
 
 # R3-gate phrases: substrings in a blocked event's reason that signal
 # the task requires an external approval packet before dispatch.  When
