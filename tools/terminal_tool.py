@@ -1927,11 +1927,16 @@ def terminal_tool(
         # timeout, never lowers it, and is scoped to lane scripts.
         if not background and "kanban-" in command and "-lane.sh" in command:
             try:
-                _lane_floor = int(os.environ.get("TERMINAL_TIMEOUT", "0") or 0)
+                _env_t = int(os.environ.get("TERMINAL_TIMEOUT", "0") or 0)
             except (TypeError, ValueError):
-                _lane_floor = 0
-            if _lane_floor <= 0:
-                _lane_floor = 1700
+                _env_t = 0
+            # HARD minimum for builder lanes: a Claude Code build routinely runs
+            # many minutes. Use at least 1700s regardless of what the driver
+            # passed OR what TERMINAL_TIMEOUT is — decomposed sub-tasks often
+            # have no max_runtime, so TERMINAL_TIMEOUT can be the low default
+            # (180) or 60 and would otherwise SIGKILL the build at exit 124
+            # (1SI-CRM chain stall, 2026-06-13). Only ever RAISES the timeout.
+            _lane_floor = max(_env_t, 1700)
             if _lane_floor > effective_timeout:
                 effective_timeout = _lane_floor
 
