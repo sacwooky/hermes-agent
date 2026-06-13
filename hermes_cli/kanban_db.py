@@ -5353,6 +5353,70 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     raise ValueError(f"unknown workspace_kind: {kind}")
 
 
+def ensure_task_worktree(
+    repo_path: str,
+    task_id: str,
+    base_branch: Optional[str] = None,
+) -> "Optional[tuple[Path, str]]":
+    """Create (or reuse) an isolated git worktree + branch for a code task.
+
+    Returns ``(worktree_path, branch_name)`` on success, or ``None`` when
+    *repo_path* is not a git repo or the worktree can't be created (the
+    caller then falls back to the shared dir). The worktree lives at
+    ``<repo_parent>/.kanban-worktrees/<repo_name>/<task_id>`` on branch
+    ``kanban/<task_id>`` based off *base_branch* (or the repo's current
+    branch).
+
+    Why: tasks that share ONE checkout clobber each other's uncommitted
+    work when built concurrently (1SI-CRM t_9e25ed49 false-success,
+    2026-06-13 — a sibling build's reset wiped real edits before commit).
+    A per-task worktree gives each build its own working tree AND a
+    per-story branch the integrator can merge.
+    """
+    import subprocess
+
+    repo = Path(repo_path).expanduser()
+    if not (repo / ".git").exists():
+        return None  # not a git repo — nothing to isolate
+    branch = f"kanban/{task_id}"
+    wt = repo.parent / ".kanban-worktrees" / repo.name / task_id
+
+    def _git(args, cwd, timeout=60):
+        return subprocess.run(  # noqa: S603 -- fixed argv
+            ["git", "-C", str(cwd), *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+
+    # Reuse a valid existing worktree (retry/respawn).
+    if wt.exists():
+        chk = _git(["rev-parse", "--is-inside-work-tree"], wt, timeout=10)
+        if chk.returncode == 0:
+            return (wt, branch)
+        # Broken/stale dir — drop it and recreate cleanly.
+        _git(["worktree", "remove", "--force", str(wt)], repo, timeout=20)
+
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    base = base_branch
+    if not base:
+        cur = _git(["branch", "--show-current"], repo, timeout=10)
+        base = (cur.stdout.strip() or "HEAD") if cur.returncode == 0 else "HEAD"
+
+    _git(["worktree", "prune"], repo, timeout=20)
+    # -B creates-or-resets the per-task branch to base, then checks it out in
+    # the new worktree. If the branch is already checked out elsewhere, fall
+    # back to attaching the existing branch.
+    add = _git(["worktree", "add", "-B", branch, str(wt), base], repo)
+    if add.returncode != 0:
+        add = _git(["worktree", "add", str(wt), branch], repo)
+    if add.returncode != 0:
+        _log.warning(
+            "ensure_task_worktree(%s): worktree add failed: %s",
+            task_id, (add.stderr or "")[:200],
+        )
+        return None
+    return (wt, branch)
+
+
 def set_workspace_path(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> None:
@@ -7553,6 +7617,16 @@ def dispatch_once(
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
+    # Worktree isolation: when a board configures an integration branch, code
+    # tasks (builders) build in an isolated per-task git worktree+branch off
+    # that branch instead of a shared checkout — preventing concurrent builds
+    # from clobbering each other and giving the integrator a per-story branch
+    # to merge. Gated on integration config; falls back to the shared dir if
+    # worktree creation fails.
+    _integ_cfg = (autonomy_cfg or {}).get("integration") or {}
+    _wt_isolate = bool(_integ_cfg.get("enabled") and _integ_cfg.get("branch"))
+    _wt_base_branch = _integ_cfg.get("branch")
+
     # Three-gate autonomy sweeps (epic acceptance generation/resolution,
     # unintegrated-work reconciliation). Feature-gated by config; a sweep
     # failure never breaks the tick — workers must keep dispatching even
@@ -7781,6 +7855,44 @@ def dispatch_once(
             if auto:
                 result.auto_blocked.append(claimed.id)
             continue
+        # Worktree isolation for builder tasks on integration-branch boards:
+        # give each build its own working tree + branch (kanban/<id>) so
+        # concurrent builds don't clobber a shared checkout, and the
+        # integrator gets a per-story branch to merge. Reviewer/qa/integrator/
+        # orchestrator tasks keep the shared/main checkout (they read, test,
+        # courier, or merge — they don't make conflicting edits). Best-effort:
+        # if isolation fails, fall back to the resolved (shared) workspace.
+        if (
+            _wt_isolate
+            and (claimed.assignee or "") == "builder"
+            and claimed.workspace_kind == "dir"
+        ):
+            try:
+                _wt = ensure_task_worktree(
+                    str(workspace), claimed.id, _wt_base_branch
+                )
+                if _wt is not None:
+                    workspace, _wt_branch = _wt
+                    with write_txn(conn):
+                        conn.execute(
+                            "UPDATE tasks SET workspace_kind='worktree', "
+                            "workspace_path=?, branch_name=? WHERE id=?",
+                            (str(workspace), _wt_branch, claimed.id),
+                        )
+                        _append_event(
+                            conn, claimed.id, "worktree_isolated",
+                            {"path": str(workspace), "branch": _wt_branch,
+                             "base": _wt_base_branch},
+                        )
+                    claimed.workspace_kind = "worktree"
+                    claimed.workspace_path = str(workspace)
+                    claimed.branch_name = _wt_branch
+            except Exception:
+                _log.exception(
+                    "worktree isolation failed for %s; using shared dir",
+                    claimed.id,
+                )
+
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
