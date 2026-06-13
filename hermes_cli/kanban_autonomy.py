@@ -80,7 +80,15 @@ def _load_verdict_key(key_path: Optional[str] = None) -> bytes:
     data = p.read_bytes().strip()
     if not data:
         raise ValueError(f"verdict key at {p} is empty")
-    return data
+    # Match robin:send-review.sh's key handling: a hex-string key file is
+    # decoded to its raw bytes (the key was generated as `xxd -p` hex); a
+    # non-hex key is used as raw bytes. Without this the HMAC key differs from
+    # Robin's signer and EVERY signature mis-verifies (verdict-record bug,
+    # 2026-06-13).
+    try:
+        return bytes.fromhex(data.decode("ascii").strip())
+    except (ValueError, UnicodeDecodeError):
+        return data
 
 
 def sign_verdict_payload(payload: bytes, *, key_path: Optional[str] = None) -> str:
@@ -158,10 +166,6 @@ def record_review_verdict(
             "pulled from Robin's host, never trusted from local files"
         )
 
-    payload_bytes = payload_json.encode("utf-8")
-    if not verify_verdict_signature(payload_bytes, signature, key_path=key_path):
-        return _reject("HMAC signature verification failed")
-
     try:
         payload = json.loads(payload_json)
     except (json.JSONDecodeError, TypeError):
@@ -169,38 +173,62 @@ def record_review_verdict(
     if not isinstance(payload, dict):
         return _reject("payload is not a JSON object")
 
+    # Signature is HMAC over the CANONICAL payload — matching the deployed
+    # robin:send-review.sh signer: json.dumps(payload, sort_keys=True,
+    # separators=(",",":"), ensure_ascii=False). Verifying over canonical form
+    # (not raw bytes) lets the courier pass the payload however it serialized
+    # it without a byte-exact round-trip. Fall back to raw-bytes verification
+    # for the legacy/test path.
+    canon = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    if not (
+        verify_verdict_signature(canon.encode("utf-8"), signature, key_path=key_path)
+        or verify_verdict_signature(payload_json.encode("utf-8"), signature, key_path=key_path)
+    ):
+        return _reject("HMAC signature verification failed")
+
     if payload.get("task_id") != task_id:
         return _reject(
             f"payload.task_id={payload.get('task_id')!r} does not match {task_id!r}"
         )
-    verdict = str(payload.get("verdict", "")).strip().lower()
-    if verdict not in VALID_VERDICTS:
-        return _reject(
-            f"verdict={verdict!r} invalid (allowed: {sorted(VALID_VERDICTS)})"
-        )
 
-    run_record = str(payload.get("run_record", "")).strip()
-    if not run_record:
-        return _reject("payload.run_record is required (vault provenance)")
-    vault = Path(vault_root or DEFAULT_VAULT_ROOT)
-    record_path = (vault / run_record) if not os.path.isabs(run_record) else Path(run_record)
-    try:
-        record_path = record_path.resolve()
-        vault_resolved = vault.resolve()
-    except OSError:
-        return _reject(f"run_record path {run_record!r} cannot be resolved")
-    if vault_resolved not in record_path.parents and record_path != vault_resolved:
-        return _reject(f"run_record {run_record!r} is outside the vault root")
-    if not record_path.is_file():
-        return _reject(f"run_record {run_record!r} does not exist in the vault")
-    pinned_hash = str(payload.get("run_record_sha256", "")).strip().lower()
-    if pinned_hash:
-        actual = hashlib.sha256(record_path.read_bytes()).hexdigest()
-        if not hmac.compare_digest(actual, pinned_hash):
-            return _reject("run_record_sha256 does not match the vault file")
+    # Normalize Robin's verdict vocabulary to the two lifecycle outcomes.
+    # send-review.sh emits BUILD_READY / PASS / PASS_WITH_NOTES /
+    # CHANGES_REQUESTED / BLOCK / REVISE (any case); map to pass|block.
+    raw_verdict = str(payload.get("verdict", "")).strip().lower().replace("-", "_")
+    PASS_SET = {"pass", "build_ready", "pass_with_notes", "approve", "approved", "ok"}
+    BLOCK_SET = {"block", "blocked", "changes_requested", "revise", "reject",
+                 "rejected", "do_not_build", "fail"}
+    if raw_verdict in PASS_SET:
+        verdict = "pass"
+    elif raw_verdict in BLOCK_SET:
+        verdict = "block"
+    else:
+        return _reject(f"unrecognized verdict={raw_verdict!r} from Robin")
 
-    findings = payload.get("findings") or []
-    model_lane = payload.get("model_lane")
+    # run_record is OPTIONAL: send-review.sh's signed verdict is itself the
+    # provenance (HMAC + out-of-band fetch from Robin's host). When a payload
+    # DOES pin a vault run_record, validate it; otherwise the signature stands.
+    run_record = str(payload.get("run_record") or "").strip()
+    if run_record:
+        vault = Path(vault_root or DEFAULT_VAULT_ROOT)
+        record_path = (vault / run_record) if not os.path.isabs(run_record) else Path(run_record)
+        try:
+            record_path = record_path.resolve()
+            vault_resolved = vault.resolve()
+        except OSError:
+            return _reject(f"run_record path {run_record!r} cannot be resolved")
+        if vault_resolved not in record_path.parents and record_path != vault_resolved:
+            return _reject(f"run_record {run_record!r} is outside the vault root")
+        if not record_path.is_file():
+            return _reject(f"run_record {run_record!r} does not exist in the vault")
+        pinned_hash = str(payload.get("run_record_sha256", "")).strip().lower()
+        if pinned_hash:
+            actual = hashlib.sha256(record_path.read_bytes()).hexdigest()
+            if not hmac.compare_digest(actual, pinned_hash):
+                return _reject("run_record_sha256 does not match the vault file")
+
+    findings = payload.get("findings") or payload.get("risks") or []
+    model_lane = payload.get("model_lane") or payload.get("lane")
     with kb.write_txn(conn):
         kb._append_event(
             conn,
@@ -216,11 +244,11 @@ def record_review_verdict(
             },
         )
 
-    if verdict in ("pass", "pass-with-notes"):
+    if verdict == "pass":
         summary = (
-            f"Robin verdict: {verdict}"
+            f"Robin verdict: {raw_verdict.upper()}"
             + (f" (lane: {model_lane})" if model_lane else "")
-            + f". Run record: {run_record}"
+            + (f". Run record: {run_record}" if run_record else " (signed verdict).")
         )
         kb.complete_task(
             conn,
@@ -228,10 +256,11 @@ def record_review_verdict(
             result=summary,
             summary=summary,
             metadata={
-                "verdict": verdict,
+                "verdict": raw_verdict,
                 "model_lane": model_lane,
-                "run_record": run_record,
+                "run_record": run_record or None,
                 "findings": findings,
+                "commit": payload.get("commit"),
             },
             board=board,
         )
