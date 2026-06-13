@@ -7784,6 +7784,18 @@ def dispatch_once(
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        # Three-gate autonomy: a dedicated review task (assignee 'reviewer')
+        # reaching READY — not just the `review` status path — must run as a
+        # Robin courier. Force-load sdlc-review so the worker submits the
+        # commit to Robin via send-review.sh instead of trying to "review" it
+        # itself. (The status='review' path below does the same; this covers
+        # graphs that model review as a normal downstream task, e.g. 1SI-CRM
+        # AP-S1-REVIEW.)
+        if (claimed.assignee or "") == "reviewer":
+            _sk = list(claimed.skills or [])
+            if "sdlc-review" not in _sk:
+                _sk.append("sdlc-review")
+            claimed.skills = _sk
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
