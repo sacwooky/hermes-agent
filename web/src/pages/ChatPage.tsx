@@ -435,14 +435,35 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
     // Dashboard chat should scroll the browser-side transcript, not send
     // mouse-wheel protocol bytes through the PTY.
+    // Accumulate fractional lines so precise/trackpad scrolling (many small
+    // pixel deltas) glides instead of snapping to >=1 whole line per event —
+    // the old `Math.max(1, round(|delta|/50))` made the transcript jump 1-2
+    // lines and never travel smoothly to the top.
+    let wheelLineAccum = 0;
     term.attachCustomWheelEventHandler((ev) => {
       const delta = ev.deltaY;
       if (!delta) {
         return false;
       }
 
-      const step = Math.max(1, Math.round(Math.abs(delta) / 50));
-      term.scrollLines(delta > 0 ? step : -step);
+      let lines: number;
+      if (ev.deltaMode === 1) {
+        lines = delta; // already in lines
+      } else if (ev.deltaMode === 2) {
+        lines = delta * term.rows; // pages
+      } else {
+        // pixels: estimate cell height from the viewport (px / rows)
+        const px = host.clientHeight || 1;
+        const cellH = term.rows > 0 ? px / term.rows : 17;
+        lines = delta / cellH;
+      }
+
+      wheelLineAccum += lines;
+      const whole = Math.trunc(wheelLineAccum);
+      if (whole !== 0) {
+        wheelLineAccum -= whole;
+        term.scrollLines(whole);
+      }
 
       ev.preventDefault();
       ev.stopPropagation();
