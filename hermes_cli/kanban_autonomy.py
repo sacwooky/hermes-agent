@@ -229,6 +229,20 @@ def record_review_verdict(
 
     findings = payload.get("findings") or payload.get("risks") or []
     model_lane = payload.get("model_lane") or payload.get("lane")
+    lanes_run = payload.get("lanes_run")
+
+    # R8 — reject HOLLOW pass verdicts. A real review records the lane(s) that ran;
+    # a lane that errored/quota-failed and emitted an empty PASS would not. BLOCK
+    # verdicts are honored regardless (a block is still actionable). Validity =
+    # recorded lane id + signature (project-intake-discovery-process Review handoff).
+    # Placed BEFORE the verdict_recorded event so a hollow pass never emits the
+    # event the integration sweeps trust as proof of a real review.
+    if verdict == "pass" and not (model_lane or (isinstance(lanes_run, list) and lanes_run)):
+        return _reject(
+            "hollow PASS verdict: no review lane recorded (model_lane / lane / lanes_run) "
+            "— the review lane likely failed (quota/timeout); left in review for requeue"
+        )
+
     with kb.write_txn(conn):
         kb._append_event(
             conn,
