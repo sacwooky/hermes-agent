@@ -424,8 +424,14 @@ class TelegramAdapter(BasePlatformAdapter):
         # Latched off after a capability failure on sendRichMessage /
         # sendRichMessageDraft (e.g. older python-telegram-bot without the
         # endpoint) so later sends skip the doomed rich attempt entirely.
-        self._rich_send_disabled: bool = False
-        self._rich_draft_disabled: bool = False
+        # FLEET PATCH (2026-06-14): Telegram WEB cannot render Bot API 10.1 rich
+        # messages — they show "This message is currently not supported on
+        # Telegram Web", which blocks web users entirely (e.g. Dottie). Default
+        # rich OFF (MarkdownV2 fallback works on every client). Re-enable per
+        # platform with telegram extra `disable_rich_messages: false` (web users
+        # will then see the unsupported error again).
+        self._rich_send_disabled: bool = self._coerce_bool_extra("disable_rich_messages", True)
+        self._rich_draft_disabled: bool = self._coerce_bool_extra("disable_rich_messages", True)
         # Buffer rapid/album photo updates so Telegram image bursts are handled
         # as a single MessageEvent instead of self-interrupting multiple turns.
         self._media_batch_delay_seconds = float(os.getenv("HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS", "0.8"))
