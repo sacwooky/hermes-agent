@@ -8406,8 +8406,29 @@ def _default_spawn(
         task.max_runtime_seconds,
         env.get("TERMINAL_MAX_FOREGROUND_TIMEOUT"),
     )
-    if foreground_timeout is not None:
-        env["TERMINAL_MAX_FOREGROUND_TIMEOUT"] = foreground_timeout
+    # Floor the foreground-timeout cap at the kanban lane floor. The
+    # kanban-worker skill tells the worker to call ``kanban-*-lane.sh`` in the
+    # FOREGROUND with ``timeout=1700`` (a real Claude Code build runs minutes),
+    # then block until it finishes and complete/block the task. But the
+    # terminal tool REJECTS any foreground timeout above
+    # TERMINAL_MAX_FOREGROUND_TIMEOUT (default 600s) and nudges the model to
+    # ``background=true`` + ``notify_on_complete``. In headless dispatch there
+    # is no interactive loop to deliver that completion notification, so the
+    # worker ends its turn awaiting it, the process exits mid-task, and the
+    # dispatcher records a phantom "pid not alive" crash (root cause of the
+    # repeated builder/reviewer crash loop, 2026-06-14). Raising the cap to the
+    # lane floor lets the foreground lane call run synchronously so the worker
+    # stays alive until the lane returns. Honour any higher operator/runtime
+    # value already in play.
+    _LANE_FG_FLOOR = 1800  # > terminal_tool lane floor (1700) + margin
+    try:
+        _fg_existing = int(str(foreground_timeout).strip()) if foreground_timeout else int(
+            str(env.get("TERMINAL_MAX_FOREGROUND_TIMEOUT") or 0).strip() or 0
+        )
+    except (TypeError, ValueError):
+        _fg_existing = 0
+    _fg_final = max(_fg_existing, _LANE_FG_FLOOR)
+    env["TERMINAL_MAX_FOREGROUND_TIMEOUT"] = str(_fg_final)
     # Pin the shared board + workspaces root the dispatcher resolved, so
     # that even when the worker activates a profile (`hermes -p <name>`
     # rewrites HERMES_HOME), its kanban paths still match the

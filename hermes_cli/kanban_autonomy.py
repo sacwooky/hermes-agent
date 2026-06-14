@@ -250,20 +250,65 @@ def record_review_verdict(
             + (f" (lane: {model_lane})" if model_lane else "")
             + (f". Run record: {run_record}" if run_record else " (signed verdict).")
         )
-        kb.complete_task(
-            conn,
-            task_id,
-            result=summary,
-            summary=summary,
-            metadata={
-                "verdict": raw_verdict,
-                "model_lane": model_lane,
-                "run_record": run_record or None,
-                "findings": findings,
-                "commit": payload.get("commit"),
-            },
-            board=board,
-        )
+        try:
+            kb.complete_task(
+                conn,
+                task_id,
+                result=summary,
+                summary=summary,
+                metadata={
+                    "verdict": raw_verdict,
+                    "model_lane": model_lane,
+                    "run_record": run_record or None,
+                    "findings": findings,
+                    "commit": payload.get("commit"),
+                },
+                board=board,
+            )
+        except kb.AcceptanceRequiredError:
+            # Manually-gated board (e.g. fleet-key): a PASS review must NOT
+            # auto-complete the task — the operator still owns the final
+            # `accept`. Rather than propagate the error (which loses the
+            # signed verdict), park the task in the board's standard
+            # acceptance-required blocked state with the verdict on record,
+            # so it surfaces in the morning report's ACCEPT-READY list.
+            with kb.write_txn(conn):
+                now = int(time.time())
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        task_id,
+                        "robin-review",
+                        f"REVIEW PASS ({model_lane or 'robin'}) — signed verdict. "
+                        f"Board requires operator acceptance; awaiting "
+                        f"`hermes kanban accept {task_id}`.\n{summary}",
+                        now,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL "
+                    "WHERE id = ?",
+                    (task_id,),
+                )
+                kb._append_event(
+                    conn,
+                    task_id,
+                    "blocked",
+                    {
+                        "reason": (
+                            f"acceptance-required: Robin review PASSED "
+                            f"({model_lane or 'robin'}); operator must accept"
+                        ),
+                        "verdict": "pass",
+                    },
+                )
+            return {
+                "ok": True,
+                "verdict": verdict,
+                "reason": "awaiting_operator_acceptance",
+            }
         return {"ok": True, "verdict": verdict, "reason": None}
 
     # verdict == "block": findings go back to the builder lane.
@@ -287,7 +332,7 @@ def record_review_verdict(
         conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL "
-            "WHERE id = ? AND status IN ('running', 'review')",
+            "WHERE id = ? AND status IN ('running', 'review', 'done')",
             (task_id,),
         )
         kb._append_event(
@@ -692,12 +737,43 @@ def _git(args: list[str], cwd: str) -> subprocess.CompletedProcess:
     )
 
 
+def _latest_verdict(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return the verdict word from the most recent ``verdict_recorded``
+    event on *task_id* (lower-cased), or ``None`` if never reviewed."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'verdict_recorded' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return None
+    payload = row["payload"]
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    if not isinstance(payload, dict):
+        return None
+    return str(payload.get("verdict", "")).lower() or None
+
+
+def _has_passing_verdict(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the task's *latest* recorded review verdict is a pass.
+
+    Uses the latest verdict (not "any pass") so a task that passed once,
+    was reworked, and then drew a CHANGES_REQUESTED does not integrate on
+    the strength of the stale pass."""
+    return _latest_verdict(conn, task_id) in ("pass", "pass-with-notes")
+
+
 def find_unintegrated_done_tasks(
     conn: sqlite3.Connection,
     *,
     integration_branch: str,
     board: Optional[str] = None,
     integrator_assignee: str = "integrator",
+    require_review: bool = True,
 ) -> list[str]:
     """Auto-create integrate tasks for done work that never merged.
 
@@ -705,6 +781,14 @@ def find_unintegrated_done_tasks(
     ancestors of *integration_branch* (checked in the task's workspace
     repo) gets one ``integrate`` task created for the integrator lane.
     Deduped via the ``integrate_task_created`` event on the source task.
+
+    **Review gate:** when *require_review* is true (default), a done task
+    is integration-eligible ONLY if its latest recorded review verdict is
+    a pass. Done work with no verdict — or a CHANGES_REQUESTED/BLOCK — is
+    held from integration (a one-time ``integration_held_pending_review``
+    event is emitted so the morning report can surface it) rather than
+    silently merging unreviewed code. This closes the gap where the
+    "build → review → integrate" sequence let review be skipped entirely.
     """
     created: list[str] = []
     rows = conn.execute(
@@ -746,6 +830,35 @@ def find_unintegrated_done_tasks(
             continue  # already integrated
         if ancestor.returncode != 1:
             continue  # indeterminate — don't guess
+
+        # ── Review gate ──────────────────────────────────────────────
+        # Never integrate work whose latest review verdict isn't a pass.
+        # Hold it (once-emitted event → visible in the morning report)
+        # instead of silently merging unreviewed / changes-requested code.
+        if require_review and not _has_passing_verdict(conn, row["id"]):
+            if _has_event(conn, row["id"], "integration_held_pending_review") is None:
+                latest = _latest_verdict(conn, row["id"]) or "none"
+                with kb.write_txn(conn):
+                    kb._append_event(
+                        conn,
+                        row["id"],
+                        "integration_held_pending_review",
+                        {
+                            "reason": (
+                                "done with unmerged branch but latest review "
+                                f"verdict is {latest!r} (not a pass); held from "
+                                "integration until a signed PASS is on record"
+                            ),
+                            "branch": row["branch_name"],
+                        },
+                    )
+                _log.info(
+                    "integration held for %s: latest verdict=%s (need pass)",
+                    row["id"],
+                    latest,
+                )
+            continue
+
         integrate_id = kb.create_task(
             conn,
             title=f"Integrate: {row['title']}",
@@ -853,6 +966,7 @@ def run_autonomy_tick(
                 integration_branch=str(integ_cfg["branch"]),
                 board=board,
                 integrator_assignee=str(integ_cfg.get("assignee") or "integrator"),
+                require_review=bool(integ_cfg.get("require_review", True)),
             )
         except Exception:
             _log.exception("autonomy: find_unintegrated_done_tasks failed")
