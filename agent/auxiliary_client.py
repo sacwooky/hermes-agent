@@ -4958,6 +4958,17 @@ def _resolve_task_provider_model(
         cfg_provider, cfg_base_url = _expand_direct_api_alias(cfg_provider, cfg_base_url)
 
     if base_url:
+        # An explicit base_url normally forces an anonymous "custom" endpoint.
+        # But when the caller ALSO names a provider (e.g. a named custom
+        # provider like ``custom:9router-codex``, or ``openrouter``), keep that
+        # name so resolve_provider_client can resolve its declared credentials
+        # (``key_env`` / ``*_API_KEY``).  Collapsing to bare "custom" here would
+        # drop the key_env and fall back to the ``no-key-required`` placeholder
+        # → 401 on auth-required endpoints.  This mirrors the config-derived
+        # branch below (cfg_base_url + cfg_provider preserves cfg_provider).
+        prov_norm = (provider or "").strip().lower()
+        if prov_norm and prov_norm not in {"auto", "custom"}:
+            return provider, resolved_model, base_url, api_key, resolved_api_mode
         return "custom", resolved_model, base_url, api_key, resolved_api_mode
     if provider:
         return provider, resolved_model, base_url, api_key, resolved_api_mode

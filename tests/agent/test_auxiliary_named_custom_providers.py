@@ -523,3 +523,59 @@ class TestCustomProviderAliasCollision:
         assert isinstance(client, OpenAI)
         assert "override.example.com" in str(client.base_url)
         assert client.api_key == "override-key"
+
+
+class TestResolveTaskProviderModelBaseUrlPreservesNamedProvider:
+    """_resolve_task_provider_model must NOT collapse a named provider to bare
+    'custom' just because an explicit base_url is also supplied.
+
+    Regression for the auxiliary-vision 401: async_call_llm resolves the task
+    config (gets the provider's base_url) and passes that base_url back into
+    resolve_vision_provider_client, which re-runs _resolve_task_provider_model
+    with base_url set.  Forcing the provider to 'custom' there dropped the named
+    provider's key_env (e.g. NINEROUTER_KEY) → 'no-key-required' placeholder →
+    401 on every vision call, even though the main agent (same provider) worked.
+    """
+
+    def test_named_custom_provider_preserved_with_base_url(self):
+        from agent.auxiliary_client import _resolve_task_provider_model
+        prov, model, base, key, _mode = _resolve_task_provider_model(
+            task="vision",
+            provider="custom:9router-codex",
+            model="vertex/gemini-2.5-flash",
+            base_url="http://127.0.0.1:20128/v1",
+            api_key=None,
+        )
+        # The named provider must survive so its key_env can resolve downstream.
+        assert prov == "custom:9router-codex"
+        assert base == "http://127.0.0.1:20128/v1"
+        assert model == "vertex/gemini-2.5-flash"
+
+    def test_builtin_named_provider_preserved_with_base_url(self):
+        from agent.auxiliary_client import _resolve_task_provider_model
+        prov, _model, base, _key, _mode = _resolve_task_provider_model(
+            task="vision",
+            provider="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        assert prov == "openrouter"
+        assert base == "https://openrouter.ai/api/v1"
+
+    def test_anonymous_endpoint_still_collapses_to_custom(self):
+        """No provider (or literal 'custom'/'auto') + base_url → bare 'custom'."""
+        from agent.auxiliary_client import _resolve_task_provider_model
+        prov, _m, base, _k, _mode = _resolve_task_provider_model(
+            task="vision", base_url="http://localhost:1234/v1",
+        )
+        assert prov == "custom"
+        assert base == "http://localhost:1234/v1"
+
+        prov2, *_ = _resolve_task_provider_model(
+            task="vision", provider="custom", base_url="http://localhost:1234/v1",
+        )
+        assert prov2 == "custom"
+
+        prov3, *_ = _resolve_task_provider_model(
+            task="vision", provider="auto", base_url="http://localhost:1234/v1",
+        )
+        assert prov3 == "custom"
