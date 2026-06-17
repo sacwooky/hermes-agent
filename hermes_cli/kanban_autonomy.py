@@ -48,6 +48,14 @@ from hermes_cli import kanban_db as kb
 
 _log = logging.getLogger(__name__)
 
+# E4-S4: startup checks — headroom learn OFF, no :8797 chain
+try:
+    from hermes_cli.headroom_guard import check_headroom_learn_off, check_no_8797_base_url
+    for _w in check_headroom_learn_off() + check_no_8797_base_url():
+        _log.warning("headroom_guard startup: %s", _w)
+except Exception:
+    pass
+
 DEFAULT_VERDICT_KEY_PATH = "~/.hermes/credentials/robin-verdict-key"
 DEFAULT_VAULT_ROOT = "/srv/fluxlabs/vault/conductor-vault"
 VALID_VERDICTS = frozenset({"pass", "pass-with-notes", "block"})
@@ -432,8 +440,404 @@ def _harvest_epic_artifacts(conn: sqlite3.Connection, epic_id: str) -> list[dict
                 ):
                     if meta.get(key):
                         entry[key] = meta[key]
+        # E4-S1/S2: Guard conformance-evidence fields against Headroom placeholders
+        from hermes_cli.headroom_guard import assert_no_placeholders
+        try:
+            assert_no_placeholders(
+                {k: v for k, v in entry.items() if k in ("qa_evidence", "screenshots", "functional_test_results", "prd_conformance_matrix")},
+                context=f"harvest_artifacts:{srow['id']}"
+            )
+        except Exception:
+            _log.warning("headroom_guard: placeholder detected in artifact evidence for %s — clearing field", srow["id"])
+            for _field in ("qa_evidence", "screenshots", "functional_test_results", "prd_conformance_matrix"):
+                entry.pop(_field, None)
         artifacts.append(entry)
     return artifacts
+
+
+# ---------------------------------------------------------------------------
+# B4/B5 author-aware conformance guard helpers
+# ---------------------------------------------------------------------------
+
+#: Max conformance fix-story retries before escalate-once (WI-QA4 bound).
+WI_QA4_MAX_CONFORMANCE_RETRIES: int = int(
+    os.environ.get("HERMES_CONFORMANCE_MAX_RETRIES", "3")
+)
+
+#: Keywords in an epic title that flag it as high-risk for cross-check (B5).
+_HIGH_RISK_TITLE_KEYWORDS = frozenset(
+    {"auth", "payment", "credential", "secret", "token", "oauth", "phase-3", "phase3"}
+)
+
+
+def _normalize_provider(lane_or_model: str) -> str:
+    """Collapse a lane/model string to its provider family.
+
+    Returns ``"claude"``, ``"gemini"``, or ``"other"``.
+    """
+    if not lane_or_model:
+        return "other"
+    s = lane_or_model.lower()
+    if any(k in s for k in ("gemini", "jake-vertex", "vertex")):
+        return "gemini"
+    if any(k in s for k in ("claude", "anthropic")):
+        return "claude"
+    return "other"
+
+
+def _get_epic_author_provider(conn: sqlite3.Connection, epic_id: str) -> str:
+    """Infer the author provider family for an epic from chain telemetry.
+
+    Scans story-completion and review events attached to the epic for a
+    ``model_lane`` / ``lane`` field and returns the most common provider
+    family (``"claude"`` or ``"gemini"``).  Falls back to ``"claude"``
+    when no chain telemetry is recorded (the overwhelmingly common case on
+    Jake today).
+    """
+    counts: dict[str, int] = {}
+    try:
+        events = kb.list_events(conn, epic_id)
+    except Exception:
+        events = []
+    for e in events:
+        kind = getattr(e, "kind", "") or ""
+        if kind not in (
+            "story_completed",
+            "completion_recorded",
+            "review_approved",
+            "build_complete",
+        ):
+            continue
+        payload = getattr(e, "payload", None) or {}
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        lane = payload.get("model_lane") or payload.get("lane") or ""
+        provider = _normalize_provider(lane)
+        if provider in ("claude", "gemini"):
+            counts[provider] = counts.get(provider, 0) + 1
+    if not counts:
+        return "claude"  # default: Jake builders are Claude-Code
+    return max(counts, key=lambda k: counts[k])
+
+
+def _required_conformance_provider(author_provider: str) -> str:
+    """Return the required review provider given the author provider."""
+    if author_provider == "gemini":
+        return "claude"
+    return "gemini"  # claude or unknown → gemini
+
+
+def _is_high_risk_epic(conn: sqlite3.Connection, epic_id: str, title: str) -> bool:
+    """Return True if the epic is flagged as security-sensitive / Phase-3.
+
+    Checks the task title for known keywords AND looks for an explicit
+    ``security_sensitive`` or ``phase_3_flagged`` metadata key.
+    """
+    # Title scan
+    title_lower = (title or "").lower()
+    if any(kw in title_lower for kw in _HIGH_RISK_TITLE_KEYWORDS):
+        return True
+    # Metadata scan (upsert_task_metadata stores extra_json as a JSON blob)
+    try:
+        row = conn.execute(
+            "SELECT extra_json FROM task_metadata WHERE task_id = ?", (epic_id,)
+        ).fetchone()
+        if row and row["extra_json"]:
+            extra = json.loads(row["extra_json"]) if isinstance(row["extra_json"], str) else row["extra_json"]
+            if extra.get("security_sensitive") or extra.get("phase_3_flagged"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _harvest_conformance_verdicts(conn: sqlite3.Connection, epic_id: str) -> dict:
+    """Read the latest conformance verdict events recorded on the epic task.
+
+    Returns dict with keys ``security`` / ``performance`` / ``accessibility``,
+    each a dict or ``None``.  Each dict may include a ``"xcheck"`` sub-key
+    with the second independent-provider verdict (B5).
+    """
+    verdicts: dict[str, Any] = {}
+    for axis, kind in (
+        ("security", "conformance_verdict_security"),
+        ("performance", "conformance_verdict_perf"),
+        ("accessibility", "conformance_verdict_a11y"),
+    ):
+        row = _has_event(conn, epic_id, kind)
+        if row is not None:
+            try:
+                payload = row["payload"]
+                v = json.loads(payload) if isinstance(payload, str) else payload
+            except Exception:
+                v = {"verdict": "unknown", "error": "parse_failed"}
+            # B5: also harvest the cross-check opinion
+            xrow = _has_event(conn, epic_id, f"{kind}_xcheck")
+            if xrow is not None:
+                try:
+                    xp = xrow["payload"]
+                    v["xcheck"] = json.loads(xp) if isinstance(xp, str) else xp
+                except Exception:
+                    v["xcheck"] = {"verdict": "unknown", "error": "parse_failed"}
+            verdicts[axis] = v
+    return verdicts
+
+
+def record_conformance_verdict(
+    conn: sqlite3.Connection,
+    epic_id: str,
+    axis: str,
+    verdict: str,
+    *,
+    lane: str,
+    signed: bool = True,
+    findings: "list | None" = None,
+    run_record: "str | None" = None,
+    crosscheck: bool = False,
+) -> None:
+    """Record a Robin-signed conformance verdict on the epic task.
+
+    Called by the verdict courier (record-robin-verdict.sh equivalent for
+    conformance).
+
+    :param axis: ``"security"`` | ``"perf"`` | ``"a11y"``
+    :param verdict: ``"pass"`` | ``"fail"`` | ``"skip"``
+    :param crosscheck: True when this is the second independent-provider
+        opinion required for high-risk epics (B5).
+
+    B4 author-aware independence enforcement: the provider of *lane* must
+    differ from the provider that authored the epic.  A same-provider
+    verdict is recorded as ``verdict_rejected`` (extends the
+    signed-empty=rejected rule — no self-review on any axis).
+    """
+    kind_map = {
+        "security": "conformance_verdict_security",
+        "perf": "conformance_verdict_perf",
+        "a11y": "conformance_verdict_a11y",
+    }
+    kind = kind_map.get(axis)
+    if not kind:
+        raise ValueError(f"Unknown conformance axis: {axis!r}")
+    if crosscheck:
+        kind = f"{kind}_xcheck"
+
+    # B4: author-aware independence gate.
+    # Primary verdicts (crosscheck=False): lane-provider must != author-provider.
+    # Cross-check verdicts (crosscheck=True): lane-provider must != primary verdict's
+    #   lane-provider (independence from the primary, not from the author — the cross-
+    #   check deliberately lets the "other" provider challenge the primary's conclusion).
+    author_provider = _get_epic_author_provider(conn, epic_id)
+    lane_provider = _normalize_provider(lane)
+    if not crosscheck:
+        required_provider = _required_conformance_provider(author_provider)
+        if lane_provider not in ("other", "") and lane_provider == author_provider:
+            _log.warning(
+                "conformance verdict rejected on epic %s axis=%s: "
+                "lane provider %r == author provider %r (primary self-review); "
+                "required lane provider: %r",
+                epic_id, axis, lane_provider, author_provider, required_provider,
+            )
+            kb._append_event(conn, epic_id, "verdict_rejected", {
+                "reason": "author_provider_self_review",
+                "axis": axis,
+                "lane": lane,
+                "lane_provider": lane_provider,
+                "author_provider": author_provider,
+                "required_provider": required_provider,
+                "crosscheck": False,
+            })
+            raise ValueError(
+                f"conformance_verdict_rejected: epic {epic_id} axis={axis} lane_provider "
+                f"{lane_provider!r} == author_provider {author_provider!r}; "
+                f"independence required (use {required_provider!r} lane)"
+            )
+    else:
+        # Cross-check: must differ from the primary verdict's provider.
+        primary_row = _has_event(conn, epic_id, kind_map[axis])
+        if primary_row is not None:
+            try:
+                p = primary_row["payload"]
+                primary_lp = (json.loads(p) if isinstance(p, str) else p).get("lane_provider", "other")
+            except Exception:
+                primary_lp = "other"
+            if lane_provider not in ("other", "") and primary_lp not in ("other", "") and lane_provider == primary_lp:
+                _log.warning(
+                    "cross-check verdict rejected on epic %s axis=%s: "
+                    "xcheck provider %r == primary provider %r (no independence); ",
+                    epic_id, axis, lane_provider, primary_lp,
+                )
+                kb._append_event(conn, epic_id, "verdict_rejected", {
+                    "reason": "crosscheck_same_provider_as_primary",
+                    "axis": axis,
+                    "lane": lane,
+                    "lane_provider": lane_provider,
+                    "primary_provider": primary_lp,
+                    "crosscheck": True,
+                })
+                raise ValueError(
+                    f"conformance_verdict_rejected: epic {epic_id} axis={axis} xcheck "
+                    f"provider {lane_provider!r} == primary provider {primary_lp!r}; "
+                    f"independence required"
+                )
+
+    payload = {
+        "verdict": verdict,
+        "lane": lane,
+        "lane_provider": lane_provider,
+        "author_provider": author_provider,
+        "signed": signed,
+        "findings": findings or [],
+        "run_record": run_record,
+        "crosscheck": crosscheck,
+    }
+    with kb.write_txn(conn):
+        kb._append_event(conn, epic_id, kind, payload)
+
+
+def _epic_learning_signals(conn: sqlite3.Connection, epic_id: str) -> list[dict]:
+    """Gather WI-9 learning signals from an epic's history for the G3
+    learning_delta. Conservative + crash-safe: any recorded rejection/feedback
+    event becomes a correction signal; an epic that reached G3 with NO recorded
+    rejection yields a clean-acceptance success signal (capture what worked)."""
+    signals: list[dict] = []
+    rejected = False
+    try:
+        events = kb.list_events(conn, epic_id)
+    except Exception:
+        events = []
+    for e in events:
+        kind = getattr(e, "kind", "")
+        payload = getattr(e, "payload", None) or {}
+        if kind in ("rejected", "reject_with_fixes", "changes_requested", "fix_requested"):
+            rejected = True
+            signals.append({
+                "source_type": "rejection",
+                "correction_type": payload.get("correction_type", "defect"),
+                "operator_feedback": payload.get("feedback") or payload.get("comment") or "",
+                "attributed_role": payload.get("role", "builder"),
+            })
+    if not rejected:
+        signals.append({
+            "source_type": "clean_acceptance",
+            "correction_type": "success",
+            "operator_feedback": f"epic {epic_id} reached G3 clean",
+            "attributed_role": "builder",
+        })
+    return signals
+
+
+def _emit_epic_run_metric(epic_id: str, board: Optional[str], created_at, n_stories: int) -> None:
+    """WI-15 producer (best-effort, fail-safe, DEFAULT-OFF). Append one per-run
+    metric row to the vault instrumentation stream
+    (``metrics/autonomy/runs.jsonl`` under HERMES_LEARNING_VAULT_ROOT) when that
+    env is set — the same stream conductor_vault's ``instrumentation-report``
+    reads. NEVER raises into acceptance generation; the report loader tolerates a
+    torn line. Emits only the defensible run-level signal at this event
+    (run_id/board/stories/wall_clock); per-role defect/escape rates need other
+    emit points (follow-up)."""
+    try:
+        root = os.environ.get("HERMES_LEARNING_VAULT_ROOT")
+        if not root:
+            return
+        from pathlib import Path
+        d = Path(root) / "metrics" / "autonomy"
+        d.mkdir(parents=True, exist_ok=True)
+        now = int(time.time())
+        row = {"run_id": epic_id, "board": board or "", "stories": int(n_stories or 0),
+               "recorded_at": now, "source": "epic_acceptance"}
+        if isinstance(created_at, (int, float)) and created_at:
+            row["wall_clock_seconds"] = max(0, now - int(created_at))
+        with open(d / "runs.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n")
+    except Exception:
+        _log.debug("WI-15 run-metric emit skipped for epic %s", epic_id, exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# B6: WI-QA4 conformance fix-story auto-spawn (closes R2 — no manual follow-up)
+# ---------------------------------------------------------------------------
+
+def _conformance_spawn_fix_story(
+    conn: sqlite3.Connection,
+    epic: sqlite3.Row,
+    reason: str,
+    board: "str | None",
+) -> None:
+    """Spawn a conformance fix story for a failed axis, bounded by WI-QA4 retry cap.
+
+    Deduped via ``conformance_fix_story_created`` events on the epic.  After
+    ``WI_QA4_MAX_CONFORMANCE_RETRIES`` spawns, emits ``conformance_escalated``
+    once and takes no further action (escalation watcher surfaces it).
+
+    :param reason: Short slug identifying the failure type (e.g. ``"security_fail"``).
+    """
+    epic_id = epic["id"]
+    # Count prior conformance fix stories
+    try:
+        events = kb.list_events(conn, epic_id)
+    except Exception:
+        events = []
+    prior_spawns = [
+        e for e in events
+        if (getattr(e, "kind", "") or "") == "conformance_fix_story_created"
+    ]
+    prior_count = len(prior_spawns)
+
+    if prior_count >= WI_QA4_MAX_CONFORMANCE_RETRIES:
+        # Escalate-once: only emit escalation if not already emitted
+        already_escalated = any(
+            (getattr(e, "kind", "") or "") == "conformance_escalated"
+            for e in events
+        )
+        if not already_escalated:
+            _log.warning(
+                "conformance gate: epic %s hit retry bound (%d/%d) reason=%s — escalating once",
+                epic_id, prior_count, WI_QA4_MAX_CONFORMANCE_RETRIES, reason,
+            )
+            kb._append_event(conn, epic_id, "conformance_escalated", {
+                "reason": reason,
+                "retry_count": prior_count,
+                "max_retries": WI_QA4_MAX_CONFORMANCE_RETRIES,
+            })
+        else:
+            _log.debug("conformance gate: epic %s already escalated, skipping", epic_id)
+        return
+
+    # Spawn the fix story
+    title = f"[conformance-fix] {epic['title']}: {reason} (retry {prior_count + 1}/{WI_QA4_MAX_CONFORMANCE_RETRIES})"
+    try:
+        fix_id = kb.create_task(
+            conn,
+            title=title,
+            body=(
+                f"Conformance gate blocked epic `{epic_id}` — reason: `{reason}`.\n\n"
+                f"Fix the issue and re-run the conformance lane.  "
+                f"This is retry {prior_count + 1} of {WI_QA4_MAX_CONFORMANCE_RETRIES} "
+                f"(WI-QA4 bound; escalation after {WI_QA4_MAX_CONFORMANCE_RETRIES}).\n\n"
+                f"**Parent epic:** `{epic_id}` — {epic['title']}"
+            ),
+            workspace_kind=epic["workspace_kind"],
+            workspace_path=epic["workspace_path"],
+            tenant=epic["tenant"],
+            board=board,
+        )
+        kb._append_event(conn, epic_id, "conformance_fix_story_created", {
+            "fix_task_id": fix_id,
+            "reason": reason,
+            "retry_number": prior_count + 1,
+        })
+        _log.info(
+            "conformance gate: spawned fix story %s for epic %s reason=%s (retry %d/%d)",
+            fix_id, epic_id, reason, prior_count + 1, WI_QA4_MAX_CONFORMANCE_RETRIES,
+        )
+    except Exception:
+        _log.exception(
+            "conformance gate: failed to spawn fix story for epic %s reason=%s",
+            epic_id, reason,
+        )
 
 
 def generate_epic_acceptances(
@@ -460,7 +864,7 @@ def generate_epic_acceptances(
     """
     created: list[str] = []
     epic_rows = conn.execute(
-        "SELECT t.id, t.title, t.workspace_kind, t.workspace_path, t.tenant "
+        "SELECT t.id, t.title, t.workspace_kind, t.workspace_path, t.tenant, t.created_at "
         "FROM tasks t JOIN task_metadata m ON m.task_id = t.id "
         "WHERE m.work_item_type = 'epic' AND t.status IN ('done', 'archived')"
     ).fetchall()
@@ -488,6 +892,116 @@ def generate_epic_acceptances(
             body_lines.append(
                 f"- {a['task_id']} — {a['title']}" + (f" ({detail})" if detail else "")
             )
+        # WI-9: learning_delta + save_learning on the G3 packet. OFF unless
+        # HERMES_LEARNING_DELTA_ENABLED is set (consistent default-off with the
+        # other Layer-3 wirings) and fail-safe (a build error leaves the packet
+        # exactly as before). Enqueue-only — candidates route to the Unified
+        # Learning Inbox where review promotes; never mints a verified_protective.
+        learning_delta = None
+        if os.environ.get("HERMES_LEARNING_DELTA_ENABLED"):
+            try:
+                from hermes_cli.learning_delta import build_learning_delta
+
+                learning_delta = build_learning_delta(
+                    _epic_learning_signals(conn, epic["id"])
+                )
+            except Exception:
+                _log.debug(
+                    "learning_delta build skipped for epic %s", epic["id"], exc_info=True
+                )
+                learning_delta = None
+        if learning_delta and learning_delta.get("candidates"):
+            body_lines += [
+                "",
+                "**Learnings to save on accept** "
+                f"(save_learning={str(learning_delta['save_learning']).lower()}; "
+                "enqueue-only → Unified Learning Inbox, review promotes):",
+            ]
+            for _c in learning_delta["candidates"]:
+                _txt = (
+                    _c.get("statement") or _c.get("what_worked") or _c.get("rule")
+                    or _c.get("prevention_rule") or ""
+                )
+                body_lines.append(f"- [{_c['type']}] {_txt}")
+        # ADD-ON B E2-S1/S2/S4/S5: conformance verdicts in packet + security machine gate
+        conformance = _harvest_conformance_verdicts(conn, epic["id"])
+
+        # B5: high-risk cross-check — for security-sensitive / Phase-3 epics, require
+        # both a primary verdict AND an xcheck verdict from a second independent provider.
+        # Both must pass; a missing xcheck counts as insufficient evidence (no G3 yet).
+        _is_high_risk = _is_high_risk_epic(conn, epic["id"], epic["title"])
+        _sec = conformance.get("security") if conformance else None
+        _sec_verdict = (_sec or {}).get("verdict", "skip")
+        if _is_high_risk and _sec_verdict not in ("fail", "skip"):
+            _xcheck = (_sec or {}).get("xcheck")
+            _xcheck_verdict = (_xcheck or {}).get("verdict") if _xcheck else None
+            _xcheck_provider = (_xcheck or {}).get("lane_provider") if _xcheck else None
+            _primary_provider = (_sec or {}).get("lane_provider")
+            if _xcheck is None:
+                # Cross-check not yet recorded — no G3 until second opinion arrives.
+                _log.info(
+                    "conformance gate: high-risk epic %s awaiting security cross-check "
+                    "(min_agreement=2, single verdict insufficient)",
+                    epic["id"],
+                )
+                continue
+            if _xcheck_verdict != "pass":
+                _log.warning(
+                    "conformance gate: high-risk epic %s security cross-check verdict=%s "
+                    "— blocking G3",
+                    epic["id"], _xcheck_verdict,
+                )
+                kb._append_event(conn, epic["id"], "conformance_gate_block", {
+                    "axis": "security", "reason": "crosscheck_fail",
+                    "primary_verdict": _sec_verdict,
+                    "xcheck_verdict": _xcheck_verdict,
+                    "primary_provider": _primary_provider,
+                    "xcheck_provider": _xcheck_provider,
+                })
+                _conformance_spawn_fix_story(conn, epic, "security_xcheck_fail", board)
+                continue
+            if _xcheck_provider and _primary_provider and _xcheck_provider == _primary_provider:
+                _log.warning(
+                    "conformance gate: high-risk epic %s security cross-check provider "
+                    "same as primary (%r) — independence violated, blocking G3",
+                    epic["id"], _primary_provider,
+                )
+                kb._append_event(conn, epic["id"], "conformance_gate_block", {
+                    "axis": "security", "reason": "crosscheck_independence_violation",
+                    "primary_provider": _primary_provider,
+                    "xcheck_provider": _xcheck_provider,
+                })
+                continue
+
+        # Security gate: BLOCKING — if security verdict is fail, spawn fix story
+        # instead of G3 acceptance creation (WI-QA4; B6: auto-spawn closes R2).
+        if _sec_verdict == "fail":
+            _log.warning(
+                "conformance gate: security FAIL on epic %s — spawning fix story instead of G3",
+                epic["id"],
+            )
+            kb._append_event(conn, epic["id"], "conformance_gate_block", {
+                "axis": "security", "verdict": "fail",
+                "findings": (_sec or {}).get("findings", []),
+            })
+            _conformance_spawn_fix_story(conn, epic, "security_fail", board)
+            continue
+
+        # Advisory axes: record in body for operator visibility
+        _perf = conformance.get("performance") if conformance else None
+        _a11y = conformance.get("accessibility") if conformance else None
+        _criteria_lines: list[str] = []
+        for _axis, _cv in (("security", _sec), ("performance", _perf), ("accessibility", _a11y)):
+            if _cv is None:
+                _criteria_lines.append(f"- {_axis}: not yet run")
+            else:
+                _criteria_lines.append(
+                    f"- {_axis}: {_cv.get('verdict', '?').upper()}"
+                    + (" ⚠ advisory" if _axis in ("performance", "accessibility") else "")
+                    + (f" ({len(_cv.get('findings', []))} findings)" if _cv.get("findings") else "")
+                )
+        if _criteria_lines:
+            body_lines += ["", "**Conformance verdicts:**"] + _criteria_lines
         body_lines += [
             "",
             "To **accept**: `hermes kanban accept <this-task-id> <optional note>`",
@@ -496,6 +1010,22 @@ def generate_epic_acceptances(
             "a fix story is spawned automatically and acceptance re-requested",
             "when it lands.",
         ]
+        # Packet artifacts: backward-compatible — learning_delta only added when
+        # WI-9 is enabled, so default packets are exactly {epic_id, stories}.
+        acceptance_packet = {"epic_id": epic["id"], "stories": artifacts}
+        if learning_delta is not None:
+            acceptance_packet["learning_delta"] = learning_delta
+        if conformance:
+            acceptance_packet["conformance_verdicts"] = conformance
+        # E4-S2: Final packet sanity — no placeholders cross to Robin
+        from hermes_cli.headroom_guard import assert_no_placeholders
+        try:
+            assert_no_placeholders(acceptance_packet, context=f"acceptance_packet:{epic['id']}")
+        except Exception as _hg_err:
+            _log.error("headroom_guard: placeholder in acceptance packet for %s: %s", epic["id"], _hg_err)
+            # Fail-safe: strip the offending fields rather than blocking G3 creation
+            for _f in ("screenshots", "functional_test_results", "prd_conformance_matrix"):
+                acceptance_packet.pop(_f, None)
         acceptance_id = kb.create_task(
             conn,
             title=f"Epic acceptance: {epic['title']}",
@@ -543,10 +1073,7 @@ def generate_epic_acceptances(
                 (
                     approval_id,
                     acceptance_id,
-                    json.dumps(
-                        {"epic_id": epic["id"], "stories": artifacts},
-                        ensure_ascii=False,
-                    ),
+                    json.dumps(acceptance_packet, ensure_ascii=False),
                     acceptance_id,
                     now,
                     now,
@@ -569,6 +1096,12 @@ def generate_epic_acceptances(
                 {"acceptance_id": acceptance_id, "approval_id": approval_id},
             )
         created.append(acceptance_id)
+        # WI-15: emit the per-run instrumentation row (best-effort, default-off).
+        _emit_epic_run_metric(
+            epic["id"], board,
+            (epic["created_at"] if "created_at" in epic.keys() else None),
+            len(artifacts),
+        )
         _log.info(
             "epic acceptance task %s created for epic %s", acceptance_id, epic["id"]
         )
@@ -584,6 +1117,53 @@ def _latest_approval(
         "ORDER BY created_at DESC, rowid DESC LIMIT 1",
         (task_id, approval_type),
     ).fetchone()
+
+
+def maybe_enqueue_learning(
+    artifacts: Optional[dict], *, run_id: Optional[str] = None
+) -> dict:
+    """save_learning bridge (WI-9/WI-10): on G3 accept, enqueue the packet's
+    ``learning_delta`` candidates into the Unified Learning Inbox via the
+    conductor-vault CLI (cross-repo subprocess — the packages aren't shared).
+
+    OFF unless HERMES_LEARNING_ENQUEUE_CMD + HERMES_LEARNING_VAULT_ROOT +
+    HERMES_LEARNING_LOCK are all set. Fail-safe (never breaks accept on a bridge
+    error) and ENQUEUE-ONLY (the CLI lands candidates; review promotes).
+    """
+    import os
+    import subprocess
+    import tempfile
+
+    ld = (artifacts or {}).get("learning_delta") if isinstance(artifacts, dict) else None
+    if not (isinstance(ld, dict) and ld.get("save_learning") and ld.get("candidates")):
+        return {"enqueued": False, "reason": "no save_learning candidates"}
+    cmd = os.environ.get("HERMES_LEARNING_ENQUEUE_CMD")
+    vault = os.environ.get("HERMES_LEARNING_VAULT_ROOT")
+    lock = os.environ.get("HERMES_LEARNING_LOCK")
+    if not (cmd and vault and lock):
+        return {"enqueued": False, "reason": "bridge not configured (off)"}
+    cfile = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump(ld["candidates"], fh)
+            cfile = fh.name
+        argv = cmd.split() + [
+            "--vault", vault, "learning-enqueue",
+            "--lock", lock, "--candidates-file", cfile,
+        ]
+        if run_id:
+            argv += ["--source-run-id", str(run_id)]
+        subprocess.run(argv, check=True, capture_output=True, timeout=60)
+        return {"enqueued": True, "count": len(ld["candidates"])}
+    except Exception:
+        _log.warning("save_learning enqueue failed", exc_info=True)
+        return {"enqueued": False, "reason": "error"}
+    finally:
+        if cfile:
+            try:
+                os.unlink(cfile)
+            except OSError:
+                pass
 
 
 def sweep_acceptance_tasks(
@@ -638,6 +1218,26 @@ def sweep_acceptance_tasks(
                 summary=f"Epic accepted by {approver}.",
                 board=board,
             )
+            # save_learning bridge (off unless the enqueue env is configured).
+            # Reads the G3 packet's learning_delta and enqueues its candidates
+            # into the Unified Learning Inbox; never breaks accept on error.
+            try:
+                _arts_row = (
+                    conn.execute(
+                        "SELECT artifacts_json FROM task_approvals WHERE approval_id=?",
+                        (approval["approval_id"],),
+                    ).fetchone()
+                    if approval is not None
+                    else None
+                )
+                _arts = (
+                    json.loads(_arts_row["artifacts_json"])
+                    if _arts_row and _arts_row["artifacts_json"]
+                    else {}
+                )
+                maybe_enqueue_learning(_arts, run_id=tid)
+            except Exception:
+                _log.debug("save_learning enqueue skipped for %s", tid, exc_info=True)
             completed.append(tid)
             continue
         if approval is not None and approval["status"] in (
@@ -779,6 +1379,145 @@ def _has_passing_verdict(conn: sqlite3.Connection, task_id: str) -> bool:
     was reworked, and then drew a CHANGES_REQUESTED does not integrate on
     the strength of the stale pass."""
     return _latest_verdict(conn, task_id) in ("pass", "pass-with-notes")
+
+
+# Integration-branch push guard (WI-5 safety floor). The integrator lane is
+# the ONLY lane permitted to push, and ONLY to the designated integration
+# branch — never with --force / history rewrite, never to
+# main/release/production. Encoded as enforceable code here so the integrator
+# tool layer can refuse BEFORE running git, rather than relying solely on the
+# integrator SOUL instruction text in the integrate-task body.
+PROTECTED_BRANCH_PREFIXES = ("main", "master", "release", "prod", "production")
+
+
+def validate_integration_push(
+    target_branch: str,
+    *,
+    integration_branch: str,
+    force: bool = False,
+) -> tuple[bool, Optional[str]]:
+    """Authorize an integrator push. Returns ``(ok, reason)``.
+
+    Rules (per §0.3 never-automate + the integrator exception):
+      * force-push / history rewrite is NEVER allowed;
+      * the push target must be EXACTLY the designated integration branch;
+      * main / master / release* / prod* / production are always refused,
+        even if one were (mis)configured as the integration branch.
+
+    The integrator tool layer MUST call this and refuse the push when ``ok``
+    is False; builder lanes never push at all.
+    """
+    tgt = (target_branch or "").strip()
+    integ = (integration_branch or "").strip()
+    if force:
+        return False, "force-push / history rewrite is never permitted"
+    if not tgt:
+        return False, "no push target branch given"
+    low = tgt.lower()
+    first_seg = low.split("/", 1)[0]
+    for pfx in PROTECTED_BRANCH_PREFIXES:
+        # Match an exact name or the first path segment (so "release/1.2" ->
+        # "release"). Precise: blocks main/master/release*/prod*/production
+        # without refusing unrelated feature branches like "release-notes".
+        if first_seg == pfx:
+            return False, f"push to protected branch {tgt!r} is never permitted"
+    if not integ:
+        return False, "no integration branch configured"
+    if tgt != integ:
+        return False, (
+            f"integrator may push ONLY to the integration branch {integ!r}, "
+            f"not {tgt!r}"
+        )
+    return True, None
+
+
+def integration_push(
+    workspace: str,
+    *,
+    integration_branch: str,
+    target_branch: Optional[str] = None,
+    remote: str = "origin",
+    dry_run: bool = False,
+) -> dict:
+    """The integrator lane's ONLY sanctioned push path (WI-5 tool layer).
+
+    Calls :func:`validate_integration_push` (``force`` is ALWAYS False — this
+    tool can never force-push) and REFUSES to push unless the target is exactly
+    the designated integration branch and not a protected branch. On approval it
+    runs ``git -C <workspace> push <remote> <target>`` (never ``--force``).
+
+    The integrator SOUL directs the lane to push exclusively via this tool, so
+    the guard is enforced in code rather than by prose alone. Returns a result
+    dict ``{"ok", "pushed", ...}``; NEVER raises on a refusal (so a caller/CLI
+    can report it cleanly) and never pushes when ``ok`` is False.
+    """
+    import subprocess
+
+    target = (target_branch or integration_branch or "").strip()
+    ok, reason = validate_integration_push(
+        target, integration_branch=integration_branch, force=False
+    )
+    if not ok:
+        return {"ok": False, "pushed": False, "reason": reason, "target": target}
+    if dry_run:
+        return {"ok": True, "pushed": False, "dry_run": True, "target": target, "remote": remote}
+    try:
+        p = subprocess.run(  # noqa: S603 -- fixed argv, no shell, no --force
+            ["git", "-C", str(workspace), "push", str(remote), target],
+            capture_output=True, text=True, timeout=300,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return {"ok": True, "pushed": False, "target": target, "remote": remote,
+                "error": f"{type(exc).__name__}: {exc}"}
+    if p.returncode != 0:
+        return {"ok": True, "pushed": False, "target": target, "remote": remote,
+                "error": (p.stderr or p.stdout or "").strip()[-600:]}
+    return {"ok": True, "pushed": True, "target": target, "remote": remote,
+            "output": (p.stdout or p.stderr or "").strip()[-600:]}
+
+
+def budget_pause_if_over(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    budget_cfg: Optional[dict],
+    usage_class: str = "subscription_quota",
+    projected_cash_usd: float = 0.0,
+    board: Optional[str] = None,
+) -> Optional[str]:
+    """Budget Guard (WI-7) dispatch hook.
+
+    If the run would breach the cash budget, park *task_id* behind a
+    ``pause_for_approval`` gate card and return the gate id; otherwise return
+    ``None`` (allow the spawn). Defaults to ``subscription_quota`` (the fleet
+    norm — $0 cash) so a run is only ever paused when it is EXPLICITLY
+    ``api_cash`` over cap, keeping normal dispatch unaffected.
+
+    NOTE: the dispatcher wiring (calling this from ``dispatch_once``'s spawn
+    loop, behind a default-off ``autonomy_cfg['budget']`` flag, with a per-run
+    usage_class / projected-cost source) is the remaining WI-7 step — see the
+    build plan. This helper is the tested enforcement primitive it will call.
+    """
+    from hermes_cli import budget_guard as _bg
+
+    decision = _bg.decision_from_config(
+        budget_cfg, usage_class=usage_class, projected_cash_usd=projected_cash_usd
+    )
+    if decision.allow:
+        return None
+    return kb.create_gate_task(
+        conn,
+        title=f"Budget pause: approval required for {task_id}",
+        body=(
+            f"Autonomous run for `{task_id}` was paused by Budget Guard "
+            f"(WI-7).\n\nReason: {decision.reason}\n\n"
+            "Approve this gate to authorize the spend, or adjust the project "
+            "budget cap; the parked task then dispatches."
+        ),
+        created_by="budget-guard",
+        children=[task_id],
+        board=board,
+    )
 
 
 def find_unintegrated_done_tasks(
