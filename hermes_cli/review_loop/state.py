@@ -84,6 +84,12 @@ def compute_loop_state(conn, task_id: str) -> LoopState:
     l0_failures = sum(1 for k in kinds if k == "l0_gate_failed")
     l0_escalated = "l0_gate_escalated" in kinds
 
+    # L1 cheap screen (non-binding). l1_passed = cleared as routine (escalate=False).
+    l1_passed: Optional[bool] = None
+    for e in evs:
+        if (getattr(e, "kind", "") or "") == "l1_screen":
+            l1_passed = not bool(_payload(e).get("escalate", True))
+
     # Latest review verdict wins (re-reviews after a fix).
     l2_verdict: Optional[str] = None
     l2_rejected = False
@@ -129,6 +135,7 @@ def compute_loop_state(conn, task_id: str) -> LoopState:
     st = LoopState(
         task_id=task_id, stage=stage,
         l0_passed=l0_passed, l0_failures=l0_failures, l0_escalated=l0_escalated,
+        l1_passed=l1_passed,
         l2_verdict=l2_verdict, l2_rejected=l2_rejected, fusion_run_id=fusion_run_id,
         integrated=integrated, g3_pending=g3_pending, budget_paused=budget_paused,
     )

@@ -982,6 +982,92 @@ def run_l0_gate_for_review_task(
     return True  # L0 settled this tick → no review token spent
 
 
+# ---------------------------------------------------------------------------
+# ADD-ON C v2 — WI-C4 L1 cheap screen (default-off; NON-BINDING triage that runs
+# before the binding review). Records a routine/risky signal; never blocks review,
+# never writes a verdict. The signal feeds the loop-state l1 slot and (Phase 6) the
+# Fusion jury sizing.
+# ---------------------------------------------------------------------------
+
+def run_l1_screen_for_review_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+    l1_cfg: Optional[dict] = None,
+) -> None:
+    """Run the non-binding L1 cheap screen for a task in ``review``.
+
+    Records an ``l1_screen`` event (routine|risky + escalate). **Never blocks** the
+    review and **never** writes a verdict — review always proceeds regardless. Deduped:
+    runs at most once per artifact (skipped if an ``l1_screen`` event already exists).
+    """
+    cfg = l1_cfg or {}
+    try:
+        events = kb.list_events(conn, task_id)
+    except Exception:
+        events = []
+    kinds = [(getattr(e, "kind", "") or "") for e in events]
+    if "l1_screen" in kinds:
+        return  # dedup: triage once per artifact
+
+    task = kb.get_task(conn, task_id)
+    if task is None:
+        return
+
+    # Build a cheap artifact view: title + body + latest completion summary.
+    parts = [f"# {task.title}"]
+    if getattr(task, "body", None):
+        parts.append(task.body)
+    for e in events:
+        if (getattr(e, "kind", "") or "") == "completed":
+            p = e.payload
+            if isinstance(p, str):
+                try:
+                    p = json.loads(p)
+                except Exception:
+                    p = {}
+            if isinstance(p, dict) and p.get("summary"):
+                parts.append(f"[build summary] {p['summary']}")
+    artifact = "\n\n".join(parts)
+
+    # Deterministic risk floor: high-risk title keywords force escalate.
+    title_lower = (task.title or "").lower()
+    force = any(k in title_lower for k in _HIGH_RISK_TITLE_KEYWORDS)
+
+    try:
+        from hermes_cli.review_loop.l1_screen import run_l1_screen
+        result = run_l1_screen(
+            artifact,
+            model=cfg.get("model", "ag/gemini-3-flash"),
+            base_url=cfg.get("base_url", "http://127.0.0.1:20128/v1"),
+            key_env=cfg.get("key_env", "NINEROUTER_KEY"),
+            timeout_s=int(cfg.get("timeout_s", 45)),
+            force_escalate=force,
+        )
+    except Exception:
+        _log.exception("l1_screen: crashed for %s — recording fail-open escalate", task_id)
+        from hermes_cli.review_loop.l1_screen import L1Result
+        result = L1Result(risk="risky", escalate=True, findings_count=0,
+                          summary="l1 screen crashed", model="?", ok=False, error="crash")
+
+    try:
+        with kb.write_txn(conn):
+            kb._append_event(conn, task_id, "l1_screen", {
+                "attested_by": "l1_screen",
+                "binding": False,
+                "risk": result.risk,
+                "escalate": result.escalate,
+                "findings_count": result.findings_count,
+                "summary": result.summary,
+                "model": result.model,
+                "model_ok": result.ok,
+                "deterministic_floor": force,
+            })
+    except Exception:
+        _log.debug("l1_screen: event emit failed for %s", task_id, exc_info=True)
+
+
 def generate_epic_acceptances(
     conn: sqlite3.Connection,
     *,
