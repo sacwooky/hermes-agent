@@ -4706,6 +4706,11 @@ def _resolve_task_provider_model(
         cfg_model = str(task_config.get("model", "")).strip() or None
         cfg_base_url = str(task_config.get("base_url", "")).strip() or None
         cfg_api_key = str(task_config.get("api_key", "")).strip() or None
+        cfg_key_env = str(
+            task_config.get("key_env") or task_config.get("api_key_env") or ""
+        ).strip()
+        if not cfg_api_key and cfg_key_env:
+            cfg_api_key = os.getenv(cfg_key_env, "").strip() or None
         cfg_api_mode = str(task_config.get("api_mode", "")).strip() or None
 
     resolved_model = model or cfg_model

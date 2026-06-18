@@ -254,6 +254,38 @@ class TestResolveVisionProviderClientModelNormalization:
         assert model == "glm-5v-turbo"  # zai has dedicated vision model in _PROVIDER_VISION_MODELS
 
 
+class TestVisionAuxiliaryKeyEnv:
+    """Vision task config should resolve key_env before explicit base_url routing."""
+
+    def test_vision_base_url_uses_auxiliary_key_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("BEANS_KEY", "beans-secret")
+        _write_config(tmp_path, {
+            "model": {"default": "main-model", "provider": "custom:beans"},
+            "custom_providers": [
+                {"name": "beans", "base_url": "http://beans.local/v1", "key_env": "BEANS_KEY"},
+            ],
+            "auxiliary": {
+                "vision": {
+                    "provider": "custom:beans",
+                    "model": "beans-vision",
+                    "base_url": "http://beans.local/v1",
+                    "key_env": "BEANS_KEY",
+                }
+            },
+        })
+        with patch("agent.auxiliary_client.resolve_provider_client") as mock_resolve:
+            mock_resolve.return_value = (MagicMock(), "beans-vision")
+            from agent.auxiliary_client import resolve_vision_provider_client
+
+            provider, client, model = resolve_vision_provider_client()
+
+        assert provider == "custom"
+        assert client is not None
+        assert model == "beans-vision"
+        assert mock_resolve.call_args.kwargs["explicit_base_url"] == "http://beans.local/v1"
+        assert mock_resolve.call_args.kwargs["explicit_api_key"] == "beans-secret"
+
+
 class TestVisionPathApiMode:
     """Vision path should propagate api_mode to _get_cached_client."""
 
