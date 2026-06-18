@@ -17,13 +17,25 @@ from __future__ import annotations
 import inspect
 
 from agent import conversation_loop
+from agent import turn_api_call
+
+
+def _turn_source() -> str:
+    """Source of the turn-execution code. The API-call/retry loop (where the
+    OAuth-401 guidance lives) was extracted into
+    turn_api_call.run_api_call_with_retry (god-file decomposition 010c), so this
+    source-location guard scans both run_conversation and the extracted helper.
+    """
+    return inspect.getsource(conversation_loop.run_conversation) + inspect.getsource(
+        turn_api_call.run_api_call_with_retry
+    )
 
 
 def test_nous_provider_is_in_oauth_401_set():
     """The provider-set gate that selects OAuth-specific guidance must
     include ``nous`` alongside ``openai-codex`` and ``xai-oauth``.
     """
-    source = inspect.getsource(conversation_loop.run_conversation)
+    source = _turn_source()
 
     # Be flexible about set element ordering — assert all three are listed
     # near each other in the gating expression.
@@ -42,7 +54,7 @@ def test_nous_provider_is_in_oauth_401_set():
 
 def test_nous_401_guidance_strings_present():
     """User-facing remediation strings for Nous OAuth 401s must exist."""
-    source = inspect.getsource(conversation_loop.run_conversation)
+    source = _turn_source()
 
     # Must tell the user it's an OAuth token problem, NOT an API key problem
     # (Nous Portal has no API key path — auth_type=oauth_device_code only).
@@ -64,7 +76,7 @@ def test_free_slug_hint_for_nous_provider():
     on the next message because Nous Portal doesn't carry the OpenRouter
     free-tier slug.
     """
-    source = inspect.getsource(conversation_loop.run_conversation)
+    source = _turn_source()
 
     assert "endswith(\":free\")" in source
     assert "OpenRouter slug" in source

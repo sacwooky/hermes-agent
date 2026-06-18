@@ -9,6 +9,7 @@ import inspect
 from unittest.mock import MagicMock
 
 from agent import conversation_loop
+from agent import turn_api_call
 from run_agent import _pool_may_recover_from_rate_limit
 
 
@@ -72,7 +73,12 @@ def test_conversation_loop_resolves_pool_helper_through_run_agent_module():
     production wrappers that patch run_agent) will not propagate into the
     extracted loop; older code also hit NameError in this branch.
     """
-    source = inspect.getsource(conversation_loop.run_conversation)
+    # The API-call/retry loop (and its pool-helper resolution) was extracted
+    # into turn_api_call.run_api_call_with_retry (god-file decomposition 010c);
+    # scan both so this source-location guard follows the relocated code.
+    source = inspect.getsource(conversation_loop.run_conversation) + inspect.getsource(
+        turn_api_call.run_api_call_with_retry
+    )
 
     assert "_ra()._pool_may_recover_from_rate_limit(" in source
     assert "pool_may_recover = _pool_may_recover_from_rate_limit(" not in source
