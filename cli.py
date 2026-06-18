@@ -13933,6 +13933,24 @@ def main(
                                     _exit_code = _RL_CODE
                                 except Exception:
                                     _exit_code = 1
+                        # A kanban worker that called ``kanban_queue`` requested
+                        # a deliberate yield / fail-closed hand-off: exit with
+                        # the EX_QUEUED sentinel so the dispatcher requeues the
+                        # card to ``ready`` WITHOUT counting a failure or
+                        # tripping the breaker. This is an EXPLICIT signal and
+                        # overrides the 0/1 result code (a bare clean exit with
+                        # no signal stays a protocol_violation, by design).
+                        if (
+                            os.environ.get("HERMES_KANBAN_TASK")
+                            and os.environ.get("HERMES_KANBAN_YIELD") == "1"
+                        ):
+                            try:
+                                from hermes_cli.kanban_db import (
+                                    KANBAN_INTENTIONAL_EXIT_CODE as _IQ_CODE,
+                                )
+                                _exit_code = _IQ_CODE
+                            except Exception:
+                                pass
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails

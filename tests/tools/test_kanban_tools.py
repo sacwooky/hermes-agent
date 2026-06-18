@@ -182,6 +182,43 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+def test_kanban_queue_yields_without_transition_and_signals_exit(
+    worker_env, monkeypatch,
+):
+    """kanban_queue records the yield reason + sets the EX_QUEUED signal but
+    LEAVES the task ``running`` (the worker exits first, then the reaper
+    requeues — avoids a double-dispatch window)."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.delenv("HERMES_KANBAN_YIELD", raising=False)
+    out = kt._handle_queue({"reason": "review lane below quorum — transient"})
+    d = json.loads(out)
+    assert d.get("yielded") is True
+    assert d.get("task_id") == worker_env
+
+    # Signal set for the worker runner (cli.py) to exit EX_QUEUED.
+    assert os.environ.get("HERMES_KANBAN_YIELD") == "1"
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        # Intentionally still running — NOT transitioned by the tool.
+        assert task.status == "running"
+        # Reason recorded as a comment.
+        comments = kb.list_comments(conn, worker_env)
+        assert any("Queued (yield)" in (getattr(c, "body", "") or "")
+                   for c in comments)
+    finally:
+        conn.close()
+
+
+def test_kanban_queue_requires_reason(worker_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_queue({})
+    assert "error" in json.loads(out)
+
+
 def test_show_explicit_task_id(worker_env):
     """Peek at a different task than the one in env."""
     from hermes_cli import kanban_db as kb

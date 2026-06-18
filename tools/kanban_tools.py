@@ -642,6 +642,52 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error(f"kanban_block: {e}")
 
 
+def _handle_queue(args: dict, **kw) -> str:
+    """Yield the task for a later retry / the next stage WITHOUT completing or
+    blocking it — a deliberate, fail-closed hand-off (e.g. a review that can't
+    render a verdict right now, a transient dependency outage). Records the
+    reason and signals the worker runner to exit with the EX_QUEUED sentinel,
+    so the dispatcher requeues the card to ``ready`` as a benign ``queued``
+    event WITHOUT counting a failure or tripping the circuit breaker.
+
+    The task is intentionally LEFT ``running`` here: the worker exits first,
+    then the reaper requeues it — so there is no window where the card is
+    ``ready`` while this worker is still alive (which would risk a
+    double-dispatch). Use this INSTEAD of just ending your turn when you mean
+    to yield: a bare clean exit with the task still running is a protocol
+    violation that hard-blocks the card.
+    """
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    reason = args.get("reason")
+    if not reason or not str(reason).strip():
+        return tool_error("reason is required — explain why you are yielding")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            author = _normalize_profile(os.environ.get("HERMES_PROFILE")) or "worker"
+            kb.add_comment(
+                conn, tid, author=author, body=f"**Queued (yield)**: {reason}",
+            )
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.exception("kanban_queue failed")
+        return tool_error(f"kanban_queue: {e}")
+    # Signal the worker runner (cli.py) to exit with KANBAN_INTENTIONAL_EXIT_CODE
+    # (EX_QUEUED). The dispatcher reaper then requeues this still-``running``
+    # task to ``ready`` without counting a failure.
+    os.environ["HERMES_KANBAN_YIELD"] = "1"
+    return _ok(task_id=tid, queued=True, yielded=True)
+
+
 def _handle_heartbeat(args: dict, **kw) -> str:
     """Signal that the worker is still alive during a long operation.
 
@@ -1108,6 +1154,39 @@ KANBAN_BLOCK_SCHEMA = {
     },
 }
 
+KANBAN_QUEUE_SCHEMA = {
+    "name": "kanban_queue",
+    "description": (
+        "Yield this task for a later retry or the next stage WITHOUT "
+        "completing or blocking it — a deliberate, fail-closed hand-off "
+        "(e.g. a review that cannot render a verdict right now, a transient "
+        "dependency/quorum outage). The dispatcher requeues the card to "
+        "``ready`` as a benign event WITHOUT counting a failure or tripping "
+        "the circuit breaker. ALWAYS call this instead of just ending your "
+        "turn when you mean to yield: a bare clean exit with the task still "
+        "running is treated as a crash and hard-blocks the card. ``reason`` "
+        "is recorded on the board."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Why you are yielding, in one or two sentences, e.g. "
+                    "'review lane below quorum — transient; requeue for retry'."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["reason"],
+    },
+}
+
 KANBAN_HEARTBEAT_SCHEMA = {
     "name": "kanban_heartbeat",
     "description": (
@@ -1392,6 +1471,15 @@ registry.register(
     handler=_handle_block,
     check_fn=_check_kanban_mode,
     emoji="⏸",
+)
+
+registry.register(
+    name="kanban_queue",
+    toolset="kanban",
+    schema=KANBAN_QUEUE_SCHEMA,
+    handler=_handle_queue,
+    check_fn=_check_kanban_mode,
+    emoji="↩",
 )
 
 registry.register(
