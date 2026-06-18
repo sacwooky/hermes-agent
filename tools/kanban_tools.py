@@ -593,6 +593,9 @@ def _handle_complete(args: dict, **kw) -> str:
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
+            # A terminal transition supersedes any earlier kanban_queue yield:
+            # clear the EX_QUEUED signal so the worker exits 0 (done), not 76.
+            os.environ.pop("HERMES_KANBAN_YIELD", None)
             run = kb.latest_run(conn, tid)
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
@@ -631,6 +634,9 @@ def _handle_block(args: dict, **kw) -> str:
                     f"could not block {tid} (unknown id or not in "
                     f"running/ready)"
                 )
+            # A terminal transition supersedes any earlier kanban_queue yield:
+            # clear the EX_QUEUED signal so the worker exits 0/1, not 76.
+            os.environ.pop("HERMES_KANBAN_YIELD", None)
             run = kb.latest_run(conn, tid)
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:

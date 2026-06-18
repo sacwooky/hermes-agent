@@ -219,6 +219,36 @@ def test_kanban_queue_requires_reason(worker_env):
     assert "error" in json.loads(out)
 
 
+def test_terminal_transition_clears_stale_yield_flag(worker_env, monkeypatch):
+    """Robin finding: a worker that yields (kanban_queue) and then COMPLETES or
+    BLOCKS must NOT still exit EX_QUEUED — the terminal transition supersedes
+    the yield by clearing HERMES_KANBAN_YIELD."""
+    from tools import kanban_tools as kt
+
+    # yield → flag set
+    kt._handle_queue({"reason": "transient — will retry"})
+    assert os.environ.get("HERMES_KANBAN_YIELD") == "1"
+
+    # ...but then the worker actually completes the task → flag cleared.
+    out = kt._handle_complete({"summary": "actually finished"})
+    assert "error" not in json.loads(out)
+    assert os.environ.get("HERMES_KANBAN_YIELD") is None
+
+    # Same for block on a fresh task.
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid2 = kb.create_task(conn, title="t2", assignee="test-worker")
+        kb.claim_task(conn, tid2)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid2)
+    kt._handle_queue({"reason": "transient"})
+    assert os.environ.get("HERMES_KANBAN_YIELD") == "1"
+    kt._handle_block({"reason": "actually need a human"})
+    assert os.environ.get("HERMES_KANBAN_YIELD") is None
+
+
 def test_show_explicit_task_id(worker_env):
     """Peek at a different task than the one in env."""
     from hermes_cli import kanban_db as kb
