@@ -6356,6 +6356,12 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    paused: bool = False
+    """WI-8: True when the global autonomy pause is in effect this tick. When
+    paused, housekeeping (reclaim/timeout/sweeps) still runs but no NEW work is
+    spawned (ready + review loops skipped). In-flight tasks finish; the board
+    auto-resumes when the pause sentinel clears."""
+    pause_reason: str = ""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -7640,6 +7646,30 @@ def dispatch_once(
             )
         except Exception:
             _log.exception("dispatch: autonomy tick failed (board=%s)", board)
+
+    # WI-8 global autonomy pause (ADD-ON C v2 Phase 2). Housekeeping above
+    # (reclaim/timeout/sweeps) has already run; if paused we spawn NO new work
+    # this tick — in-flight tasks finish, the queue holds, and the board
+    # auto-resumes when the sentinel clears. Optional outage auto-pause trips
+    # when many provider credentials are simultaneously OPEN (fail-open: any
+    # error here leaves the dispatcher un-paused).
+    if not dry_run:
+        try:
+            from hermes_cli.review_loop import pause as _pause
+            _outage = (autonomy_cfg or {}).get("outage_pause") or {}
+            if _outage.get("enabled"):
+                _pause.maybe_autopause_on_outage(
+                    threshold=int(_outage.get("open_breaker_threshold", 3)), board=board,
+                )
+            _paused, _reason = _pause.is_paused(board)
+            if _paused:
+                result.paused = True
+                result.pause_reason = _reason
+                _log.warning("dispatch: autonomy PAUSED (board=%s) — no new spawns: %s",
+                             board or "*", _reason)
+                return result
+        except Exception:
+            _log.debug("dispatch: pause check failed — proceeding un-paused", exc_info=True)
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
