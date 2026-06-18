@@ -464,6 +464,13 @@ WI_QA4_MAX_CONFORMANCE_RETRIES: int = int(
     os.environ.get("HERMES_CONFORMANCE_MAX_RETRIES", "3")
 )
 
+#: ADD-ON C v2 WI-C3 — max times the L0 deterministic gate routes a review task
+#: back to the builder before escalating once. Env-overridable, same style as the
+#: conformance retry bound above.
+HERMES_L0_GATE_MAX_RETRIES: int = int(
+    os.environ.get("HERMES_L0_GATE_MAX_RETRIES", "3")
+)
+
 #: Keywords in an epic title that flag it as high-risk for cross-check (B5).
 _HIGH_RISK_TITLE_KEYWORDS = frozenset(
     {"auth", "payment", "credential", "secret", "token", "oauth", "phase-3", "phase3"}
@@ -838,6 +845,141 @@ def _conformance_spawn_fix_story(
             "conformance gate: failed to spawn fix story for epic %s reason=%s",
             epic_id, reason,
         )
+
+
+# ---------------------------------------------------------------------------
+# ADD-ON C v2 — WI-C3 L0 deterministic gate (default-off; runs before any model
+# review). Pure executor lives in hermes_cli.review_loop; this is the policy:
+# where it hooks, how a FAIL routes back to the builder, and the escalate-once
+# bound. Touches NO binding-verdict code.
+# ---------------------------------------------------------------------------
+
+def run_l0_gate_for_review_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+    l0_cfg: Optional[dict] = None,
+) -> bool:
+    """Run the L0 deterministic gate for a task sitting in ``review``.
+
+    Called by the dispatcher (the harness) **before** a review token is spent.
+    The builder never self-certifies — results are captured here and written as an
+    out-of-band ``l0_attestation`` event.
+
+    :returns: ``True`` if L0 *settled* the task this tick (FAIL → routed to the
+        fix-retry loop, or exhausted → held), meaning the caller must NOT spawn a
+        review. ``False`` if review should proceed (L0 passed, or already passed,
+        or no checks configured).
+    """
+    cfg = l0_cfg or {}
+    checks = cfg.get("checks") or []
+    if not checks:
+        return False  # nothing to gate on → let review proceed
+
+    # Dedup: if L0 already passed for this task, don't re-run subprocesses.
+    try:
+        events = kb.list_events(conn, task_id)
+    except Exception:
+        events = []
+    kinds = [(getattr(e, "kind", "") or "") for e in events]
+    if "l0_gate_passed" in kinds:
+        return False
+    # Exhausted + escalated already → hold (no re-run, no review).
+    if "l0_gate_escalated" in kinds:
+        return True
+
+    task = kb.get_task(conn, task_id)
+    if task is None:
+        return False
+    try:
+        workspace = kb.resolve_workspace(task, board=board)
+    except Exception:
+        _log.exception("l0_gate: workspace resolve failed for %s — proceeding to review", task_id)
+        return False
+
+    # --- run the pure executor (no DB, no LLM) ---
+    from hermes_cli.review_loop.l0_gate import run_l0_gate
+    from hermes_cli.review_loop.attestation import record_l0_attestation
+    from hermes_cli.review_loop.metrics import emit_l0_catchrate
+
+    try:
+        result = run_l0_gate(
+            workspace,
+            checks,
+            timeout_s=int(cfg.get("timeout_s", 600)),
+            log_tail_bytes=int(cfg.get("log_tail_bytes", 8192)),
+        )
+    except Exception:
+        _log.exception("l0_gate: executor crashed for %s — failing open to review", task_id)
+        return False
+
+    # --- record evidence out-of-band (own txn) ---
+    record_l0_attestation(conn, task_id, result, board=board)
+
+    if result.passed:
+        try:
+            with kb.write_txn(conn):
+                kb._append_event(conn, task_id, "l0_gate_passed", {
+                    "duration_s": result.duration_s,
+                    "checks": [c.name for c in result.checks],
+                })
+        except Exception:
+            _log.debug("l0_gate: l0_gate_passed emit failed for %s", task_id, exc_info=True)
+        emit_l0_catchrate(
+            task_id, settled_at_l0=False, passed=True, board=board,
+            duration_s=result.duration_s,
+        )
+        return False  # review proceeds
+
+    # --- FAIL path: bounded fix-retry, escalate-once ---
+    prior_fails = sum(1 for k in kinds if k == "l0_gate_failed")
+    max_retries = int(cfg.get("max_retries", HERMES_L0_GATE_MAX_RETRIES))
+    on_exhaust = str(cfg.get("on_exhaust", "escalate")).lower()
+
+    try:
+        with kb.write_txn(conn):
+            kb._append_event(conn, task_id, "l0_gate_failed", {
+                "failed_required": result.failed_required,
+                "attempt": prior_fails + 1,
+                "max_retries": max_retries,
+            })
+            if prior_fails + 1 < max_retries:
+                # Route back to the builder: review → ready (the same transition a
+                # rejected review uses). The standing dispatch path re-spawns it.
+                conn.execute(
+                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL "
+                    "WHERE id = ? AND status = 'review'",
+                    (task_id,),
+                )
+                kb._append_event(conn, task_id, "l0_gate_fix_requested", {
+                    "failed_required": result.failed_required,
+                    "attempt": prior_fails + 1,
+                })
+            else:
+                # Retry bound hit: escalate once.
+                kb._append_event(conn, task_id, "l0_gate_escalated", {
+                    "failed_required": result.failed_required,
+                    "attempts": prior_fails + 1,
+                    "max_retries": max_retries,
+                    "on_exhaust": on_exhaust,
+                })
+                if on_exhaust == "block":
+                    conn.execute(
+                        "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                        "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL "
+                        "WHERE id = ? AND status = 'review'",
+                        (task_id,),
+                    )
+    except Exception:
+        _log.exception("l0_gate: FAIL routing failed for %s", task_id)
+
+    emit_l0_catchrate(
+        task_id, settled_at_l0=True, passed=False, board=board,
+        failed_required=result.failed_required, duration_s=result.duration_s,
+    )
+    return True  # L0 settled this tick → no review token spent
 
 
 def generate_epic_acceptances(

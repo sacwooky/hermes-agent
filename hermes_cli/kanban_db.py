@@ -7965,12 +7965,25 @@ def dispatch_once(
         "WHERE status = 'review' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+    _l0_cfg = (autonomy_cfg or {}).get("l0_gate") or {}
+    _l0_enabled = bool(_l0_cfg.get("enabled")) and not dry_run
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
+        # ADD-ON C v2 WI-C3: L0 deterministic gate runs BEFORE any review token is
+        # spent. Default-off; fail-open (any gate error → proceed to review).
+        if _l0_enabled:
+            try:
+                from hermes_cli import kanban_autonomy as _autonomy
+                if _autonomy.run_l0_gate_for_review_task(
+                    conn, row["id"], board=board, l0_cfg=_l0_cfg
+                ):
+                    continue  # L0 settled this row (FAIL → fix-loop); no review spawn
+            except Exception:
+                _log.exception("l0_gate: hook failed for %s — proceeding to review", row["id"])
         try:
             from hermes_cli.profiles import profile_exists
         except Exception:
