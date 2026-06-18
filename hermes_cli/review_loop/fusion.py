@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from hermes_cli.review_loop import ninerouter, routing
+from hermes_cli.review_loop import cost, ninerouter, routing
 
 _log = logging.getLogger(__name__)
 
@@ -56,6 +56,7 @@ class FusionResult:
     lanes_run: list = field(default_factory=list)
     degraded: bool = False
     reject_reason: Optional[str] = None
+    cost: dict = field(default_factory=dict)  # WI-C7 cost telemetry (flat/metered/est_usd)
 
 
 def mint_fusion_run_id(task_id: str, commit: str, recorded_at) -> str:
@@ -152,6 +153,8 @@ def run_fusion(
     # --- Jury ---
     try:
         seats = routing.select_jury(author_provider, high_risk=hr)
+        # WI-C7 rule 5 defense-in-depth: Grok (only always-metered lane) on high-risk only.
+        cost.assert_grok_high_risk_only([p for _f, p, _fb in seats], high_risk=hr)
     except Exception as exc:
         return _rejected(f"jury selection failed: {exc}", fusion_run_id)
 
@@ -248,6 +251,7 @@ def run_fusion(
     return FusionResult(
         verdict=verdict, confidence=confidence, jury=jury, judge=judge,
         fusion_run_id=fusion_run_id, lanes_run=lanes_run, degraded=degraded, reject_reason=None,
+        cost=cost.estimate_fusion_cost(lanes_run),
     )
 
 

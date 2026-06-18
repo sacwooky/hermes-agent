@@ -126,10 +126,10 @@ def test_empty_artifact_rejects():
 
 def test_lane_independence_violation_rejects(monkeypatch):
     # Force a self-family seat into the jury → assert_lane_allowed raises → run rejected.
+    # (No Grok here, so the grok-high-risk guard passes and the independence check is what fires.)
     monkeypatch.setattr(R, "select_jury",
                         lambda author, *, high_risk: [(R.CLAUDE, "cc/claude-opus-4-8", None),
-                                                      (R.OPENAI, "cx/gpt-5.4-review", None),
-                                                      (R.XAI, "openrouter/x-ai/grok-4.3", None)])
+                                                      (R.OPENAI, "cx/gpt-5.4-review", None)])
     res = _run(_chat_for({}), author="claude")
     assert res.verdict == F.REJECTED and "independence" in res.reject_reason
 
