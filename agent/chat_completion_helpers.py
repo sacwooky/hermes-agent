@@ -1099,6 +1099,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         )
         return agent._try_activate_fallback()
 
+    # Credential-aware skip (design: preflight-credential-failover-circuit-
+    # breaker §4C/§4D). Skip a fallback entry whose CREDENTIAL is circuit-open
+    # so the chain advances to the next DIFFERENT-credential tier instead of
+    # re-picking a door that just failed auth (e.g. a NINEROUTER_KEY blip drops
+    # BOTH gpt-5.5 and gemini-via-9router at once). FAIL-OPEN: if the breaker is
+    # unavailable/corrupt, ``is_open`` returns False and the chain is unchanged.
+    try:
+        from hermes_cli import provider_health as _ph
+        if _ph.is_open(_ph.cred_id(fb)):
+            logger.warning(
+                "Fallback skip: credential circuit-open for %s/%s",
+                fb_provider, fb_model,
+            )
+            return agent._try_activate_fallback()
+    except Exception:  # pragma: no cover - fail open
+        pass
+
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
     # access for Codex providers.

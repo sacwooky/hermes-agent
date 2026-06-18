@@ -1725,6 +1725,19 @@ def run_conversation(
                     except Exception:
                         pass
                 agent._touch_activity(f"API call #{api_call_count} completed")
+                # Healthy-clear (design §4A/§0a#4): a successful call CLOSES the
+                # current credential's breaker and zeroes its failure counter so
+                # a recovered key is immediately reusable fleet-wide. FAIL-OPEN.
+                try:
+                    from hermes_cli import provider_health as _ph
+                    _ok_entry = {
+                        "provider": getattr(agent, "provider", "") or "",
+                        "model": getattr(agent, "model", "") or "",
+                        "base_url": str(getattr(agent, "base_url", "") or ""),
+                    }
+                    _ph.record_success(_ph.cred_id(_ok_entry))
+                except Exception:  # pragma: no cover - fail open
+                    pass
                 break  # Success, exit retry loop
 
             except InterruptedError:
@@ -2968,6 +2981,31 @@ def run_conversation(
                 ) and not is_context_length_error
 
                 if is_client_error:
+                    # Credential-aware circuit breaker (design: preflight-
+                    # credential-failover-circuit-breaker §4C). On an AUTH error
+                    # (401 / 403-auth), record a failure against the CURRENT
+                    # credential BEFORE advancing so the breaker can open after N
+                    # consecutive failures and later spawns skip the dead key.
+                    # A 403 content_policy_blocked is request-scoped and must NOT
+                    # mark the credential (classify_failure → CONTENT_POLICY is a
+                    # no-op). FAIL-OPEN: any breaker error is swallowed.
+                    if classified.is_auth or classified.reason == FailoverReason.content_policy_blocked:
+                        try:
+                            from hermes_cli import provider_health as _ph
+                            _cur_entry = {
+                                "provider": getattr(agent, "provider", "") or "",
+                                "model": getattr(agent, "model", "") or "",
+                                "base_url": str(getattr(agent, "base_url", "") or ""),
+                            }
+                            _fail_class = _ph.classify_failure(
+                                status_code=status_code,
+                                reason=classified.reason.value,
+                                is_auth=classified.is_auth,
+                            )
+                            if _fail_class != _ph.CONTENT_POLICY:
+                                _ph.record_failure(_ph.cred_id(_cur_entry), _fail_class)
+                        except Exception:  # pragma: no cover - fail open
+                            pass
                     # Try fallback before aborting — a different provider may
                     # not have the same issue (rate limit, auth, etc.). Only
                     # announce the attempt when a fallback chain actually
@@ -3004,6 +3042,28 @@ def run_conversation(
                     agent._vprint(f"{agent.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
                     agent._vprint(f"{agent.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
                     agent._vprint(f"{agent.log_prefix}   🌐 Endpoint: {_base}", force=True)
+                    # Diagnosable abort (design §4D): name which credentials in
+                    # the fallback chain are circuit-open, so the operator sees
+                    # *why* no healthy tier remained rather than an opaque abort.
+                    # FAIL-OPEN: any breaker error is swallowed silently.
+                    try:
+                        from hermes_cli import provider_health as _ph
+                        _open_creds = []
+                        for _ce in (getattr(agent, "_fallback_chain", []) or []):
+                            try:
+                                _cid = _ph.cred_id(_ce)
+                                if _ph.is_open(_cid) and _cid not in _open_creds:
+                                    _open_creds.append(_cid)
+                            except Exception:
+                                continue
+                        if _open_creds:
+                            agent._vprint(
+                                f"{agent.log_prefix}   🚫 Circuit-open credentials: "
+                                f"{', '.join(_open_creds)}",
+                                force=True,
+                            )
+                    except Exception:  # pragma: no cover - fail open
+                        pass
                     # Actionable guidance for common auth errors
                     if classified.is_auth or classified.reason == FailoverReason.billing:
                         if classified.reason == FailoverReason.billing and _print_billing_or_entitlement_guidance(

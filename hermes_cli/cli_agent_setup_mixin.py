@@ -50,12 +50,37 @@ class CLIAgentSetupMixin:
         if runtime is None and _primary_exc is not None:
             from hermes_cli.auth import AuthError
             if isinstance(_primary_exc, AuthError):
+                # Credential-aware preflight (design: preflight-credential-failover
+                # -circuit-breaker §4B). Select the first candidate that is both
+                # resolvable AND not circuit-open by credential identity — a
+                # present-but-DEAD key (resolves fine, fails on use) must be
+                # skipped here, not picked. The breaker is FAIL-OPEN: if it is
+                # unavailable/corrupt, ``is_open`` returns False and behavior is
+                # identical to before this change.
+                try:
+                    from hermes_cli import provider_health as _ph
+                except Exception:  # pragma: no cover - fail open
+                    _ph = None
+
                 _fb_chain = self._fallback_model if isinstance(self._fallback_model, list) else []
-                for _fb in _fb_chain:
+                _picked_index = None
+                for _i, _fb in enumerate(_fb_chain):
                     _fb_provider = (_fb.get("provider") or "").strip().lower()
                     _fb_model = (_fb.get("model") or "").strip()
                     if not _fb_provider or not _fb_model:
                         continue
+                    # Skip a candidate whose CREDENTIAL is circuit-open (a
+                    # rejected key is dead on every endpoint that uses it).
+                    if _ph is not None:
+                        try:
+                            if _ph.is_open(_ph.cred_id(_fb)):
+                                logger.info(
+                                    "Preflight skip: credential circuit-open for %s/%s",
+                                    _fb_provider, _fb_model,
+                                )
+                                continue
+                        except Exception:  # pragma: no cover - fail open
+                            pass
                     try:
                         runtime = resolve_runtime_provider(requested=_fb_provider)
                         logger.warning(
@@ -66,9 +91,18 @@ class CLIAgentSetupMixin:
                         self.requested_provider = _fb_provider
                         self.model = _fb_model
                         _primary_exc = None
+                        _picked_index = _i
                         break
                     except Exception:
                         continue
+
+                # DO NOT collapse the chain (design §4B / D2): the FULL fallback
+                # chain (``self._fallback_model``) is still handed to the agent
+                # below (``fallback_model=self._fallback_model``), so the runtime
+                # climb retains every remaining tier and can recover from a
+                # wrong/cold preflight pick instead of aborting. We only changed
+                # the SELECTION here; we deliberately do not truncate the chain.
+                _ = _picked_index  # selection-only; chain intentionally preserved
 
         if runtime is None:
             message = format_runtime_provider_error(_primary_exc) if _primary_exc else "Provider resolution failed."
