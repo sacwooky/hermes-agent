@@ -186,6 +186,20 @@ DEFAULT_CRASH_GRACE_SECONDS = 30
 # 0/1/2 codes the worker uses for success / generic failure / usage error.
 KANBAN_RATE_LIMIT_EXIT_CODE = 75
 
+# Sentinel exit code a kanban worker uses to signal "I exited cleanly ON
+# PURPOSE without calling kanban_complete / kanban_block — I am yielding /
+# queuing this task for the next stage, a human, or a later retry (e.g. a
+# fail-closed review queue, or a hand-off), NOT crashing." Without this
+# signal a clean (rc=0) exit while the task is still ``running`` is an
+# indistinguishable ``protocol_violation`` and trips the breaker IMMEDIATELY
+# (failure_limit=1). With it, ``detect_crashed_workers`` releases the task
+# back to ``ready`` as a benign ``queued`` event WITHOUT counting a failure,
+# mirroring the rate-limited path. 76 is the sibling of EX_TEMPFAIL(75),
+# well clear of the 0/1/2 success/error/usage codes.
+# SAFETY: a *bare* rc=0 (no sentinel) is still a protocol_violation — only an
+# EXPLICITLY-signaled intentional exit is exempt (fail-closed default).
+KANBAN_INTENTIONAL_EXIT_CODE = 76
+
 
 def _resolve_crash_grace_seconds() -> int:
     """Return the crash-detection grace period in seconds.
@@ -5204,7 +5218,67 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def _cascade_archive_children(
+    conn: sqlite3.Connection, parent_id: str, _seen: Optional[set] = None
+) -> list[str]:
+    """Archive not-yet-started children orphaned by archiving ``parent_id``.
+
+    A child is cascade-archived only when, after the parent is archived, EVERY
+    one of its parents is terminal (``archived``/``done``) and at least one is
+    ``archived`` — i.e. a line it depended on was *cancelled*, not completed, so
+    the child can no longer fulfil its purpose (e.g. a review card whose
+    implementation was archived). Children that are ``running``/``review``/
+    ``done``/``archived`` are left untouched (don't cascade-kill in-flight or
+    finished work). Recurses. Must be called inside an open ``write_txn``.
+    """
+    if _seen is None:
+        _seen = set()
+    archived: list[str] = []
+    children = [
+        r["child_id"]
+        for r in conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ?", (parent_id,)
+        ).fetchall()
+    ]
+    for cid in children:
+        if cid in _seen:
+            continue
+        _seen.add(cid)
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (cid,)
+        ).fetchone()
+        if not row or row["status"] in ("done", "archived", "running", "review"):
+            continue
+        agg = conn.execute(
+            "SELECT MIN(CASE WHEN p.status IN ('archived','done') THEN 1 ELSE 0 END) "
+            "       AS all_terminal, "
+            "       MAX(CASE WHEN p.status = 'archived' THEN 1 ELSE 0 END) AS any_archived "
+            "FROM task_links l JOIN tasks p ON p.id = l.parent_id WHERE l.child_id = ?",
+            (cid,),
+        ).fetchone()
+        if not agg or agg["all_terminal"] != 1 or agg["any_archived"] != 1:
+            continue
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'archived', claim_lock = NULL, "
+            "    claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status NOT IN ('archived','done','running','review')",
+            (cid,),
+        )
+        if cur.rowcount != 1:
+            continue
+        run_id = _end_run(
+            conn, cid, outcome="reclaimed", status="reclaimed",
+            summary=f"cascade-archived: parent {parent_id} archived",
+        )
+        _append_event(conn, cid, "archived", {"cascade_from": parent_id}, run_id=run_id)
+        archived.append(cid)
+        archived.extend(_cascade_archive_children(conn, cid, _seen))
+    return archived
+
+
+def archive_task(
+    conn: sqlite3.Connection, task_id: str, *, cascade: bool = True
+) -> bool:
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
@@ -5225,6 +5299,12 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
+        # Cancel not-yet-started dependent children orphaned by this archive
+        # (e.g. a review card whose implementation parent was archived) so they
+        # don't promote and spin up a worker with "nothing to do". Mirror from
+        # Morgan (operator-approved fleet convergence on cascade default).
+        if cascade:
+            _cascade_archive_children(conn, task_id)
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
@@ -6408,6 +6488,13 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    intentionally_queued: list[str] = field(default_factory=list)
+    """Task ids whose workers exited cleanly ON PURPOSE without completing
+    (EX_QUEUED sentinel exit) — a deliberate yield / queue / hand-off — and
+    were released back to ``ready`` as benign ``queued`` events WITHOUT
+    counting a failure. Unlike a bare clean exit (a protocol_violation that
+    trips the breaker immediately), an EX_QUEUED yield never trips the
+    breaker. A bare rc=0 with no sentinel is still a protocol_violation."""
     autonomy: Optional[dict] = None
     """Summary of the three-gate autonomy sweeps for this tick (epic
     acceptances created/resolved, integrate tasks created). ``None`` when
@@ -6465,6 +6552,13 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       provider rate-limited / exhausted quota, NOT because the task failed.
       ``detect_crashed_workers`` releases the task back to ``ready`` without
       counting a failure, so a long quota window can't trip the breaker.
+    * ``"intentional_exit"`` — ``WIFEXITED`` with status
+      ``KANBAN_INTENTIONAL_EXIT_CODE``. The worker exited cleanly ON PURPOSE
+      without calling ``kanban_complete`` / ``kanban_block`` — a deliberate
+      yield / queue / hand-off (e.g. a fail-closed review queue). Unlike a
+      bare ``clean_exit`` this is NOT a protocol violation: the task is
+      released back to ``ready`` as a benign ``queued`` event WITHOUT counting
+      a failure or tripping the breaker (mirrors ``rate_limited``).
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
     * ``"unknown"`` — pid was not in the reap registry (either reaped by
@@ -6486,6 +6580,8 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
                 return ("clean_exit", 0)
             if code == KANBAN_RATE_LIMIT_EXIT_CODE:
                 return ("rate_limited", code)
+            if code == KANBAN_INTENTIONAL_EXIT_CODE:
+                return ("intentional_exit", code)
             return ("nonzero_exit", code)
         if os.WIFSIGNALED(raw):
             return ("signaled", os.WTERMSIG(raw))
@@ -6987,6 +7083,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    intentionally_queued: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -7019,6 +7116,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            intentional_exit_flag = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -7055,6 +7153,29 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
+            elif kind == "intentional_exit":
+                # Worker exited cleanly ON PURPOSE without calling
+                # kanban_complete/kanban_block (EX_QUEUED sentinel) — a
+                # deliberate yield / queue / hand-off (e.g. a fail-closed
+                # review queue). This is NOT a protocol violation and NOT a
+                # crash: release the task back to ``ready`` as a benign
+                # ``queued`` event and do NOT count a failure (skip
+                # ``_record_task_failure``) so a legitimate yield can't trip
+                # the breaker. A *bare* rc=0 (no sentinel) still falls into
+                # the clean_exit→protocol_violation branch above — fail-closed.
+                protocol_violation = False
+                intentional_exit_flag = True
+                error_text = (
+                    f"pid {pid} exited intentionally (EX_QUEUED rc={code}) — "
+                    f"yielded/queued without completing; requeued without "
+                    f"counting a failure"
+                )
+                event_kind = "queued"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                }
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
@@ -7079,7 +7200,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
                 # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                if intentional_exit_flag:
+                    _run_outcome = "queued"
+                elif rate_limited_exit:
+                    _run_outcome = "rate_limited"
+                else:
+                    _run_outcome = "crashed"
                 run_id = _end_run(
                     conn,
                     row["id"],
@@ -7106,6 +7232,14 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (error_text[:500], row["id"]),
                     )
                     rate_limited.append(row["id"])
+                elif intentional_exit_flag:
+                    # Deliberate yield/queue (EX_QUEUED): released back to
+                    # ``ready`` as a benign ``queued`` event. Like the
+                    # rate-limited path, it is NOT added to ``crash_details``,
+                    # so ``_record_task_failure`` never runs — no failure
+                    # counted, no breaker trip. The respawn guard re-dispatches
+                    # it on a later tick.
+                    intentionally_queued.append(row["id"])
                 else:
                     crashed.append(row["id"])
                     crash_details.append((
@@ -7155,6 +7289,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    # Same side-channel for intentional (EX_QUEUED) yields — released back to
+    # ``ready`` as benign ``queued`` events, no failure counted, not crashes.
+    detect_crashed_workers._last_intentionally_queued = intentionally_queued  # type: ignore[attr-defined]
     return crashed
 
 
@@ -7620,6 +7757,10 @@ def dispatch_once(
     _crash_rate_limited = getattr(detect_crashed_workers, "_last_rate_limited", [])
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
+    # Intentional (EX_QUEUED) yields: requeued to ``ready``, no failure counted.
+    _crash_intentional = getattr(detect_crashed_workers, "_last_intentionally_queued", [])
+    if _crash_intentional:
+        result.intentionally_queued.extend(_crash_intentional)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 

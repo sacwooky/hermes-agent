@@ -248,6 +248,18 @@ kanban_complete(
 
 Shape `metadata` so downstream parsers (reviewers, aggregators, schedulers) can use it without re-reading your prose.
 
+## Yielding a task (`kanban_queue`) — NEVER just end your turn
+
+There are three legitimate ways for a worker to terminate: `kanban_complete` (done), `kanban_block` (need a human), and `kanban_queue` (deliberate yield — retry later / hand off to the next stage). **If you intend to yield, you MUST call `kanban_queue` with a reason.** Just ending your turn without calling one of the three leaves the task `running` while your process exits cleanly — the dispatcher reads that as a crash (`protocol_violation`) and **hard-blocks the card immediately**.
+
+Use `kanban_queue` when the work is *not* done and *not* human-blocked, but you are deliberately standing down so the card is re-dispatched later — e.g. a fail-closed review that can't render a verdict right now (transient lane/quorum outage), or a hand-off to a later stage. The dispatcher requeues the card to `ready` as a benign `queued` event **without counting a failure or tripping the breaker**.
+
+```python
+kanban_queue(reason="review lane below quorum — transient; requeue for retry")
+```
+
+Do NOT use `kanban_block` for a transient/self-clearing condition (that needs a human and stops the card); do NOT use `kanban_complete` (the work isn't done). Reserve `kanban_queue` for genuine yields — a card that yields forever still surfaces for attention.
+
 ## Claiming cards you actually created
 
 If your run produced new kanban tasks (via `kanban_create`), pass the ids in `created_cards` on `kanban_complete`. The kernel verifies each id exists and was created by your profile; any phantom id blocks the completion with an error listing what went wrong, and the rejected attempt is permanently recorded on the task's event log. **Only list ids you captured from a successful `kanban_create` return value — never invent ids from prose, never paste ids from earlier runs, never claim cards another worker created.**
