@@ -5218,7 +5218,67 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def _cascade_archive_children(
+    conn: sqlite3.Connection, parent_id: str, _seen: Optional[set] = None
+) -> list[str]:
+    """Archive not-yet-started children orphaned by archiving ``parent_id``.
+
+    A child is cascade-archived only when, after the parent is archived, EVERY
+    one of its parents is terminal (``archived``/``done``) and at least one is
+    ``archived`` — i.e. a line it depended on was *cancelled*, not completed, so
+    the child can no longer fulfil its purpose (e.g. a review card whose
+    implementation was archived). Children that are ``running``/``review``/
+    ``done``/``archived`` are left untouched (don't cascade-kill in-flight or
+    finished work). Recurses. Must be called inside an open ``write_txn``.
+    """
+    if _seen is None:
+        _seen = set()
+    archived: list[str] = []
+    children = [
+        r["child_id"]
+        for r in conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ?", (parent_id,)
+        ).fetchall()
+    ]
+    for cid in children:
+        if cid in _seen:
+            continue
+        _seen.add(cid)
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (cid,)
+        ).fetchone()
+        if not row or row["status"] in ("done", "archived", "running", "review"):
+            continue
+        agg = conn.execute(
+            "SELECT MIN(CASE WHEN p.status IN ('archived','done') THEN 1 ELSE 0 END) "
+            "       AS all_terminal, "
+            "       MAX(CASE WHEN p.status = 'archived' THEN 1 ELSE 0 END) AS any_archived "
+            "FROM task_links l JOIN tasks p ON p.id = l.parent_id WHERE l.child_id = ?",
+            (cid,),
+        ).fetchone()
+        if not agg or agg["all_terminal"] != 1 or agg["any_archived"] != 1:
+            continue
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'archived', claim_lock = NULL, "
+            "    claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status NOT IN ('archived','done','running','review')",
+            (cid,),
+        )
+        if cur.rowcount != 1:
+            continue
+        run_id = _end_run(
+            conn, cid, outcome="reclaimed", status="reclaimed",
+            summary=f"cascade-archived: parent {parent_id} archived",
+        )
+        _append_event(conn, cid, "archived", {"cascade_from": parent_id}, run_id=run_id)
+        archived.append(cid)
+        archived.extend(_cascade_archive_children(conn, cid, _seen))
+    return archived
+
+
+def archive_task(
+    conn: sqlite3.Connection, task_id: str, *, cascade: bool = True
+) -> bool:
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
@@ -5239,6 +5299,12 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
+        # Cancel not-yet-started dependent children orphaned by this archive
+        # (e.g. a review card whose implementation parent was archived) so they
+        # don't promote and spin up a worker with "nothing to do". Mirror from
+        # Morgan (operator-approved fleet convergence on cascade default).
+        if cascade:
+            _cascade_archive_children(conn, task_id)
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.

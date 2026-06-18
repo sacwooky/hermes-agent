@@ -2846,24 +2846,57 @@ def test_unlink_tasks_triggers_recompute_ready(kanban_home):
         )
 
 
-def test_archive_task_triggers_recompute_ready_for_dependents(kanban_home):
-    """Archiving a parent must immediately unblock its children.
-
-    ``recompute_ready()`` already treats ``archived`` parents as satisfied
-    dependencies, just like ``done``. Regression: ``archive_task()`` updated
-    the parent row but never ran the ready-promotion pass, so children stayed
-    stuck in ``todo`` until a later dispatcher tick.
+def test_archive_task_cascade_archives_orphaned_children(kanban_home):
+    """DEFAULT (cascade=True, mirrored from Morgan 2026-06-18): archiving a
+    parent cancels not-yet-started dependent-only children — a child whose last
+    blocking parent was *archived* (cancelled, not done) can no longer fulfil
+    its purpose (e.g. a review card whose implementation was archived), so it is
+    cascade-archived rather than promoted into a worker with nothing to do.
     """
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="obsolete parent")
+        child = kb.create_task(conn, title="dependent child", parents=[parent])
+
+        assert kb.get_task(conn, child).status == "todo"
+        assert kb.archive_task(conn, parent) is True  # cascade defaults True
+
+        assert kb.get_task(conn, child).status == "archived", (
+            "an orphaned not-yet-started child should be cascade-archived, not "
+            "promoted, when its only parent is archived"
+        )
+
+
+def test_archive_task_cascade_false_promotes_children(kanban_home):
+    """cascade=False preserves the legacy promote-to-ready behavior:
+    ``recompute_ready()`` treats an ``archived`` parent as satisfied, so the
+    child is unblocked to ``ready`` immediately (no waiting for a dispatcher
+    tick) and NOT archived."""
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="obsolete parent")
         child = kb.create_task(conn, title="child", parents=[parent])
 
         assert kb.get_task(conn, child).status == "todo"
-        assert kb.archive_task(conn, parent) is True
+        assert kb.archive_task(conn, parent, cascade=False) is True
 
         assert kb.get_task(conn, child).status == "ready", (
-            "child should promote to ready immediately after its last blocking "
-            "parent is archived"
+            "with cascade=False the child should promote to ready immediately "
+            "after its last blocking parent is archived"
+        )
+
+
+def test_archive_task_cascade_spares_children_with_active_parents(kanban_home):
+    """Cascade only cancels TRULY orphaned children: a child that still has a
+    non-terminal parent is left in ``todo`` (not archived) even on the default
+    cascade path."""
+    with kb.connect() as conn:
+        p_archived = kb.create_task(conn, title="archived parent")
+        p_active = kb.create_task(conn, title="still-active parent")
+        child = kb.create_task(conn, title="child", parents=[p_archived, p_active])
+
+        assert kb.archive_task(conn, p_archived) is True  # cascade default
+        # p_active is still todo/ready → child not fully orphaned → spared.
+        assert kb.get_task(conn, child).status == "todo", (
+            "a child with a still-active parent must not be cascade-archived"
         )
 
 # ---------------------------------------------------------------------------
