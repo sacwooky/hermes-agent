@@ -31,6 +31,10 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
+from agent.turn_compression import (
+    apply_turn_compression,
+    sanitize_active_system_prompt,
+)
 from agent.turn_context import build_turn_context
 from agent.turn_retry_state import TurnRetryState
 from agent.memory_manager import build_memory_context_block
@@ -2035,13 +2039,9 @@ def run_conversation(
                         if isinstance(getattr(agent, "tools", None), list):
                             _tools_sanitized = _sanitize_tools_non_ascii(agent.tools)
 
-                        _system_sanitized = False
-                        if isinstance(active_system_prompt, str):
-                            _sanitized_system = _strip_non_ascii(active_system_prompt)
-                            if _sanitized_system != active_system_prompt:
-                                active_system_prompt = _sanitized_system
-                                agent._cached_system_prompt = _sanitized_system
-                                _system_sanitized = True
+                        active_system_prompt, _system_sanitized = sanitize_active_system_prompt(
+                            agent, active_system_prompt, strip_non_ascii=_strip_non_ascii,
+                        )
                         if isinstance(getattr(agent, "ephemeral_system_prompt", None), str):
                             _sanitized_ephemeral = _strip_non_ascii(agent.ephemeral_system_prompt)
                             if _sanitized_ephemeral != agent.ephemeral_system_prompt:
@@ -2737,15 +2737,10 @@ def run_conversation(
                     compression_attempts += 1
                     if compression_attempts <= max_compression_attempts:
                         original_len = len(messages)
-                        messages, active_system_prompt = agent._compress_context(
-                            messages, system_message,
-                            approx_tokens=approx_tokens,
-                            task_id=effective_task_id,
+                        messages, active_system_prompt, conversation_history = apply_turn_compression(
+                            agent, messages, system_message,
+                            approx_tokens=approx_tokens, task_id=effective_task_id,
                         )
-                        # Compression created a new session — clear history
-                        # so _flush_messages_to_session_db writes compressed
-                        # messages to the new session, not skipping them.
-                        conversation_history = None
                         if len(messages) < original_len or old_ctx > _reduced_ctx:
                             agent._buffer_status(
                                 f"🗜️ Context reduced to {_reduced_ctx:,} tokens "
@@ -2914,14 +2909,10 @@ def run_conversation(
                     agent._buffer_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
 
                     original_len = len(messages)
-                    messages, active_system_prompt = agent._compress_context(
-                        messages, system_message, approx_tokens=approx_tokens,
-                        task_id=effective_task_id,
+                    messages, active_system_prompt, conversation_history = apply_turn_compression(
+                        agent, messages, system_message,
+                        approx_tokens=approx_tokens, task_id=effective_task_id,
                     )
-                    # Compression created a new session — clear history
-                    # so _flush_messages_to_session_db writes compressed
-                    # messages to the new session, not skipping them.
-                    conversation_history = None
 
                     if len(messages) < original_len:
                         agent._buffer_status(f"🗜️ Compressed {original_len} → {len(messages)} messages, retrying...")
@@ -3070,14 +3061,10 @@ def run_conversation(
                     agent._buffer_status(f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})...")
 
                     original_len = len(messages)
-                    messages, active_system_prompt = agent._compress_context(
-                        messages, system_message, approx_tokens=approx_tokens,
-                        task_id=effective_task_id,
+                    messages, active_system_prompt, conversation_history = apply_turn_compression(
+                        agent, messages, system_message,
+                        approx_tokens=approx_tokens, task_id=effective_task_id,
                     )
-                    # Compression created a new session — clear history
-                    # so _flush_messages_to_session_db writes compressed
-                    # messages to the new session, not skipping them.
-                    conversation_history = None
 
                     if len(messages) < original_len or new_ctx and new_ctx < old_ctx:
                         if len(messages) < original_len:
@@ -4046,15 +4033,11 @@ def run_conversation(
 
                 if agent.compression_enabled and _compressor.should_compress(_real_tokens):
                     agent._safe_print("  ⟳ compacting context…")
-                    messages, active_system_prompt = agent._compress_context(
-                        messages, system_message,
+                    messages, active_system_prompt, conversation_history = apply_turn_compression(
+                        agent, messages, system_message,
                         approx_tokens=agent.context_compressor.last_prompt_tokens,
                         task_id=effective_task_id,
                     )
-                    # Compression created a new session — clear history so
-                    # _flush_messages_to_session_db writes compressed messages
-                    # to the new session (see preflight compression comment).
-                    conversation_history = None
                 
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages
