@@ -377,3 +377,42 @@ def test_integrated_branch_is_skipped(kanban_home, git_repo):
         assert ka.find_unintegrated_done_tasks(
             conn, integration_branch="integration"
         ) == []
+
+
+def test_record_verdict_fusion_run_id_and_confidence_flow(kanban_home, verdict_key, vault):
+    """Phase 6: a fusion-shaped verdict (lanes_run, fusion_run_id, confidence) records a PASS
+    (R8 satisfied by lanes_run, no model_lane) and the id + confidence reach LoopState."""
+    from hermes_cli.review_loop import state as S
+    with kb.connect() as conn:
+        tid = _mk_review_task(conn)
+        payload = _payload(
+            tid, model_lane=None,
+            lane="fusion-abc1234500000000", second_opinion_lane="cx/gpt-5.5-review",
+            lanes_run=["ag/gemini-3.1-pro-low", "cx/gpt-5.4-review", "cx/gpt-5.5-review"],
+            fusion_run_id="fusion-abc1234500000000",
+            confidence={"capacity": "full", "judge_confidence": 0.9, "composite": 0.9,
+                        "missing": [], "divergence": 0.0},
+        )
+        sig = ka.sign_verdict_payload(payload.encode(), key_path=verdict_key)
+        out = ka.record_review_verdict(
+            conn, tid, payload, sig, fetched_via="robin-ssh",
+            key_path=verdict_key, vault_root=str(vault),
+        )
+        assert out["ok"] is True and out["verdict"] == "pass"  # R8 satisfied by lanes_run
+        st = S.compute_loop_state(conn, tid)
+        assert st.fusion_run_id == "fusion-abc1234500000000"
+        assert st.confidence and st.confidence["composite"] == 0.9
+
+
+def test_record_verdict_fusion_hollow_pass_still_rejected(kanban_home, verdict_key, vault):
+    """A fusion PASS with NO lanes_run and NO model_lane is still a hollow pass → rejected (R8)."""
+    with kb.connect() as conn:
+        tid = _mk_review_task(conn)
+        payload = _payload(tid, model_lane=None, lanes_run=[],
+                           fusion_run_id="fusion-deadbeef00000000")
+        sig = ka.sign_verdict_payload(payload.encode(), key_path=verdict_key)
+        out = ka.record_review_verdict(
+            conn, tid, payload, sig, fetched_via="robin-ssh",
+            key_path=verdict_key, vault_root=str(vault),
+        )
+        assert out["ok"] is False and "hollow" in out["reason"]

@@ -238,6 +238,8 @@ def record_review_verdict(
     findings = payload.get("findings") or payload.get("risks") or []
     model_lane = payload.get("model_lane") or payload.get("lane")
     lanes_run = payload.get("lanes_run")
+    fusion_run_id = payload.get("fusion_run_id")  # Phase 6: L2 Robin Fusion run id
+    fusion_confidence = payload.get("confidence")  # Phase 6: confidence × risk object
 
     # R8 — reject HOLLOW pass verdicts. A real review records the lane(s) that ran;
     # a lane that errored/quota-failed and emitted an empty PASS would not. BLOCK
@@ -263,6 +265,10 @@ def record_review_verdict(
                 "run_record": run_record,
                 "fetched_via": fetched_via,
                 "signature_prefix": signature[:16],
+                # Phase 6: carry the Fusion run id + confidence so LoopState.fusion_run_id
+                # populates and the G3 packet can surface real confidence×risk.
+                "fusion_run_id": fusion_run_id,
+                "confidence": fusion_confidence,
             },
         )
 

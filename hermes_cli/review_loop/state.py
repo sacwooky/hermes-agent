@@ -51,6 +51,7 @@ class LoopState:
     l2_verdict: Optional[str] = None      # "pass"/"block" (today: Robin review verdict)
     l2_rejected: bool = False             # verdict_rejected (e.g. signed-empty)
     fusion_run_id: Optional[str] = None   # set by Phase 6 (Robin Fusion) L2
+    confidence: Optional[dict] = None     # Phase 6: confidence × risk object from the Fusion verdict
     integrated: bool = False
     g3_pending: bool = False
     budget_paused: bool = False
@@ -94,12 +95,15 @@ def compute_loop_state(conn, task_id: str) -> LoopState:
     l2_verdict: Optional[str] = None
     l2_rejected = False
     fusion_run_id: Optional[str] = None
+    confidence: Optional[dict] = None
     for e in evs:
         k = getattr(e, "kind", "") or ""
         if k == "verdict_recorded":
             p = _payload(e)
             l2_verdict = (p.get("verdict") or "pass").lower()
             fusion_run_id = p.get("fusion_run_id") or fusion_run_id
+            if isinstance(p.get("confidence"), dict):
+                confidence = p.get("confidence")
             l2_rejected = False
         elif k == "review_blocked":
             l2_verdict = "block"
@@ -137,6 +141,7 @@ def compute_loop_state(conn, task_id: str) -> LoopState:
         l0_passed=l0_passed, l0_failures=l0_failures, l0_escalated=l0_escalated,
         l1_passed=l1_passed,
         l2_verdict=l2_verdict, l2_rejected=l2_rejected, fusion_run_id=fusion_run_id,
+        confidence=confidence,
         integrated=integrated, g3_pending=g3_pending, budget_paused=budget_paused,
     )
     st.surfaces = human_surfaces(st)
@@ -160,14 +165,20 @@ def human_surfaces(state: LoopState) -> list:
     return out
 
 
-def loop_capacity(conformance: Optional[dict]) -> dict:
-    """WI-C9 packet annotation: coarse capacity/confidence for the G3 packet.
+def loop_capacity(conformance: Optional[dict], *, fusion_confidence: Optional[dict] = None) -> dict:
+    """WI-C9 packet annotation: capacity/confidence for the G3 packet.
 
-    Phase 3 derives a minimal signal from conformance-verdict presence; Phase 6
-    (Robin Fusion) replaces this with the real ``min(capacity, judge_confidence)``
-    confidence object. ``full`` = a security conformance verdict is present and not a
-    fail; ``degraded`` = missing/penalised — surfaced to the operator at G3.
+    Phase 6 (Robin Fusion): when a real ``fusion_confidence`` object is available it is
+    preferred verbatim (carries ``capacity``/``judge_confidence``/``composite``/``missing``/
+    ``divergence``). Otherwise falls back to the Phase-3 coarse, conformance-derived signal:
+    ``full`` = a security conformance verdict is present and not a fail; ``degraded`` =
+    missing/penalised — surfaced to the operator at G3.
     """
+    if isinstance(fusion_confidence, dict) and fusion_confidence:
+        out = dict(fusion_confidence)
+        out["source"] = "fusion"
+        out["degraded"] = (out.get("capacity") != "full")
+        return out
     sec = (conformance or {}).get("security") if isinstance(conformance, dict) else None
     if sec and (sec.get("verdict") in ("pass", "skip")):
         return {"capacity": "full", "confidence": "high", "degraded": False, "source": "phase3-conformance-derived"}
