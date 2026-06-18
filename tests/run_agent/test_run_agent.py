@@ -6551,7 +6551,10 @@ class TestDeadRetryCode:
     def test_no_unreachable_max_retries_after_backoff(self):
         import inspect
         from agent.conversation_loop import run_conversation as _rc
-        source = inspect.getsource(_rc)
+        from agent.turn_api_call import run_api_call_with_retry as _rcr
+        # The retry loop was extracted into turn_api_call.run_api_call_with_retry
+        # (god-file decomposition 010c); count across both so the guard follows it.
+        source = inspect.getsource(_rc) + inspect.getsource(_rcr)
         occurrences = source.count("if retry_count >= max_retries:")
         assert occurrences == 2, (
             f"Expected 2 occurrences of 'if retry_count >= max_retries:' "
