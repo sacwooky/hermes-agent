@@ -799,6 +799,115 @@ def test_real_crash_still_counts_and_trips_breaker(kanban_home, monkeypatch):
         )
 
 
+# ---------------------------------------------------------------------------
+# Intentional-exit (EX_QUEUED) requeue: a worker that exits cleanly ON PURPOSE
+# without calling kanban_complete/kanban_block (a deliberate yield / queue /
+# hand-off — e.g. a fail-closed review queue) must be released back to
+# ``ready`` WITHOUT counting a failure, so a legitimate yield can't trip the
+# breaker. A *bare* rc=0 with no sentinel is still a protocol_violation that
+# trips immediately. Regression coverage for the run-496/507 breaker finding.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_worker_exit_recognizes_intentional_sentinel(kanban_home):
+    import hermes_cli.kanban_db as _kb
+
+    pid = 41337
+    _kb._record_worker_exit(pid, _exited_status(_kb.KANBAN_INTENTIONAL_EXIT_CODE))
+    kind, code = _kb._classify_worker_exit(pid)
+    assert kind == "intentional_exit"
+    assert code == _kb.KANBAN_INTENTIONAL_EXIT_CODE
+
+    # A bare rc=0 is still ``clean_exit`` (→ protocol_violation), NOT exempt.
+    _kb._record_worker_exit(pid + 1, _exited_status(0))
+    assert _kb._classify_worker_exit(pid + 1) == ("clean_exit", 0)
+
+
+def test_intentional_exit_requeues_without_counting_failure(
+    kanban_home, monkeypatch,
+):
+    """An EX_QUEUED sentinel exit releases the task to ``ready`` and leaves
+    ``consecutive_failures`` untouched — a deliberate yield must never trip
+    the breaker, even across many consecutive yields."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="yield", assignee="reviewer")
+
+        # Far more yields than DEFAULT_FAILURE_LIMIT (2). If any counted as a
+        # failure (or hit the protocol_violation immediate trip), the task
+        # would be blocked.
+        for i in range(6):
+            pid = 80000 + i
+            kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            conn.execute(
+                "UPDATE tasks SET worker_pid=?, consecutive_failures=? "
+                "WHERE id=?",
+                (pid, 0, tid),
+            )
+            conn.commit()
+            _kb._record_worker_exit(
+                pid, _exited_status(_kb.KANBAN_INTENTIONAL_EXIT_CODE)
+            )
+
+            crashed = kb.detect_crashed_workers(conn)
+            assert tid not in crashed, f"hit {i}: intentional yield is not a crash"
+            iq = getattr(
+                _kb.detect_crashed_workers, "_last_intentionally_queued", []
+            )
+            assert tid in iq, f"hit {i}: should be on the intentionally_queued list"
+
+            task = kb.get_task(conn, tid)
+            assert task.status == "ready", (
+                f"hit {i}: should requeue ready, got {task.status}"
+            )
+            assert task.consecutive_failures == 0, (
+                f"hit {i}: intentional yield must not count a failure, "
+                f"got {task.consecutive_failures}"
+            )
+
+        # A ``queued`` run outcome was recorded (not ``crashed``).
+        outcomes = [
+            r["outcome"] for r in conn.execute(
+                "SELECT outcome FROM task_runs WHERE task_id=?", (tid,),
+            ).fetchall()
+        ]
+        assert "queued" in outcomes
+        assert "crashed" not in outcomes
+
+
+def test_bare_clean_exit_without_sentinel_still_trips_breaker(
+    kanban_home, monkeypatch,
+):
+    """SAFETY: the carve-out is surgical. A worker that exits rc=0 while still
+    ``running`` WITHOUT the EX_QUEUED sentinel is still a protocol_violation
+    and still hard-blocks immediately (failure_limit=1) on the FIRST hit."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="forgot-to-transition", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:w0")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (90001, tid),
+        )
+        conn.commit()
+        _kb._record_worker_exit(90001, _exited_status(0))  # bare rc=0, no sentinel
+
+        kb.detect_crashed_workers(conn)
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", (
+            f"bare clean exit must still trip on first hit, got {task.status}"
+        )
+
+
 def test_respawn_guard_defers_rate_limited_within_cooldown(
     kanban_home, monkeypatch,
 ):
