@@ -17,6 +17,11 @@ from hermes_cli.review_loop.l0_gate import (
     L0Result,
     run_l0_gate,
 )
+from hermes_cli.review_loop.state import (
+    LoopState,
+    compute_loop_state,
+    human_surfaces,
+)
 
 __all__ = [
     "L0CheckResult",
@@ -24,6 +29,9 @@ __all__ = [
     "run_l0_gate",
     "record_l0_attestation",
     "emit_l0_catchrate",
+    "compute_loop_state",
+    "LoopState",
+    "human_surfaces",
 ]
 
 

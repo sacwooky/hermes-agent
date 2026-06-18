@@ -1159,6 +1159,15 @@ def generate_epic_acceptances(
             acceptance_packet["learning_delta"] = learning_delta
         if conformance:
             acceptance_packet["conformance_verdicts"] = conformance
+        # WI-C9: annotate the G3 packet with loop capacity/confidence so the operator
+        # sees whether the epic was decided at full or degraded capacity. Phase-3
+        # minimal signal (conformance-derived); Phase-6 Robin Fusion replaces it with
+        # the real confidence object. Additive + fail-safe.
+        try:
+            from hermes_cli.review_loop.state import loop_capacity
+            acceptance_packet["loop_capacity"] = loop_capacity(conformance)
+        except Exception:
+            _log.debug("WI-C9: loop_capacity annotation skipped for %s", epic["id"], exc_info=True)
         # E4-S2: Final packet sanity — no placeholders cross to Robin
         from hermes_cli.headroom_guard import assert_no_placeholders
         try:
