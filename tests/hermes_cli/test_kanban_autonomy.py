@@ -473,21 +473,25 @@ def test_advisory_design_review_records_advisory(monkeypatch):
     assert rec["crosscheck"] is False          # never on the blocking path
 
 
-def test_l1_hook_runs_advisory_design_review(monkeypatch, kanban_home):
-    """The advisory design review fires automatically from the L1 review-phase pass
-    (wired, not deferred). LLM screen + epic resolver stubbed; assert it is invoked."""
+def _stub_l1(monkeypatch):
     from hermes_cli.review_loop import l1_screen as _l1
     monkeypatch.setattr(
         _l1, "run_l1_screen",
         lambda *a, **k: _l1.L1Result(risk="routine", escalate=False,
                                      findings_count=0, summary="ok", model="m", ok=True),
     )
+
+
+def test_l1_hook_runs_advisory_design_review(monkeypatch, kanban_home):
+    """The advisory design review fires automatically from the L1 review-phase pass for a
+    UI task with an approved direction (wired, not deferred)."""
+    _stub_l1(monkeypatch)
+    monkeypatch.setattr(ka, "_latest_selected_direction",
+                        lambda tid: {"selected_direction_id": "dir_a"})
     monkeypatch.setattr(ka, "_epic_for_story", lambda conn, sid: "epic1")
     captured = {}
-    monkeypatch.setattr(
-        ka, "run_advisory_design_review",
-        lambda conn, tid, eid, **kw: captured.update(task=tid, epic=eid),
-    )
+    monkeypatch.setattr(ka, "run_advisory_design_review",
+                        lambda conn, tid, eid, **kw: captured.update(task=tid, epic=eid))
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="Build the landing page", assignee="builder")
         ka.run_l1_screen_for_review_task(conn, tid, l1_cfg={"model": "m"})
@@ -497,42 +501,52 @@ def test_l1_hook_runs_advisory_design_review(monkeypatch, kanban_home):
 
 def test_l1_hook_advisory_failure_is_isolated(monkeypatch, kanban_home):
     """A crash in the advisory design pass must NOT break the L1 review (fail-open)."""
-    from hermes_cli.review_loop import l1_screen as _l1
-    monkeypatch.setattr(
-        _l1, "run_l1_screen",
-        lambda *a, **k: _l1.L1Result(risk="routine", escalate=False,
-                                     findings_count=0, summary="ok", model="m", ok=True),
-    )
+    _stub_l1(monkeypatch)
+    monkeypatch.setattr(ka, "_latest_selected_direction",
+                        lambda tid: {"selected_direction_id": "dir_a"})
     monkeypatch.setattr(ka, "_epic_for_story", lambda conn, sid: "epic1")
     def _boom(*a, **k):
         raise RuntimeError("design review exploded")
     monkeypatch.setattr(ka, "run_advisory_design_review", _boom)
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="Build the dashboard", assignee="builder")
-        # must not raise
-        ka.run_l1_screen_for_review_task(conn, tid, l1_cfg={"model": "m"})
-        # the L1 screen event was still recorded despite the advisory crash
+        ka.run_l1_screen_for_review_task(conn, tid, l1_cfg={"model": "m"})  # must not raise
         kinds = [e.kind for e in kb.list_events(conn, tid)]
     assert "l1_screen" in kinds
 
 
-def test_l1_hook_advisory_is_deduped(monkeypatch, kanban_home):
-    """Explicit once-per-artifact guard: if a design_review_advisory marker already
-    exists, the advisory pass is skipped (no duplicate verdict) even when run again."""
-    from hermes_cli.review_loop import l1_screen as _l1
-    monkeypatch.setattr(
-        _l1, "run_l1_screen",
-        lambda *a, **k: _l1.L1Result(risk="routine", escalate=False,
-                                     findings_count=0, summary="ok", model="m", ok=True),
-    )
+def test_l1_hook_advisory_is_deduped_per_direction(monkeypatch, kanban_home):
+    """Direction-scoped idempotency: the SAME approved direction is not re-reviewed."""
+    _stub_l1(monkeypatch)
+    monkeypatch.setattr(ka, "_latest_selected_direction",
+                        lambda tid: {"selected_direction_id": "dir_a"})
     monkeypatch.setattr(ka, "_epic_for_story", lambda conn, sid: "epic1")
     calls = []
     monkeypatch.setattr(ka, "run_advisory_design_review",
                         lambda conn, tid, eid, **kw: calls.append(tid))
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="Build the pricing page", assignee="builder")
-        # pre-seed the advisory marker (simulating a prior pass)
         with kb.write_txn(conn):
-            kb._append_event(conn, tid, "design_review_advisory", {"epic_id": "epic1"})
+            kb._append_event(conn, tid, "design_review_advisory",
+                             {"selected_direction_id": "dir_a", "epic_id": "epic1"})
         ka.run_l1_screen_for_review_task(conn, tid, l1_cfg={"model": "m"})
-    assert calls == []  # guarded -> not re-invoked
+    assert calls == []  # same direction -> not re-invoked
+
+
+def test_l1_hook_advisory_reruns_on_new_direction(monkeypatch, kanban_home):
+    """A NEW/revised approved direction (Stage-2 re-pick) DOES get a fresh advisory review,
+    even though an older direction was already reviewed."""
+    _stub_l1(monkeypatch)
+    monkeypatch.setattr(ka, "_latest_selected_direction",
+                        lambda tid: {"selected_direction_id": "dir_b"})  # operator re-picked
+    monkeypatch.setattr(ka, "_epic_for_story", lambda conn, sid: "epic1")
+    calls = []
+    monkeypatch.setattr(ka, "run_advisory_design_review",
+                        lambda conn, tid, eid, **kw: calls.append(tid))
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Rebuild the hero", assignee="builder")
+        with kb.write_txn(conn):  # prior review was for dir_a
+            kb._append_event(conn, tid, "design_review_advisory",
+                             {"selected_direction_id": "dir_a", "epic_id": "epic1"})
+        ka.run_l1_screen_for_review_task(conn, tid, l1_cfg={"model": "m"})
+    assert calls == [tid]  # new direction -> re-reviewed

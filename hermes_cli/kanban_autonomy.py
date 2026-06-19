@@ -751,6 +751,41 @@ def _epic_for_story(conn: sqlite3.Connection, story_id: str) -> "str | None":
     return row["child_id"] if row else None
 
 
+def _latest_selected_direction(task_id: str) -> "dict | None":
+    """Return the approved-direction artifact from the LATEST wireframe approval for
+    *task_id*, or None.
+
+    ``list_task_approvals`` is newest-first, so the first wireframe approval is the most
+    recent — this deterministically tracks the current G2 selection (including a Stage-2
+    ``revision_of`` re-pick). Within the approval it returns the artifact that actually
+    carries ``selected_direction_id`` (not blindly ``artifacts[0]``).
+    """
+    for a in kb.list_task_approvals(task_id):
+        if a.get("approval_type") != "wireframe":
+            continue
+        for art in (a.get("artifacts") or []):
+            if isinstance(art, dict) and art.get("selected_direction_id"):
+                return art
+    return None
+
+
+def _direction_already_reviewed(events, dir_id: str) -> bool:
+    """True if a ``design_review_advisory`` marker for *dir_id* already exists — the
+    artifact(direction)-scoped idempotency check, so a NEW/revised direction re-runs."""
+    for e in events:
+        if (getattr(e, "kind", "") or "") != "design_review_advisory":
+            continue
+        p = getattr(e, "payload", None)
+        if isinstance(p, str):
+            try:
+                p = json.loads(p)
+            except Exception:
+                p = {}
+        if isinstance(p, dict) and p.get("selected_direction_id") == dir_id:
+            return True
+    return False
+
+
 def run_advisory_design_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -776,15 +811,7 @@ def run_advisory_design_review(
     """
     from hermes_cli.review_loop import design_quality as _dq
 
-    artifact = None
-    for a in kb.list_task_approvals(task_id):
-        if a.get("approval_type") != "wireframe":
-            continue
-        arts = a.get("artifacts") or []
-        if arts and isinstance(arts[0], dict) and arts[0].get("selected_direction_id"):
-            artifact = arts[0]
-            break
-
+    artifact = _latest_selected_direction(task_id)
     evidence = _dq.render_design_evidence(artifact)
     if not evidence:
         return None
@@ -1106,6 +1133,43 @@ def run_l1_screen_for_review_task(
     except Exception:
         events = []
     kinds = [(getattr(e, "kind", "") or "") for e in events]
+
+    # Advisory design-quality pass (decision-experience-first-builds-v1): runs in the review
+    # phase, NON-BLOCKING and fail-open, and INDEPENDENT of the L1-screen dedup below so a
+    # Stage-2 re-pick (new selected_direction_id) gets a fresh review. ARTIFACT(direction)-
+    # SCOPED idempotency: records a ``design_review_advisory`` marker carrying the reviewed
+    # selected_direction_id and skips only if THAT direction was already reviewed — no
+    # duplicate verdicts, but a revised direction re-runs. Non-UI tasks (no selected
+    # direction) self-skip. The advisory verdict records on the epic and
+    # _harvest_conformance_verdicts surfaces it in the G3 packet.
+    try:
+        _direction = _latest_selected_direction(task_id)
+        _dir_id = _direction.get("selected_direction_id") if _direction else None
+        if _dir_id and not _direction_already_reviewed(events, _dir_id):
+            _epic = _epic_for_story(conn, task_id)
+            if _epic:
+                from hermes_cli.review_loop import ninerouter as _nr
+
+                def _design_chat(model, messages, **kw):
+                    return _nr.chat(
+                        model, messages,
+                        base_url=cfg.get("base_url", _nr.DEFAULT_BASE_URL),
+                        key_env=cfg.get("key_env", _nr.DEFAULT_KEY_ENV),
+                        timeout_s=int(cfg.get("timeout_s", 45)),
+                        **kw,
+                    )
+
+                run_advisory_design_review(
+                    conn, task_id, _epic,
+                    chat=_design_chat,
+                    model=cfg.get("design_model", cfg.get("model", "ag/gemini-3-flash")),
+                )
+                with kb.write_txn(conn):
+                    kb._append_event(conn, task_id, "design_review_advisory",
+                                     {"selected_direction_id": _dir_id, "epic_id": _epic})
+    except Exception:
+        _log.debug("advisory design review failed-open for %s", task_id, exc_info=True)
+
     if "l1_screen" in kinds:
         return  # dedup: triage once per artifact
 
@@ -1164,39 +1228,6 @@ def run_l1_screen_for_review_task(
             })
     except Exception:
         _log.debug("l1_screen: event emit failed for %s", task_id, exc_info=True)
-
-    # Advisory design-quality pass (decision-experience-first-builds-v1): runs here in the
-    # review phase, NON-BLOCKING and fail-open. EXPLICIT once-per-artifact guard via its own
-    # ``design_review_advisory`` marker (idempotent even if the l1_screen emit above failed,
-    # so it can never record a duplicate advisory verdict). Self-skips non-UI tasks
-    # (run_advisory_design_review returns None when there is no G2 selected direction).
-    # Records an advisory design_quality verdict on the epic, which _harvest_conformance_verdicts
-    # surfaces in the G3 packet.
-    if "design_review_advisory" not in kinds:
-        try:
-            epic_id = _epic_for_story(conn, task_id)
-            if epic_id:
-                from hermes_cli.review_loop import ninerouter as _nr
-
-                def _design_chat(model, messages, **kw):
-                    return _nr.chat(
-                        model, messages,
-                        base_url=cfg.get("base_url", _nr.DEFAULT_BASE_URL),
-                        key_env=cfg.get("key_env", _nr.DEFAULT_KEY_ENV),
-                        timeout_s=int(cfg.get("timeout_s", 45)),
-                        **kw,
-                    )
-
-                run_advisory_design_review(
-                    conn, task_id, epic_id,
-                    chat=_design_chat,
-                    model=cfg.get("design_model", cfg.get("model", "ag/gemini-3-flash")),
-                )
-            # Mark done (UI or not) so a later sweep never re-attempts -> no duplicate verdicts.
-            with kb.write_txn(conn):
-                kb._append_event(conn, task_id, "design_review_advisory", {"epic_id": epic_id})
-        except Exception:
-            _log.debug("advisory design review failed-open for %s", task_id, exc_info=True)
 
 
 def generate_epic_acceptances(
