@@ -602,6 +602,11 @@ def _harvest_conformance_verdicts(conn: sqlite3.Connection, epic_id: str) -> dic
     return verdicts
 
 
+# Advisory conformance axes are surfaced in the G3 packet but NEVER gate integration;
+# the invariant is enforced in record_conformance_verdict (not merely documented).
+_ADVISORY_CONFORMANCE_AXES = frozenset({"design_quality"})
+
+
 def record_conformance_verdict(
     conn: sqlite3.Connection,
     epic_id: str,
@@ -640,6 +645,13 @@ def record_conformance_verdict(
     kind = kind_map.get(axis)
     if not kind:
         raise ValueError(f"Unknown conformance axis: {axis!r}")
+    # ENFORCED invariant (Robin run 540): an advisory axis can NEVER be recorded on the
+    # crosscheck/blocking path. Previously documented-only; now code-enforced.
+    if axis in _ADVISORY_CONFORMANCE_AXES and crosscheck:
+        raise ValueError(
+            f"advisory conformance axis {axis!r} cannot be recorded on the crosscheck/"
+            f"blocking path; it never gates integration"
+        )
     if crosscheck:
         kind = f"{kind}_xcheck"
 
@@ -650,7 +662,11 @@ def record_conformance_verdict(
     #   check deliberately lets the "other" provider challenge the primary's conclusion).
     author_provider = _get_epic_author_provider(conn, epic_id)
     lane_provider = _normalize_provider(lane)
-    if not crosscheck:
+    if axis in _ADVISORY_CONFORMANCE_AXES:
+        # Advisory axes never gate integration, so the B4/B5 independence gate does not
+        # apply (and crosscheck=True was already rejected above). Record as-is.
+        pass
+    elif not crosscheck:
         required_provider = _required_conformance_provider(author_provider)
         if lane_provider not in ("other", "") and lane_provider == author_provider:
             _log.warning(
@@ -714,6 +730,57 @@ def record_conformance_verdict(
     }
     with kb.write_txn(conn):
         kb._append_event(conn, epic_id, kind, payload)
+
+
+def run_advisory_design_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    epic_id: str,
+    *,
+    chat,
+    model: str,
+    lane: str = "design-advisory",
+) -> "dict | None":
+    """Advisory design-quality review for a UI/website task (decision-experience-first-builds-v1).
+
+    Sources the G2 wireframe approval's approved-direction evidence for *task_id*,
+    runs the text-only, injection-safe design review, and records an ADVISORY
+    ``design_quality`` conformance verdict against *epic_id* (``crosscheck=False`` so it
+    NEVER gates integration; surfaced in the G3 packet by ``_harvest_conformance_verdicts``).
+
+    Returns the review dict, or ``None`` when the task has no approved design direction
+    (non-UI work / nothing to review) — a cheap skip that records no verdict.
+
+    Call site (dispatch/review sweep) is the one remaining wiring step: invoke this for a
+    completed UI story before its epic's G3 acceptance, passing an INDEPENDENT review lane
+    ``chat``/``model``. Kept advisory until calibrated on >=3 real boards.
+    """
+    from hermes_cli.review_loop import design_quality as _dq
+
+    artifact = None
+    for a in kb.list_task_approvals(task_id):
+        if a.get("approval_type") != "wireframe":
+            continue
+        arts = a.get("artifacts") or []
+        if arts and isinstance(arts[0], dict) and arts[0].get("selected_direction_id"):
+            artifact = arts[0]
+            break
+
+    evidence = _dq.render_design_evidence(artifact)
+    if not evidence:
+        return None
+
+    result = _dq.review_design_quality(evidence, chat=chat, model=model)
+    # Advisory mapping: "concerns" -> "fail" (surfaced in the packet, never blocks);
+    # "insufficient_evidence" -> "skip".
+    verdict = {"pass": "pass", "concerns": "fail", "insufficient_evidence": "skip"}.get(
+        result.get("verdict"), "skip"
+    )
+    record_conformance_verdict(
+        conn, epic_id, "design_quality", verdict,
+        lane=lane, findings=result.get("findings") or [], crosscheck=False,
+    )
+    return result
 
 
 def _epic_learning_signals(conn: sqlite3.Connection, epic_id: str) -> list[dict]:

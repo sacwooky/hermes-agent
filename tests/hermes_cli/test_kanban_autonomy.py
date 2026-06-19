@@ -416,3 +416,58 @@ def test_record_verdict_fusion_hollow_pass_still_rejected(kanban_home, verdict_k
             key_path=verdict_key, vault_root=str(vault),
         )
         assert out["ok"] is False and "hollow" in out["reason"]
+
+
+# --- Stage 3: advisory design_quality axis (Robin run 540 BLOCK fixes) -------------
+
+from hermes_cli.review_loop import ninerouter as _NR  # noqa: E402
+
+
+def test_design_quality_crosscheck_is_rejected():
+    """ENFORCED invariant: an advisory axis can never be recorded on the crosscheck
+    path. The guard fires before any DB access, so conn is irrelevant here."""
+    with pytest.raises(ValueError, match="advisory"):
+        ka.record_conformance_verdict(
+            None, "epic1", "design_quality", "pass", lane="l", crosscheck=True
+        )
+
+
+def test_advisory_design_review_skips_non_ui(monkeypatch):
+    """No wireframe approval with a selected direction -> returns None, records nothing."""
+    monkeypatch.setattr(kb, "list_task_approvals", lambda task_id: [])
+    called = []
+    monkeypatch.setattr(ka, "record_conformance_verdict",
+                        lambda *a, **k: called.append((a, k)))
+    out = ka.run_advisory_design_review(
+        None, "t1", "e1", chat=lambda *a, **k: _NR.ChatResult("x", "m", True, None), model="m"
+    )
+    assert out is None
+    assert called == []
+
+
+def test_advisory_design_review_records_advisory(monkeypatch):
+    """UI task with an approved direction -> sources artifact, runs review, records an
+    ADVISORY design_quality verdict (crosscheck=False, 'concerns' -> 'fail')."""
+    approval = {
+        "approval_type": "wireframe",
+        "artifacts": [{
+            "selected_direction_id": "dir_a", "direction_set_id": "ds_1",
+            "operator_rationale": "Linear-style", "design_token_summary": "Inter; #0b0b0f",
+        }],
+    }
+    monkeypatch.setattr(kb, "list_task_approvals", lambda task_id: [approval])
+    rec = {}
+    monkeypatch.setattr(ka, "record_conformance_verdict",
+                        lambda conn, epic, axis, verdict, **k: rec.update(
+                            dict(axis=axis, verdict=verdict, **k)))
+
+    def chat(model, messages, **kw):
+        return _NR.ChatResult(
+            json.dumps({"verdict": "concerns", "scores": {}, "findings": ["flat"],
+                        "summary": "x"}), "m", True, None)
+
+    out = ka.run_advisory_design_review(None, "t1", "e1", chat=chat, model="m")
+    assert out["verdict"] == "concerns"
+    assert rec["axis"] == "design_quality"
+    assert rec["verdict"] == "fail"           # concerns -> advisory fail
+    assert rec["crosscheck"] is False          # never on the blocking path
