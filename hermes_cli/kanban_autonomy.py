@@ -1159,14 +1159,18 @@ def run_l1_screen_for_review_task(
                         **kw,
                     )
 
+                # Record the marker BEFORE the verdict so a partial failure can never
+                # produce a DUPLICATE verdict on retry: if the verdict write fails after
+                # this, the marker already suppresses re-review (at worst one advisory
+                # review is missed — acceptable for a non-blocking axis).
+                with kb.write_txn(conn):
+                    kb._append_event(conn, task_id, "design_review_advisory",
+                                     {"selected_direction_id": _dir_id, "epic_id": _epic})
                 run_advisory_design_review(
                     conn, task_id, _epic,
                     chat=_design_chat,
                     model=cfg.get("design_model", cfg.get("model", "ag/gemini-3-flash")),
                 )
-                with kb.write_txn(conn):
-                    kb._append_event(conn, task_id, "design_review_advisory",
-                                     {"selected_direction_id": _dir_id, "epic_id": _epic})
     except Exception:
         _log.debug("advisory design review failed-open for %s", task_id, exc_info=True)
 
