@@ -85,13 +85,13 @@ class TestAgentLoopSourceStillHasCarveOut:
 
     def test_run_agent_excludes_jsondecodeerror_from_local_validation(self):
         import inspect
-        from agent import conversation_loop
+        from agent import conversation_loop, turn_api_call
         # The agent loop body lives in agent/conversation_loop.py after
-        # the run_agent.py refactor.  Assert the carve-out is present in
-        # the extracted module specifically — if it ever moves back or
-        # disappears, this fails loudly rather than silently passing
-        # against a non-existent inline replica.
-        src = inspect.getsource(conversation_loop)
+        # the run_agent.py refactor; the API-call/retry loop (with this
+        # carve-out) was then extracted into agent/turn_api_call.py
+        # (god-file decomposition 010c).  Scan both so this guard follows
+        # the relocated code rather than silently passing/failing.
+        src = inspect.getsource(conversation_loop) + inspect.getsource(turn_api_call)
         # The predicate we care about must reference json.JSONDecodeError
         # in its exclusion tuple. We check for the specific co-occurrence
         # rather than the literal string so harmless reformatting doesn't
@@ -146,8 +146,10 @@ class TestAgentLoopSourceHasNoneTypeCarveOut:
 
     def test_conversation_loop_excludes_nonetype_not_iterable_from_local_validation(self):
         import inspect
-        from agent import conversation_loop
-        src = inspect.getsource(conversation_loop)
+        from agent import conversation_loop, turn_api_call
+        # Retry/error classification was extracted into turn_api_call.py
+        # (decomposition 010c); scan both modules.
+        src = inspect.getsource(conversation_loop) + inspect.getsource(turn_api_call)
         assert "is_local_validation_error" in src
         # The specific check must be present.
         assert "nonetype" in src.lower() and "not iterable" in src.lower(), (

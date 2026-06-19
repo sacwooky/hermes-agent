@@ -119,9 +119,12 @@ class TestSourceStillHasBillingExclusionRemoved:
 
     def test_conversation_loop_omits_billing_from_client_error_exclusion(self):
         import inspect
-        from agent import conversation_loop
+        from agent import conversation_loop, turn_api_call
 
-        src = inspect.getsource(conversation_loop)
+        # The API-call/retry loop (incl. the is_client_error block) was
+        # extracted into agent/turn_api_call.py (god-file decomposition 010c);
+        # scan both modules so this source guard follows the relocated code.
+        src = inspect.getsource(conversation_loop) + inspect.getsource(turn_api_call)
 
         # Locate the is_client_error block and inspect its exclusion set.
         marker = "is_client_error = ("
