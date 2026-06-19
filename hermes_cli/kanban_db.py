@@ -7292,6 +7292,33 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             )
             if tripped:
                 auto_blocked.append(tid)
+                if protocol_violation:
+                    # A protocol-violation trip must be STICKY. The breaker
+                    # emits only ``gave_up`` (the auto-recoverable signal),
+                    # so ``_has_sticky_block`` stays False and
+                    # ``recompute_ready`` promotes the card straight back to
+                    # ``ready`` on the same tick — because the protocol trip
+                    # forces ``failure_limit=1`` but ``recompute_ready`` uses
+                    # the dispatcher's config limit (>= DEFAULT_FAILURE_LIMIT),
+                    # so ``consecutive_failures (1) < effective_limit`` and the
+                    # guard never holds. The card then re-dispatches, the
+                    # worker exits rc=0 again, and the board oscillates
+                    # blocked <-> ready forever. Unlike a transient/systemic
+                    # crash (which SHOULD auto-recover once conditions change),
+                    # a clean-exit-without-transition is deterministic: the
+                    # next respawn does exactly the same thing. Emit an
+                    # explicit ``blocked`` event so the block is treated as a
+                    # deliberate handoff that stays parked until an operator
+                    # runs ``kanban_unblock`` (#28712 sticky semantics).
+                    with write_txn(conn):
+                        _append_event(
+                            conn, tid, "blocked",
+                            {
+                                "reason": "protocol_violation",
+                                "error": error_text[:500],
+                                "sticky": True,
+                            },
+                        )
     # Stash auto-blocked ids on the function for the dispatch loop to pick up.
     # Keeps the public return type (``list[str]``) stable for direct callers
     # and tests that destructure the result; ``dispatch_once`` reads this

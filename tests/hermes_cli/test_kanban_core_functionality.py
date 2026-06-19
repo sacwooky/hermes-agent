@@ -4401,6 +4401,48 @@ def test_detect_crashed_workers_protocol_violation_auto_blocks(kanban_home):
         conn.close()
 
 
+def test_protocol_violation_block_survives_recompute_ready(kanban_home):
+    """A protocol-violation auto-block must be STICKY — it must NOT be
+    auto-promoted back to ``ready`` by ``recompute_ready``.
+
+    Regression for the live crash-loop: the protocol trip forces
+    ``failure_limit=1`` in the breaker, but ``recompute_ready`` uses the
+    dispatcher's config limit (>= DEFAULT_FAILURE_LIMIT). With only a
+    ``gave_up`` event, ``_has_sticky_block`` was False and
+    ``consecutive_failures (1) < effective_limit (2)``, so the guard never
+    held and the card oscillated blocked <-> ready, re-dispatching the
+    worker every tick. The fix emits a ``blocked`` event so the card stays
+    parked until an operator unblocks it.
+    """
+    import hermes_cli.kanban_db as _kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="quiet", assignee="worker")
+        host_prefix = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock")
+        fake_pid = 999996
+        kb._set_worker_pid(conn, tid, fake_pid)
+        _kb._record_worker_exit(fake_pid, 0)
+        original_alive = _kb._pid_alive
+        _kb._pid_alive = lambda p: False
+        try:
+            kb.detect_crashed_workers(conn)
+        finally:
+            _kb._pid_alive = original_alive
+
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert _kb._has_sticky_block(conn, tid) is True
+
+        # Simulate the dispatcher's post-reap promotion pass at the
+        # default failure limit — must NOT recover the protocol block.
+        kb.recompute_ready(conn, failure_limit=_kb.DEFAULT_FAILURE_LIMIT)
+        assert kb.get_task(conn, tid).status == "blocked", (
+            "protocol-violation block must survive recompute_ready"
+        )
+    finally:
+        conn.close()
+
+
 def test_detect_crashed_workers_nonzero_exit_uses_default_limit(kanban_home):
     """A worker that exited non-zero (real error / crash) uses the
     normal counter path — one failure doesn't trip the breaker.
