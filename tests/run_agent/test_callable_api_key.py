@@ -366,8 +366,11 @@ class TestInlinedDisplayMasks:
         to do ``key[:12]`` on ``self._anthropic_api_key``. For Entra ID +
         Anthropic-style mode that's a callable; slicing crashes."""
         from pathlib import Path
-        src = (Path(__file__).resolve().parent.parent.parent
-               / "agent" / "conversation_loop.py").read_text()
+        _agent_dir = Path(__file__).resolve().parent.parent.parent / "agent"
+        # The Anthropic 401 diagnostic moved with the API-call/retry loop into
+        # agent/turn_api_call.py (god-file decomposition 010c); scan both.
+        src = ((_agent_dir / "conversation_loop.py").read_text()
+               + (_agent_dir / "turn_api_call.py").read_text())
         # The Anthropic 401 block now branches on is_token_provider
         # before slicing the key.
         assert "Microsoft Entra ID (httpx event hook)" in src, (
