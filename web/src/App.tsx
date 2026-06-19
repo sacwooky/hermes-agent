@@ -28,6 +28,7 @@ import {
   Database,
   Download,
   Eye,
+  Gauge,
   FolderOpen,
   FileText,
   Globe,
@@ -80,6 +81,7 @@ import SessionsPage from "@/pages/SessionsPage";
 import LogsPage from "@/pages/LogsPage";
 import AnalyticsPage from "@/pages/AnalyticsPage";
 import ModelsPage from "@/pages/ModelsPage";
+import ModelBenchmarkPage from "@/pages/ModelBenchmarkPage";
 import CronPage from "@/pages/CronPage";
 import ProfilesPage from "@/pages/ProfilesPage";
 import ProfileBuilderPage from "@/pages/ProfileBuilderPage";
@@ -136,6 +138,7 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/files": FilesPage,
   "/analytics": AnalyticsPage,
   "/models": ModelsPage,
+  "/benchmark": ModelBenchmarkPage,
   "/logs": LogsPage,
   "/cron": CronPage,
   "/skills": SkillsPage,
@@ -180,6 +183,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
     label: "Models",
     icon: Cpu,
   },
+  { path: "/benchmark", label: "Benchmark", icon: Gauge },
   { path: "/logs", labelKey: "logs", label: "Logs", icon: FileText },
   { path: "/cron", labelKey: "cron", label: "Cron", icon: Clock },
   { path: "/skills", labelKey: "skills", label: "Skills", icon: Package },
@@ -207,6 +211,7 @@ const ICON_MAP: Record<string, ComponentType<{ className?: string }>> = {
   Cpu,
   FileText,
   FolderOpen,
+  Gauge,
   KeyRound,
   MessageSquare,
   Package,
