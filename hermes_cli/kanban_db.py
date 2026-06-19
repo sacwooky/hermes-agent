@@ -6388,10 +6388,36 @@ INFRA_RETRY_LIMIT = 4
 # (case-insensitive), ``recompute_ready`` refuses to promote the task
 # until the comment thread contains an unblock signal.
 R3_GATE_PHRASES = (
+    # Original narrow set.
     "waiting on dependencies",
     "needs approval packet",
     "requires approval packet",
     "blocked pending approval",
+    # C3b (run 524): broaden dispatcher gate recognition to the operator/approval
+    # gate set the external router already knows, so a human-decision card is NOT
+    # dispatched once (a wasted worker run) before being parked. Approval-specific
+    # phrases only — real-block reasons ("pid not alive", "timed out", "CHANGES_REQUESTED")
+    # do not match, so transient/real blocks still auto-recover normally.
+    "approval needed",
+    "approval-needed",
+    "approval packet",
+    "review-required",
+    "review required",
+    "human gate",
+    "human approval",
+    "human_approval",
+    "operator approval",
+    "operator must accept",
+    "operator-gated",
+    "operator gated",
+    "awaiting operator",
+    "pending approval",
+    "sign-off",
+    "signoff",
+    "scope containment",
+    "scope_containment",
+    "requires keith",
+    "needs keith",
 )
 # Legacy alias — callers / tests still reference the old name.
 DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
