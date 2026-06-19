@@ -5478,8 +5478,19 @@ def ensure_task_worktree(
     wt.parent.mkdir(parents=True, exist_ok=True)
     base = base_branch
     if not base:
-        cur = _git(["branch", "--show-current"], repo, timeout=10)
-        base = (cur.stdout.strip() or "HEAD") if cur.returncode == 0 else "HEAD"
+        # Base builders off the fleet TRUNK (the upstream of main = the fork),
+        # freshly fetched — NOT whatever branch the shared repo has checked out,
+        # which drifts onto task branches and is what causes parallel-copy
+        # divergence (2026-06-19 reconcile).
+        up = _git(["rev-parse", "--abbrev-ref", "main@{upstream}"], repo, timeout=10)
+        trunk = up.stdout.strip() if up.returncode == 0 else ""
+        if "/" in trunk:  # remote-tracking trunk, e.g. "realfork/main"
+            _git(["fetch", trunk.split("/", 1)[0], "main"], repo, timeout=120)
+            base = trunk
+        elif _git(["rev-parse", "--verify", "--quiet", "main"], repo, timeout=10).returncode == 0:
+            base = "main"
+        else:
+            base = "HEAD"
 
     _git(["worktree", "prune"], repo, timeout=20)
     # -B creates-or-resets the per-task branch to base, then checks it out in
