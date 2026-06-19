@@ -7857,6 +7857,34 @@ def _finalize_update_output(state):
             pass
 
 
+def _fleet_trunk_remote_ref(git_cmd, cwd, branch):
+    """Resolve the (remote, ref_branch) this checkout should update against.
+
+    Prefers the target branch's configured ``@{upstream}`` (the fleet trunk,
+    e.g. ``realfork/main``) over the hardcoded ``origin``. Returns
+    ``(None, None)`` to REFUSE when that resolves to the public NousResearch
+    upstream, so ``hermes update`` can never hard-reset a customized fork to
+    upstream (the trunk-wipe footgun). Falls back to ``("origin", branch)`` only
+    when no upstream is configured AND origin is not the NousResearch upstream.
+    """
+    up = subprocess.run(
+        git_cmd + ["rev-parse", "--abbrev-ref", f"{branch}@{{upstream}}"],
+        cwd=cwd, capture_output=True, text=True,
+    )
+    ref = up.stdout.strip() if up.returncode == 0 else ""
+    if "/" in ref:
+        remote, ref_branch = ref.split("/", 1)
+    else:
+        remote, ref_branch = "origin", branch
+    url = subprocess.run(
+        git_cmd + ["remote", "get-url", remote],
+        cwd=cwd, capture_output=True, text=True,
+    ).stdout.strip().lower()
+    if "nousresearch/hermes-agent" in url:
+        return None, None
+    return remote, ref_branch
+
+
 def _resolve_update_branch(args) -> str:
     """Normalize ``args.branch`` into a non-empty branch name.
 
@@ -7921,39 +7949,22 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     # Note: upstream/<branch> may not exist for non-main branches (a fork's
     # bb/gui has no upstream counterpart), so when the caller picks a
     # non-default branch we skip the upstream probe and use origin directly.
-    if branch == "main":
-        print("→ Fetching from upstream...")
-        fetch_result = subprocess.run(
-            git_cmd + ["fetch", "upstream", branch],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-        )
-        if fetch_result.returncode != 0:
-            # Fallback to origin if upstream doesn't exist
-            print("→ Fetching from origin...")
-            fetch_result = subprocess.run(
-                git_cmd + ["fetch", "origin", branch],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-            )
-            upstream_exists = False
-            compare_branch = f"origin/{branch}"
-        else:
-            upstream_exists = True
-            compare_branch = f"upstream/{branch}"
-    else:
-        # Non-default branch: compare against origin/<branch> directly.
-        print("→ Fetching from origin...")
-        fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin", branch],
-            cwd=PROJECT_ROOT,
-            capture_output=True,
-            text=True,
-        )
-        upstream_exists = False
-        compare_branch = f"origin/{branch}"
+    # Fleet: compare against the configured trunk (e.g. realfork/main), never the
+    # NousResearch upstream. _fleet_trunk_remote_ref refuses if it would resolve
+    # to upstream, so --check can't misreport "behind upstream" as actionable.
+    _trunk_remote, _trunk_branch = _fleet_trunk_remote_ref(git_cmd, PROJECT_ROOT, branch)
+    if _trunk_remote is None:
+        print("✗ Update target resolves to the NousResearch upstream; refusing (would wipe fork).")
+        sys.exit(1)
+    print(f"→ Fetching from {_trunk_remote}...")
+    fetch_result = subprocess.run(
+        git_cmd + ["fetch", _trunk_remote, _trunk_branch],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    upstream_exists = False
+    compare_branch = f"{_trunk_remote}/{_trunk_branch}"
 
     if fetch_result.returncode != 0:
         stderr = fetch_result.stderr.strip()
@@ -8655,10 +8666,19 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # minutes on a non-single-branch checkout. Fetch only what we update
         # against.
         branch = _resolve_update_branch(args)
+        _trunk_remote, _trunk_branch = _fleet_trunk_remote_ref(
+            git_cmd, PROJECT_ROOT, branch
+        )
+        if _trunk_remote is None:
+            print("✗ Refusing to update: the update target resolves to the NousResearch")
+            print("  upstream. A fork update would hard-reset to upstream and wipe local")
+            print("  customizations. Point this branch's upstream at the fleet trunk first.")
+            sys.exit(1)
+        _trunk_ref = f"{_trunk_remote}/{_trunk_branch}"
 
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin", branch],
+            git_cmd + ["fetch", _trunk_remote, _trunk_branch],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -8716,7 +8736,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 # the common case when the requested branch exists upstream
                 # but was never checked out locally.
                 track_result = subprocess.run(
-                    git_cmd + ["checkout", "-B", branch, f"origin/{branch}"],
+                    git_cmd + ["checkout", "-B", branch, _trunk_ref],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
@@ -8747,7 +8767,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         # Check if there are updates
         result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+            git_cmd + ["rev-list", f"HEAD..{_trunk_ref}", "--count"],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -8812,7 +8832,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         pre_pull_sha = _capture_head_sha(git_cmd, PROJECT_ROOT)
         try:
             pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
+                git_cmd + ["pull", "--ff-only", _trunk_remote, _trunk_branch],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
@@ -8822,10 +8842,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 # force-pushed or rebase).  Since local changes are already
                 # stashed, reset to match the remote exactly.
                 print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                    "  ⚠ Fast-forward not possible (history diverged), resetting to match the fleet trunk..."
                 )
                 reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                    git_cmd + ["reset", "--hard", _trunk_ref],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,

@@ -14,6 +14,10 @@ def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
 
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
+        # Fleet trunk probe: report "no upstream" so _fleet_trunk_remote_ref
+        # falls back to origin/<branch> in these mocks.
+        if "@{upstream}" in joined:
+            return subprocess.CompletedProcess(cmd, 128, stdout="", stderr="")
 
         # git rev-parse --abbrev-ref HEAD  (get current branch)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
@@ -504,6 +508,10 @@ class TestCmdUpdateBranchFlag:
 
         def side_effect(cmd, **kwargs):
             joined = " ".join(str(c) for c in cmd)
+            # Fleet trunk probe: report "no upstream" so _fleet_trunk_remote_ref
+            # falls back to origin/<branch> in these mocks.
+            if "@{upstream}" in joined:
+                return subprocess.CompletedProcess(cmd, 128, stdout="", stderr="")
 
             if "rev-parse" in joined and "--abbrev-ref" in joined:
                 return subprocess.CompletedProcess(cmd, 0, stdout=f"{current_branch}\n", stderr="")
@@ -658,6 +666,10 @@ class TestCmdUpdateCheckBranchFlag:
 
         def side_effect(cmd, **kwargs):
             joined = " ".join(str(c) for c in cmd)
+            # Fleet trunk probe: report "no upstream" so _fleet_trunk_remote_ref
+            # falls back to origin/<branch> in these mocks.
+            if "@{upstream}" in joined:
+                return subprocess.CompletedProcess(cmd, 128, stdout="", stderr="")
 
             if "fetch" in joined and "upstream" in joined:
                 rc = 0 if upstream_fetch_ok else 128
@@ -734,10 +746,12 @@ class TestCmdUpdateCheckBranchFlag:
 
     @patch("hermes_cli.config.detect_install_method", return_value="git")
     @patch("subprocess.run")
-    def test_check_default_main_still_prefers_upstream(
+    def test_check_default_main_targets_trunk(
         self, mock_run, _mock_method, capsys
     ):
-        """No --branch (or --branch=None) preserves the upstream-then-origin probe."""
+        """Fleet: --check targets the branch's configured @{upstream} (the trunk),
+        not a literal 'upstream' remote. With no upstream configured in this mock it
+        falls back to origin/main; on the fleet @{upstream} = realfork/main."""
         mock_run.side_effect = self._check_side_effect(
             target_branch="main", verify_ok=True, commit_count="0"
         )
@@ -746,11 +760,12 @@ class TestCmdUpdateCheckBranchFlag:
         cmd_update(args)
 
         commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
-        # Should have tried upstream first.
-        assert any("fetch" in c and "upstream" in c for c in commands), commands
-        # Compare ref is upstream/main (upstream fetch succeeded).
+        # Fleet: targets the configured trunk (origin/main here; realfork/main live),
+        # never a separate 'upstream' remote.
+        assert not any("fetch" in c and "upstream" in c for c in commands), commands
+        assert any("fetch" in c and "origin" in c for c in commands), commands
         rev_list_cmds = [c for c in commands if "rev-list" in c]
-        assert any("upstream/main" in c for c in rev_list_cmds), rev_list_cmds
+        assert any("origin/main" in c for c in rev_list_cmds), rev_list_cmds
 
     @patch("hermes_cli.config.detect_install_method", return_value="pip")
     @patch("hermes_cli.banner.check_via_pypi", return_value=0)
