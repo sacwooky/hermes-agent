@@ -1166,31 +1166,37 @@ def run_l1_screen_for_review_task(
         _log.debug("l1_screen: event emit failed for %s", task_id, exc_info=True)
 
     # Advisory design-quality pass (decision-experience-first-builds-v1): runs here in the
-    # review phase, NON-BLOCKING and fail-open, deduped with the L1 screen above (same
-    # once-per-artifact guard). Self-skips non-UI tasks (run_advisory_design_review returns
-    # None when there is no G2 selected direction). Records an advisory design_quality
-    # verdict on the epic, which _harvest_conformance_verdicts surfaces in the G3 packet.
-    try:
-        epic_id = _epic_for_story(conn, task_id)
-        if epic_id:
-            from hermes_cli.review_loop import ninerouter as _nr
+    # review phase, NON-BLOCKING and fail-open. EXPLICIT once-per-artifact guard via its own
+    # ``design_review_advisory`` marker (idempotent even if the l1_screen emit above failed,
+    # so it can never record a duplicate advisory verdict). Self-skips non-UI tasks
+    # (run_advisory_design_review returns None when there is no G2 selected direction).
+    # Records an advisory design_quality verdict on the epic, which _harvest_conformance_verdicts
+    # surfaces in the G3 packet.
+    if "design_review_advisory" not in kinds:
+        try:
+            epic_id = _epic_for_story(conn, task_id)
+            if epic_id:
+                from hermes_cli.review_loop import ninerouter as _nr
 
-            def _design_chat(model, messages, **kw):
-                return _nr.chat(
-                    model, messages,
-                    base_url=cfg.get("base_url", _nr.DEFAULT_BASE_URL),
-                    key_env=cfg.get("key_env", _nr.DEFAULT_KEY_ENV),
-                    timeout_s=int(cfg.get("timeout_s", 45)),
-                    **kw,
+                def _design_chat(model, messages, **kw):
+                    return _nr.chat(
+                        model, messages,
+                        base_url=cfg.get("base_url", _nr.DEFAULT_BASE_URL),
+                        key_env=cfg.get("key_env", _nr.DEFAULT_KEY_ENV),
+                        timeout_s=int(cfg.get("timeout_s", 45)),
+                        **kw,
+                    )
+
+                run_advisory_design_review(
+                    conn, task_id, epic_id,
+                    chat=_design_chat,
+                    model=cfg.get("design_model", cfg.get("model", "ag/gemini-3-flash")),
                 )
-
-            run_advisory_design_review(
-                conn, task_id, epic_id,
-                chat=_design_chat,
-                model=cfg.get("design_model", cfg.get("model", "ag/gemini-3-flash")),
-            )
-    except Exception:
-        _log.debug("advisory design review failed-open for %s", task_id, exc_info=True)
+            # Mark done (UI or not) so a later sweep never re-attempts -> no duplicate verdicts.
+            with kb.write_txn(conn):
+                kb._append_event(conn, task_id, "design_review_advisory", {"epic_id": epic_id})
+        except Exception:
+            _log.debug("advisory design review failed-open for %s", task_id, exc_info=True)
 
 
 def generate_epic_acceptances(

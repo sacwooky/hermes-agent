@@ -514,3 +514,25 @@ def test_l1_hook_advisory_failure_is_isolated(monkeypatch, kanban_home):
         # the L1 screen event was still recorded despite the advisory crash
         kinds = [e.kind for e in kb.list_events(conn, tid)]
     assert "l1_screen" in kinds
+
+
+def test_l1_hook_advisory_is_deduped(monkeypatch, kanban_home):
+    """Explicit once-per-artifact guard: if a design_review_advisory marker already
+    exists, the advisory pass is skipped (no duplicate verdict) even when run again."""
+    from hermes_cli.review_loop import l1_screen as _l1
+    monkeypatch.setattr(
+        _l1, "run_l1_screen",
+        lambda *a, **k: _l1.L1Result(risk="routine", escalate=False,
+                                     findings_count=0, summary="ok", model="m", ok=True),
+    )
+    monkeypatch.setattr(ka, "_epic_for_story", lambda conn, sid: "epic1")
+    calls = []
+    monkeypatch.setattr(ka, "run_advisory_design_review",
+                        lambda conn, tid, eid, **kw: calls.append(tid))
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Build the pricing page", assignee="builder")
+        # pre-seed the advisory marker (simulating a prior pass)
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "design_review_advisory", {"epic_id": "epic1"})
+        ka.run_l1_screen_for_review_task(conn, tid, l1_cfg={"model": "m"})
+    assert calls == []  # guarded -> not re-invoked
