@@ -732,6 +732,25 @@ def record_conformance_verdict(
         kb._append_event(conn, epic_id, kind, payload)
 
 
+def _epic_for_story(conn: sqlite3.Connection, story_id: str) -> "str | None":
+    """Return the epic id for *story_id*, or None.
+
+    decompose links the epic root as a CHILD of every story (so the epic waits on the
+    graph), so the epic is the story's child in ``task_links`` whose metadata marks it an
+    epic. Best-effort; advisory-path use only.
+    """
+    try:
+        row = conn.execute(
+            "SELECT l.child_id FROM task_links l "
+            "JOIN task_metadata m ON m.task_id = l.child_id "
+            "WHERE l.parent_id = ? AND m.work_item_type = 'epic' LIMIT 1",
+            (story_id,),
+        ).fetchone()
+    except Exception:
+        return None
+    return row["child_id"] if row else None
+
+
 def run_advisory_design_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -751,9 +770,9 @@ def run_advisory_design_review(
     Returns the review dict, or ``None`` when the task has no approved design direction
     (non-UI work / nothing to review) — a cheap skip that records no verdict.
 
-    Call site (dispatch/review sweep) is the one remaining wiring step: invoke this for a
-    completed UI story before its epic's G3 acceptance, passing an INDEPENDENT review lane
-    ``chat``/``model``. Kept advisory until calibrated on >=3 real boards.
+    Wired into ``run_l1_screen_for_review_task`` (review phase, non-blocking, fail-open,
+    once-per-artifact) — it runs automatically for review tasks; non-UI tasks self-skip.
+    Kept advisory (never gates) until calibrated on >=3 real boards.
     """
     from hermes_cli.review_loop import design_quality as _dq
 
@@ -1145,6 +1164,33 @@ def run_l1_screen_for_review_task(
             })
     except Exception:
         _log.debug("l1_screen: event emit failed for %s", task_id, exc_info=True)
+
+    # Advisory design-quality pass (decision-experience-first-builds-v1): runs here in the
+    # review phase, NON-BLOCKING and fail-open, deduped with the L1 screen above (same
+    # once-per-artifact guard). Self-skips non-UI tasks (run_advisory_design_review returns
+    # None when there is no G2 selected direction). Records an advisory design_quality
+    # verdict on the epic, which _harvest_conformance_verdicts surfaces in the G3 packet.
+    try:
+        epic_id = _epic_for_story(conn, task_id)
+        if epic_id:
+            from hermes_cli.review_loop import ninerouter as _nr
+
+            def _design_chat(model, messages, **kw):
+                return _nr.chat(
+                    model, messages,
+                    base_url=cfg.get("base_url", _nr.DEFAULT_BASE_URL),
+                    key_env=cfg.get("key_env", _nr.DEFAULT_KEY_ENV),
+                    timeout_s=int(cfg.get("timeout_s", 45)),
+                    **kw,
+                )
+
+            run_advisory_design_review(
+                conn, task_id, epic_id,
+                chat=_design_chat,
+                model=cfg.get("design_model", cfg.get("model", "ag/gemini-3-flash")),
+            )
+    except Exception:
+        _log.debug("advisory design review failed-open for %s", task_id, exc_info=True)
 
 
 def generate_epic_acceptances(

@@ -471,3 +471,46 @@ def test_advisory_design_review_records_advisory(monkeypatch):
     assert rec["axis"] == "design_quality"
     assert rec["verdict"] == "fail"           # concerns -> advisory fail
     assert rec["crosscheck"] is False          # never on the blocking path
+
+
+def test_l1_hook_runs_advisory_design_review(monkeypatch, kanban_home):
+    """The advisory design review fires automatically from the L1 review-phase pass
+    (wired, not deferred). LLM screen + epic resolver stubbed; assert it is invoked."""
+    from hermes_cli.review_loop import l1_screen as _l1
+    monkeypatch.setattr(
+        _l1, "run_l1_screen",
+        lambda *a, **k: _l1.L1Result(risk="routine", escalate=False,
+                                     findings_count=0, summary="ok", model="m", ok=True),
+    )
+    monkeypatch.setattr(ka, "_epic_for_story", lambda conn, sid: "epic1")
+    captured = {}
+    monkeypatch.setattr(
+        ka, "run_advisory_design_review",
+        lambda conn, tid, eid, **kw: captured.update(task=tid, epic=eid),
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Build the landing page", assignee="builder")
+        ka.run_l1_screen_for_review_task(conn, tid, l1_cfg={"model": "m"})
+    assert captured.get("task") == tid
+    assert captured.get("epic") == "epic1"
+
+
+def test_l1_hook_advisory_failure_is_isolated(monkeypatch, kanban_home):
+    """A crash in the advisory design pass must NOT break the L1 review (fail-open)."""
+    from hermes_cli.review_loop import l1_screen as _l1
+    monkeypatch.setattr(
+        _l1, "run_l1_screen",
+        lambda *a, **k: _l1.L1Result(risk="routine", escalate=False,
+                                     findings_count=0, summary="ok", model="m", ok=True),
+    )
+    monkeypatch.setattr(ka, "_epic_for_story", lambda conn, sid: "epic1")
+    def _boom(*a, **k):
+        raise RuntimeError("design review exploded")
+    monkeypatch.setattr(ka, "run_advisory_design_review", _boom)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="Build the dashboard", assignee="builder")
+        # must not raise
+        ka.run_l1_screen_for_review_task(conn, tid, l1_cfg={"model": "m"})
+        # the L1 screen event was still recorded despite the advisory crash
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+    assert "l1_screen" in kinds
