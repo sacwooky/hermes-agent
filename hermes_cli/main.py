@@ -4278,14 +4278,20 @@ def _print_version_info(*, check_updates: bool = True) -> None:
         from hermes_cli.config import recommended_update_command
 
         behind = check_for_updates()
-        if behind and behind > 0:
-            commits_word = "commit" if behind == 1 else "commits"
-            print(
-                f"Update available: {behind} {commits_word} behind — "
-                f"run '{recommended_update_command()}'"
-            )
-        elif behind == 0:
-            print("Up to date")
+        # Fleet fork: check_for_updates counts vs origin (the NousResearch
+        # upstream here), which is meaningless when the trunk is a separate
+        # remote (realfork). Only surface the notice for installs that track
+        # origin; suppress it on the fork.
+        _banner_trunk_remote, _ = _fleet_trunk_remote_ref(["git"], PROJECT_ROOT, "main")
+        if _banner_trunk_remote == "origin":
+            if behind and behind > 0:
+                commits_word = "commit" if behind == 1 else "commits"
+                print(
+                    f"Update available: {behind} {commits_word} behind — "
+                    f"run '{recommended_update_command()}'"
+                )
+            elif behind == 0:
+                print("Up to date")
     except Exception:
         pass
 
