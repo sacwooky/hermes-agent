@@ -579,6 +579,9 @@ def _harvest_conformance_verdicts(conn: sqlite3.Connection, epic_id: str) -> dic
         ("security", "conformance_verdict_security"),
         ("performance", "conformance_verdict_perf"),
         ("accessibility", "conformance_verdict_a11y"),
+        # Advisory axis (decision-experience-first-builds-v1, Stage 3): surfaced in the
+        # G3 acceptance packet only — NEVER on any blocking/crosscheck path.
+        ("design_quality", "conformance_verdict_design_quality"),
     ):
         row = _has_event(conn, epic_id, kind)
         if row is not None:
@@ -616,7 +619,9 @@ def record_conformance_verdict(
     Called by the verdict courier (record-robin-verdict.sh equivalent for
     conformance).
 
-    :param axis: ``"security"`` | ``"perf"`` | ``"a11y"``
+    :param axis: ``"security"`` | ``"perf"`` | ``"a11y"`` | ``"design_quality"``
+        (``design_quality`` is ADVISORY — recorded + surfaced in the G3 packet,
+        never on a blocking/crosscheck path; decision-experience-first-builds-v1).
     :param verdict: ``"pass"`` | ``"fail"`` | ``"skip"``
     :param crosscheck: True when this is the second independent-provider
         opinion required for high-risk epics (B5).
@@ -630,6 +635,7 @@ def record_conformance_verdict(
         "security": "conformance_verdict_security",
         "perf": "conformance_verdict_perf",
         "a11y": "conformance_verdict_a11y",
+        "design_quality": "conformance_verdict_design_quality",  # advisory; never blocks
     }
     kind = kind_map.get(axis)
     if not kind:
