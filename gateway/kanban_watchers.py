@@ -912,6 +912,14 @@ class GatewayKanbanWatchersMixin:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
+                # run 524: skip PAUSED boards — their ready cards are deliberately
+                # not spawned (operator pause), so they must not trip the stuck-warn.
+                try:
+                    from hermes_cli.review_loop import pause as _pause
+                    if _pause.is_paused(slug)[0]:
+                        continue
+                except Exception:
+                    pass
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
