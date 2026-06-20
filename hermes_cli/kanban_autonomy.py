@@ -59,6 +59,51 @@ except Exception:
 DEFAULT_VERDICT_KEY_PATH = "~/.hermes/credentials/robin-verdict-key"
 DEFAULT_VAULT_ROOT = "/srv/fluxlabs/vault/conductor-vault"
 VALID_VERDICTS = frozenset({"pass", "pass-with-notes", "block"})
+
+# --- v18 Supreme Court Review Contract (structured output) ------------------
+# Source of truth: conductor-vault
+# wiki/projects/project-intake-discovery-process.md ("Supreme Court Review
+# Contract"). For each review TYPE the reviewer MUST emit structured output
+# (not freeform); a verdict missing any required field, or missing the rubric
+# scorecard for its type, is treated as a HOLLOW verdict → verdict_rejected +
+# requeue (fail-closed). Enforcement is OPT-IN, keyed on the payload declaring
+# a ``review_type`` — legacy/fusion verdicts (no review_type) keep the existing
+# lane-based R8 hollow check unchanged.
+SC_REVIEW_TYPES = frozenset(
+    {"wireframe", "prd", "code", "final-delivery", "final_delivery", "final", "general"}
+)
+# Review types that require a rubric scorecard (templates/rubrics/<type>-rubric.md).
+SC_SCORECARD_TYPES = frozenset(
+    {"wireframe", "prd", "code", "final-delivery", "final_delivery", "final", "general"}
+)
+# Every structured field the contract requires, regardless of review type.
+SC_REQUIRED_FIELDS = (
+    "verdict",
+    "confidence",
+    "scorecard",
+    "blocking_issues",
+    "advisory_issues",
+    "missing_skill_findings",
+    "required_repair_actions",
+    "evidence_reviewed",
+    "calibration_substrate_flags",
+)
+# Fields that must be JSON lists when present (the contract specifies [] shape).
+SC_LIST_FIELDS = (
+    "blocking_issues",
+    "advisory_issues",
+    "missing_skill_findings",
+    "required_repair_actions",
+    "evidence_reviewed",
+    "calibration_substrate_flags",
+)
+# v18 verdict vocabulary → lifecycle outcome. Approved / Approved-with-minor-notes
+# pass; Rejected-for-revision / Rejected-wrong-skill-stack block.
+SC_PASS_VERDICTS = frozenset({"approved", "approved_with_minor_notes"})
+SC_BLOCK_VERDICTS = frozenset(
+    {"rejected_for_revision", "rejected_wrong_skill_stack"}
+)
+
 # Provenance channels a verdict may legitimately arrive through. A file
 # that "appeared" in a local worktree is NOT one of them — that is the
 # exact fabrication vector this module exists to close.
@@ -117,6 +162,85 @@ def verify_verdict_signature(
     except (FileNotFoundError, ValueError):
         return False
     return hmac.compare_digest(expected, (signature or "").strip().lower())
+
+
+def _normalize_review_type(review_type: Any) -> Optional[str]:
+    """Canonicalize a payload ``review_type`` to a known SC type, or None.
+
+    Accepts case / hyphen / underscore variants (``Final-Delivery`` →
+    ``final-delivery``). Returns the canonical token when recognized, else
+    ``None`` (caller treats unrecognized/absent as "not an SC contract").
+    """
+    if not isinstance(review_type, str):
+        return None
+    t = review_type.strip().lower().replace(" ", "-").replace("_", "-")
+    # Fold the underscore aliases we accept in SC_REVIEW_TYPES.
+    aliases = {"final-delivery": "final-delivery", "final_delivery": "final-delivery"}
+    t = aliases.get(t, t)
+    canon = t.replace("-", "_")
+    if t in SC_REVIEW_TYPES or canon in SC_REVIEW_TYPES:
+        return t
+    return None
+
+
+def enforce_supreme_court_contract(
+    payload: dict, review_type: str
+) -> Optional[str]:
+    """Validate a v18 Supreme Court structured verdict. Fail-closed.
+
+    Returns a rejection reason string if the payload violates the contract,
+    or ``None`` if it conforms. The contract (vault
+    ``project-intake-discovery-process.md`` → "Supreme Court Review Contract"):
+    every verdict MUST carry the structured fields in :data:`SC_REQUIRED_FIELDS`,
+    the rubric ``scorecard`` for its review type must be a non-empty object, the
+    list-shaped fields must be JSON lists, and ``verdict`` must be drawn from the
+    v18 vocabulary (Approved / Approved-with-minor-notes / Rejected-for-revision
+    / Rejected-wrong-skill-stack).
+
+    A verdict missing any required field, or missing the scorecard for its
+    review type, is hollow → reject + requeue (same fail-closed posture as the
+    R8 hollow-PASS check).
+    """
+    # 1. Every required structured field must be PRESENT (key exists). Absence
+    #    is the hollow-verdict signal the contract guards against.
+    missing = [f for f in SC_REQUIRED_FIELDS if f not in payload]
+    if missing:
+        return (
+            f"hollow SC verdict ({review_type}): missing required structured "
+            f"field(s) {missing} — Supreme Court Review Contract requires "
+            f"{list(SC_REQUIRED_FIELDS)} (fail-closed, requeue for re-review)"
+        )
+
+    # 2. Scorecard must be a non-empty object for types that carry a rubric.
+    scorecard = payload.get("scorecard")
+    if review_type in SC_SCORECARD_TYPES or review_type.replace("-", "_") in SC_SCORECARD_TYPES:
+        if not isinstance(scorecard, dict) or not scorecard:
+            return (
+                f"hollow SC verdict ({review_type}): rubric scorecard is "
+                f"missing or empty — every {review_type} review must carry the "
+                f"templates/rubrics/{review_type}-rubric.md scorecard "
+                f"(fail-closed, requeue)"
+            )
+    elif scorecard is not None and not isinstance(scorecard, dict):
+        return f"SC verdict ({review_type}): scorecard must be a JSON object"
+
+    # 3. List-shaped fields must actually be lists (shape contract).
+    for f in SC_LIST_FIELDS:
+        if not isinstance(payload.get(f), list):
+            return (
+                f"SC verdict ({review_type}): field {f!r} must be a JSON list "
+                f"(got {type(payload.get(f)).__name__})"
+            )
+
+    # 4. verdict must be in the v18 vocabulary.
+    raw = str(payload.get("verdict", "")).strip().lower().replace("-", "_").replace(" ", "_")
+    if raw not in SC_PASS_VERDICTS and raw not in SC_BLOCK_VERDICTS:
+        return (
+            f"SC verdict ({review_type}): verdict={payload.get('verdict')!r} is "
+            f"not in the v18 vocabulary "
+            f"{sorted(SC_PASS_VERDICTS | SC_BLOCK_VERDICTS)}"
+        )
+    return None
 
 
 def record_review_verdict(
@@ -199,13 +323,33 @@ def record_review_verdict(
             f"payload.task_id={payload.get('task_id')!r} does not match {task_id!r}"
         )
 
+    # v18 Supreme Court Review Contract (fail-closed, opt-in via review_type).
+    # When the payload declares a recognized review_type, it MUST satisfy the
+    # full structured-output schema (required fields + rubric scorecard + v18
+    # verdict vocabulary). A non-conforming SC verdict is hollow → reject +
+    # requeue, the same posture R8 uses for a lane-less PASS. Legacy/fusion
+    # verdicts (no review_type) skip this and rely on the existing R8 check.
+    sc_review_type = _normalize_review_type(payload.get("review_type"))
+    if sc_review_type is not None:
+        violation = enforce_supreme_court_contract(payload, sc_review_type)
+        if violation:
+            return _reject(violation)
+
     # Normalize Robin's verdict vocabulary to the two lifecycle outcomes.
     # send-review.sh emits BUILD_READY / PASS / PASS_WITH_NOTES /
-    # CHANGES_REQUESTED / BLOCK / REVISE (any case); map to pass|block.
+    # CHANGES_REQUESTED / BLOCK / REVISE (any case); the v18 SC contract emits
+    # Approved / Approved-with-minor-notes / Rejected-for-revision /
+    # Rejected-wrong-skill-stack. Map all of them to pass|block.
     raw_verdict = str(payload.get("verdict", "")).strip().lower().replace("-", "_")
-    PASS_SET = {"pass", "build_ready", "pass_with_notes", "approve", "approved", "ok"}
+    PASS_SET = {
+        "pass", "build_ready", "pass_with_notes", "approve", "approved", "ok",
+        # v18 SC vocabulary
+        "approved_with_minor_notes",
+    }
     BLOCK_SET = {"block", "blocked", "changes_requested", "revise", "reject",
-                 "rejected", "do_not_build", "fail"}
+                 "rejected", "do_not_build", "fail",
+                 # v18 SC vocabulary
+                 "rejected_for_revision", "rejected_wrong_skill_stack"}
     if raw_verdict in PASS_SET:
         verdict = "pass"
     elif raw_verdict in BLOCK_SET:
@@ -269,6 +413,9 @@ def record_review_verdict(
                 # populates and the G3 packet can surface real confidence×risk.
                 "fusion_run_id": fusion_run_id,
                 "confidence": fusion_confidence,
+                # v18: record the SC review type when this was a structured
+                # Supreme Court verdict (None for legacy/fusion verdicts).
+                "review_type": sc_review_type,
             },
         )
 

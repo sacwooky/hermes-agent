@@ -550,3 +550,221 @@ def test_l1_hook_advisory_reruns_on_new_direction(monkeypatch, kanban_home):
                              {"selected_direction_id": "dir_a", "epic_id": "epic1"})
         ka.run_l1_screen_for_review_task(conn, tid, l1_cfg={"model": "m"})
     assert calls == [tid]  # new direction -> re-reviewed
+
+
+# ---------------------------------------------------------------------------
+# v18 Supreme Court Review Contract (structured-output enforcement)
+# ---------------------------------------------------------------------------
+
+
+def _sc_payload(task_id, review_type="code", verdict="Approved", **kw):
+    """A conforming v18 Supreme Court structured verdict.
+
+    Carries every required structured field + a non-empty rubric scorecard +
+    a recorded review lane (so R8 is satisfied) + a valid vault run_record.
+    Individual tests override / drop fields to exercise the fail-closed paths.
+    """
+    body = {
+        "task_id": task_id,
+        "review_type": review_type,
+        "verdict": verdict,
+        "confidence": 0.9,
+        "scorecard": {"clarity": 9, "completeness": 8, "threshold_met": True},
+        "blocking_issues": [],
+        "advisory_issues": [],
+        "missing_skill_findings": [],
+        "required_repair_actions": [],
+        "evidence_reviewed": ["diff.patch", "review-request.md"],
+        "calibration_substrate_flags": [],
+        "run_record": "runs/2026-06-12-900-test-review.md",
+        "model_lane": "claude-code",
+    }
+    body.update(kw)
+    # Allow tests to DELETE a key by passing it as None-with-intent via a
+    # sentinel list of keys to drop.
+    for k in kw.pop("_drop", []) if isinstance(kw.get("_drop"), list) else []:
+        body.pop(k, None)
+    return json.dumps(body, sort_keys=True)
+
+
+def _sc_record(conn, tid, payload, verdict_key, vault, fetched_via="robin-ssh"):
+    sig = ka.sign_verdict_payload(payload.encode(), key_path=verdict_key)
+    return ka.record_review_verdict(
+        conn, tid, payload, sig, fetched_via=fetched_via,
+        key_path=verdict_key, vault_root=str(vault),
+    )
+
+
+def test_sc_conforming_code_verdict_completes(kanban_home, verdict_key, vault):
+    """A fully-conforming SC code verdict (Approved) completes the task."""
+    with kb.connect() as conn:
+        tid = _mk_review_task(conn)
+        out = _sc_record(conn, tid, _sc_payload(tid), verdict_key, vault)
+        assert out == {"ok": True, "verdict": "pass", "reason": None}
+        assert kb.get_task(conn, tid).status == "done"
+        ev = [e for e in kb.list_events(conn, tid) if e.kind == "verdict_recorded"]
+        assert ev
+        p = ev[-1].payload
+        if isinstance(p, str):
+            p = json.loads(p)
+        assert p["review_type"] == "code"
+
+
+def test_sc_approved_with_minor_notes_passes(kanban_home, verdict_key, vault):
+    with kb.connect() as conn:
+        tid = _mk_review_task(conn)
+        out = _sc_record(
+            conn, tid,
+            _sc_payload(tid, verdict="Approved-with-minor-notes"),
+            verdict_key, vault,
+        )
+        assert out["ok"] is True and out["verdict"] == "pass"
+
+
+def test_sc_rejected_for_revision_blocks(kanban_home, verdict_key, vault):
+    with kb.connect() as conn:
+        tid = _mk_review_task(conn)
+        out = _sc_record(
+            conn, tid,
+            _sc_payload(
+                tid, verdict="Rejected-for-revision",
+                blocking_issues=["missing error state on the form"],
+            ),
+            verdict_key, vault,
+        )
+        assert out["ok"] is True and out["verdict"] == "block"
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_sc_rejected_wrong_skill_stack_blocks(kanban_home, verdict_key, vault):
+    with kb.connect() as conn:
+        tid = _mk_review_task(conn)
+        out = _sc_record(
+            conn, tid,
+            _sc_payload(tid, review_type="wireframe",
+                        verdict="Rejected-wrong-skill-stack"),
+            verdict_key, vault,
+        )
+        assert out["ok"] is True and out["verdict"] == "block"
+
+
+@pytest.mark.parametrize("missing_field", [
+    "confidence", "scorecard", "blocking_issues", "advisory_issues",
+    "missing_skill_findings", "required_repair_actions", "evidence_reviewed",
+    "calibration_substrate_flags",
+])
+def test_sc_missing_required_field_is_rejected(
+    kanban_home, verdict_key, vault, missing_field
+):
+    """Dropping ANY required structured field => hollow SC verdict => rejected."""
+    with kb.connect() as conn:
+        tid = _mk_review_task(conn)
+        body = json.loads(_sc_payload(tid))
+        body.pop(missing_field)
+        payload = json.dumps(body, sort_keys=True)
+        out = _sc_record(conn, tid, payload, verdict_key, vault)
+        assert out["ok"] is False
+        assert "hollow SC verdict" in out["reason"]
+        assert kb.get_task(conn, tid).status == "running"  # untouched, fail-closed
+        assert "verdict_rejected" in [e.kind for e in kb.list_events(conn, tid)]
+
+
+def test_sc_empty_scorecard_is_rejected(kanban_home, verdict_key, vault):
+    """A present-but-empty scorecard for a scorecard-bearing type is hollow."""
+    with kb.connect() as conn:
+        tid = _mk_review_task(conn)
+        out = _sc_record(conn, tid, _sc_payload(tid, scorecard={}),
+                         verdict_key, vault)
+        assert out["ok"] is False and "scorecard" in out["reason"]
+        assert kb.get_task(conn, tid).status == "running"
+
+
+def test_sc_non_list_field_is_rejected(kanban_home, verdict_key, vault):
+    """A required list field that is not a JSON list is rejected (shape)."""
+    with kb.connect() as conn:
+        tid = _mk_review_task(conn)
+        out = _sc_record(conn, tid,
+                         _sc_payload(tid, blocking_issues="oops not a list"),
+                         verdict_key, vault)
+        assert out["ok"] is False and "must be a JSON list" in out["reason"]
+
+
+def test_sc_bad_verdict_vocabulary_is_rejected(kanban_home, verdict_key, vault):
+    """A structured SC verdict with an off-vocabulary verdict is rejected."""
+    with kb.connect() as conn:
+        tid = _mk_review_task(conn)
+        out = _sc_record(conn, tid, _sc_payload(tid, verdict="LGTM"),
+                         verdict_key, vault)
+        assert out["ok"] is False and "v18 vocabulary" in out["reason"]
+
+
+def test_sc_hollow_pass_no_lane_still_rejected(kanban_home, verdict_key, vault):
+    """An otherwise-conforming SC PASS with NO review lane is still hollow (R8)."""
+    with kb.connect() as conn:
+        tid = _mk_review_task(conn)
+        body = json.loads(_sc_payload(tid))
+        body.pop("model_lane")  # no lane / lanes_run -> R8 hollow
+        payload = json.dumps(body, sort_keys=True)
+        out = _sc_record(conn, tid, payload, verdict_key, vault)
+        assert out["ok"] is False and "hollow" in out["reason"]
+
+
+def test_sc_all_review_types_enforced(kanban_home, verdict_key, vault):
+    """Every SC review type enforces the contract (missing field -> reject)."""
+    for rt in ("wireframe", "prd", "code", "final-delivery", "general"):
+        with kb.connect() as conn:
+            tid = _mk_review_task(conn)
+            body = json.loads(_sc_payload(tid, review_type=rt))
+            body.pop("scorecard")
+            payload = json.dumps(body, sort_keys=True)
+            out = _sc_record(conn, tid, payload, verdict_key, vault)
+            assert out["ok"] is False, f"{rt} should fail-closed"
+            assert "hollow SC verdict" in out["reason"]
+
+
+def test_legacy_payload_without_review_type_is_unaffected(
+    kanban_home, verdict_key, vault
+):
+    """A legacy/fusion verdict (no review_type) bypasses SC enforcement and
+    still completes via the existing lane-based path — backward compatibility."""
+    with kb.connect() as conn:
+        tid = _mk_review_task(conn)
+        # _payload() has model_lane + no review_type and no SC structured fields.
+        payload = _payload(tid, verdict="pass")
+        out = _sc_record(conn, tid, payload, verdict_key, vault)
+        assert out == {"ok": True, "verdict": "pass", "reason": None}
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_sc_unrecognized_review_type_is_not_enforced(
+    kanban_home, verdict_key, vault
+):
+    """An unknown review_type is treated as 'not an SC contract' -> no structured
+    enforcement; it falls through to the legacy verdict path."""
+    with kb.connect() as conn:
+        tid = _mk_review_task(conn)
+        # review_type the SC contract doesn't know about + legacy-shaped body.
+        payload = _payload(tid, verdict="pass", review_type="security-audit")
+        out = _sc_record(conn, tid, payload, verdict_key, vault)
+        assert out["ok"] is True and out["verdict"] == "pass"
+
+
+def test_enforce_supreme_court_contract_unit():
+    """Direct unit coverage of the pure validator (no DB)."""
+    good = {
+        "verdict": "Approved", "confidence": 0.9,
+        "scorecard": {"x": 1},
+        "blocking_issues": [], "advisory_issues": [],
+        "missing_skill_findings": [], "required_repair_actions": [],
+        "evidence_reviewed": [], "calibration_substrate_flags": [],
+    }
+    assert ka.enforce_supreme_court_contract(good, "code") is None
+    bad = dict(good)
+    del bad["scorecard"]
+    assert "missing required structured" in ka.enforce_supreme_court_contract(bad, "code")
+    # normalization of the review_type token
+    assert ka._normalize_review_type("Final-Delivery") == "final-delivery"
+    assert ka._normalize_review_type("CODE") == "code"
+    assert ka._normalize_review_type("nope") is None
+    assert ka._normalize_review_type(None) is None
+
