@@ -768,3 +768,139 @@ def test_enforce_supreme_court_contract_unit():
     assert ka._normalize_review_type("nope") is None
     assert ka._normalize_review_type(None) is None
 
+
+# ---------------------------------------------------------------------------
+# Per-review-type SC contract: every recognized review type must REJECT a
+# non-structured verdict and ACCEPT a valid structured one (task t_f0ce733c).
+# The wireframe / prd / code / final-delivery types are the v18 gate types the
+# Supreme Court contract was authored for; this block locks each one down so a
+# regression in one type can't slip through the broader sweep tests above.
+# ---------------------------------------------------------------------------
+
+# Canonical gate review types named in the task. "final-delivery" is exercised
+# via both its hyphen and underscore spellings to prove _normalize_review_type
+# folds the alias before enforcement.
+SC_GATE_REVIEW_TYPES = ["wireframe", "prd", "code", "final-delivery"]
+
+
+def _legacy_typed_payload(task_id, review_type, verdict="pass", **kw):
+    """A NON-structured (legacy-shaped) verdict that nevertheless declares an
+    SC review_type. It has model_lane + run_record (so it would clear the R8
+    lane check) but NONE of the SC_REQUIRED_FIELDS — exactly the hollow
+    structured verdict the contract must fail-closed on."""
+    return _payload(task_id, verdict=verdict, review_type=review_type, **kw)
+
+
+@pytest.mark.parametrize("review_type", SC_GATE_REVIEW_TYPES)
+def test_sc_nonstructured_verdict_rejected_per_type(
+    kanban_home, verdict_key, vault, review_type
+):
+    """For each gate review type, a verdict declaring that review_type but
+    lacking the structured SC fields is rejected fail-closed and leaves task
+    state untouched (no completion, no block — requeue for re-review)."""
+    with kb.connect() as conn:
+        tid = _mk_review_task(conn)
+        payload = _legacy_typed_payload(tid, review_type)
+        out = _sc_record(conn, tid, payload, verdict_key, vault)
+        assert out["ok"] is False, f"{review_type} non-structured must reject"
+        assert "hollow SC verdict" in out["reason"]
+        # fail-closed: the task is neither completed nor blocked.
+        assert kb.get_task(conn, tid).status == "running"
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "verdict_rejected" in kinds
+        assert "verdict_recorded" not in kinds
+
+
+@pytest.mark.parametrize("review_type", SC_GATE_REVIEW_TYPES)
+def test_sc_valid_structured_verdict_accepted_per_type(
+    kanban_home, verdict_key, vault, review_type
+):
+    """For each gate review type, a fully-conforming structured Approved verdict
+    is accepted: the task completes and the recorded review_type is normalized
+    to the canonical token."""
+    with kb.connect() as conn:
+        tid = _mk_review_task(conn)
+        out = _sc_record(
+            conn, tid, _sc_payload(tid, review_type=review_type),
+            verdict_key, vault,
+        )
+        assert out == {"ok": True, "verdict": "pass", "reason": None}, review_type
+        assert kb.get_task(conn, tid).status == "done"
+        ev = [e for e in kb.list_events(conn, tid) if e.kind == "verdict_recorded"]
+        assert ev, f"{review_type} should emit verdict_recorded"
+        p = ev[-1].payload
+        if isinstance(p, str):
+            p = json.loads(p)
+        assert p["review_type"] == ka._normalize_review_type(review_type)
+
+
+@pytest.mark.parametrize("review_type", SC_GATE_REVIEW_TYPES)
+def test_sc_valid_structured_rejection_verdict_blocks_per_type(
+    kanban_home, verdict_key, vault, review_type
+):
+    """For each gate review type, a conforming Rejected-for-revision verdict is
+    honored as a block: the task returns to 'ready' so the builder lane
+    respawns with the findings, rather than completing."""
+    with kb.connect() as conn:
+        tid = _mk_review_task(conn)
+        out = _sc_record(
+            conn, tid,
+            _sc_payload(
+                tid, review_type=review_type, verdict="Rejected-for-revision",
+                blocking_issues=["gate-specific blocking finding"],
+            ),
+            verdict_key, vault,
+        )
+        assert out["ok"] is True and out["verdict"] == "block", review_type
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+@pytest.mark.parametrize("review_type", SC_GATE_REVIEW_TYPES)
+@pytest.mark.parametrize("missing_field", list(ka.SC_REQUIRED_FIELDS))
+def test_sc_each_missing_field_rejected_per_type(
+    kanban_home, verdict_key, vault, review_type, missing_field
+):
+    """Cross-product: dropping ANY single required structured field from ANY
+    gate review type is rejected fail-closed. Locks the full field x type
+    matrix so no (type, field) combination silently degrades."""
+    with kb.connect() as conn:
+        tid = _mk_review_task(conn)
+        body = json.loads(_sc_payload(tid, review_type=review_type))
+        # task_id and review_type are not in SC_REQUIRED_FIELDS, so every
+        # parametrized field is a genuine structured field that must be present.
+        body.pop(missing_field)
+        payload = json.dumps(body, sort_keys=True)
+        out = _sc_record(conn, tid, payload, verdict_key, vault)
+        assert out["ok"] is False, f"{review_type}/{missing_field} must reject"
+        assert kb.get_task(conn, tid).status == "running"
+
+
+def test_sc_final_delivery_underscore_alias_enforced(
+    kanban_home, verdict_key, vault
+):
+    """The 'final_delivery' underscore spelling normalizes to the same SC type
+    and is enforced identically to 'final-delivery' (no enforcement bypass via
+    the alternate spelling)."""
+    with kb.connect() as conn:
+        # underscore spelling, non-structured -> rejected
+        tid = _mk_review_task(conn)
+        out = _sc_record(
+            conn, tid, _legacy_typed_payload(tid, "final_delivery"),
+            verdict_key, vault,
+        )
+        assert out["ok"] is False and "hollow SC verdict" in out["reason"]
+    with kb.connect() as conn:
+        # underscore spelling, structured -> accepted, normalized token recorded
+        tid2 = _mk_review_task(conn)
+        out2 = _sc_record(
+            conn, tid2, _sc_payload(tid2, review_type="final_delivery"),
+            verdict_key, vault,
+        )
+        assert out2 == {"ok": True, "verdict": "pass", "reason": None}
+        ev = [e for e in kb.list_events(conn, tid2)
+              if e.kind == "verdict_recorded"]
+        p = ev[-1].payload
+        if isinstance(p, str):
+            p = json.loads(p)
+        assert p["review_type"] == "final-delivery"
+
