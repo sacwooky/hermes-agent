@@ -3247,6 +3247,46 @@ _SWEEP_STATUS_PATH = _HERMES_HOME / "benchmark-sweep-status.json"
 _RUN_SWEEP_SCRIPT = _REPO_ROOT / "scripts" / "model_benchmark" / "run_sweep.py"
 
 
+def _launch_sweep_detached() -> None:
+    """Launch run_sweep.py so it SURVIVES a dashboard restart.
+
+    hermes-dashboard is a systemd user service (KillMode=mixed): restarting it
+    SIGKILLs everything left in its cgroup. A plain Popen child stays in that
+    cgroup and dies on the next deploy/auto-update, freezing the sweep mid-run.
+    Launch via ``systemd-run --user`` as a transient unit (its own cgroup,
+    independent of the dashboard); fall back to a detached Popen if systemd-run
+    is unavailable.
+    """
+    logf_path = str(_HERMES_HOME / "benchmark-sweep.log")
+    env = os.environ.copy()
+    sysrun = shutil.which("systemd-run")
+    if sysrun and env.get("XDG_RUNTIME_DIR"):
+        unit = "hermes-benchmark-sweep"
+        subprocess.run(["systemctl", "--user", "reset-failed", unit + ".service"],
+                       capture_output=True, text=True)
+        cmd = [
+            sysrun, "--user", "--quiet", "--collect", "--unit", unit,
+            "--property", f"WorkingDirectory={_REPO_ROOT}",
+            "--property", f"StandardOutput=append:{logf_path}",
+            "--property", f"StandardError=append:{logf_path}",
+            "--setenv", f"HERMES_HOME={_HERMES_HOME}",
+        ]
+        if env.get("NINEROUTER_KEY"):
+            cmd += ["--setenv", f"NINEROUTER_KEY={env['NINEROUTER_KEY']}"]
+        cmd += [sys.executable, str(_RUN_SWEEP_SCRIPT)]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=30)
+            return
+        except Exception:  # noqa: BLE001
+            _log.warning("systemd-run sweep launch failed; falling back to Popen", exc_info=True)
+    logf = open(logf_path, "a", encoding="utf-8")
+    subprocess.Popen(
+        [sys.executable, str(_RUN_SWEEP_SCRIPT)],
+        stdout=logf, stderr=subprocess.STDOUT, start_new_session=True,
+        env=env, cwd=str(_REPO_ROOT),
+    )
+
+
 @app.get("/api/model-benchmark/run-sweep/status")
 def get_sweep_status():
     """Progress/result of the most recent live sweep (public, read-only)."""
@@ -3274,12 +3314,7 @@ def run_benchmark_sweep():
     if not _RUN_SWEEP_SCRIPT.is_file():
         raise HTTPException(status_code=500, detail="run_sweep.py not found")
     try:
-        logf = open(_HERMES_HOME / "benchmark-sweep.log", "a", encoding="utf-8")
-        subprocess.Popen(
-            [sys.executable, str(_RUN_SWEEP_SCRIPT)],
-            stdout=logf, stderr=subprocess.STDOUT, start_new_session=True,
-            env=os.environ.copy(), cwd=str(_REPO_ROOT),
-        )
+        _launch_sweep_detached()
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"failed to launch sweep: {exc}") from exc
     # Seed an immediate "running" status so the UI flips before run_sweep writes.
