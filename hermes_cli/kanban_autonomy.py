@@ -1779,7 +1779,8 @@ def sweep_acceptance_tasks(
     rows = conn.execute(
         "SELECT t.id, t.title, t.workspace_kind, t.workspace_path, t.tenant "
         "FROM tasks t JOIN task_metadata m ON m.task_id = t.id "
-        "WHERE m.work_item_type = 'acceptance' AND t.status = 'blocked'"
+        "WHERE m.work_item_type = 'acceptance' "
+        "AND t.status IN ('blocked', 'scheduled')"
     ).fetchall()
     for row in rows:
         tid = row["id"]
@@ -1801,13 +1802,24 @@ def sweep_acceptance_tasks(
                             approval["approval_id"],
                         ),
                     )
-            kb.complete_task(
-                conn,
-                tid,
-                result=f"Epic accepted by {approver}.",
-                summary=f"Epic accepted by {approver}.",
-                board=board,
-            )
+            # Atomic gate release. Mirrors record_task_acceptance's one-step
+            # path and — unlike complete_task — moves a gate out of
+            # ``scheduled`` (the state it self-corrects into per
+            # decision-kanban-approval-gates-scheduled-not-blocked-v1), so an
+            # already-stranded accepted gate recovers on the next tick too.
+            with kb.write_txn(conn):
+                released = kb._release_epic_acceptance_gate(conn, tid, approver)
+            if not released:
+                # Fall back to the standard completion path for any gate the
+                # release helper declined (e.g. it had open children) so the
+                # behavior is never *less* than before this fix.
+                kb.complete_task(
+                    conn,
+                    tid,
+                    result=f"Epic accepted by {approver}.",
+                    summary=f"Epic accepted by {approver}.",
+                    board=board,
+                )
             # save_learning bridge (off unless the enqueue env is configured).
             # Reads the G3 packet's learning_delta and enqueues its candidates
             # into the Unified Learning Inbox; never breaks accept on error.

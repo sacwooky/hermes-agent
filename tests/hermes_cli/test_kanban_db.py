@@ -4766,6 +4766,136 @@ def test_board_requires_acceptance_returns_false_by_default(kanban_home):
 
 
 # ---------------------------------------------------------------------------
+# Epic-acceptance gate one-step release (record_task_acceptance)
+#
+# Regression for run-547 "accept-did-not-release": a dispatcher-generated
+# epic-acceptance gate (work_item_type='acceptance') self-corrects
+# blocked->scheduled per decision-kanban-approval-gates-scheduled-not-blocked-v1.
+# Accepting it must complete it atomically in the SAME txn, including from the
+# ``scheduled`` state that complete_task's own UPDATE never covered.
+# ---------------------------------------------------------------------------
+
+
+def _make_epic_acceptance_gate(conn, *, status="blocked", title="Epic acceptance: X"):
+    """Create a task that looks like an epic-acceptance gate and park it in
+    *status*, with a pending ``epic_acceptance`` approval attached."""
+    tid = kb.create_task(conn, title=title)
+    now = int(time.time())
+    # Stamp work_item_type='acceptance' (what generate_epic_acceptances does).
+    conn.execute(
+        "INSERT INTO task_metadata "
+        "(task_id, work_item_type, tags_json, updated_at, updated_by) "
+        "VALUES (?, 'acceptance', '[]', ?, 'test')",
+        (tid, now),
+    )
+    # Attach a pending epic_acceptance approval (gate carries one).
+    approval_id = "apr_" + os.urandom(4).hex()
+    conn.execute(
+        "INSERT INTO task_approvals ("
+        " approval_id, task_id, approval_type, status, artifacts_json,"
+        " options_json, selected_option_id, decision, approver, decided_at,"
+        " comment, unblock_target_id, unblock_behavior, created_by,"
+        " created_at, updated_at"
+        ") VALUES (?, ?, 'epic_acceptance', 'pending', '{}', '[]', NULL, NULL,"
+        " NULL, NULL, NULL, ?, 'complete', 'test', ?, ?)",
+        (approval_id, tid, tid, now, now),
+    )
+    # Move it into the target gate status.
+    conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
+    return tid, approval_id
+
+
+def test_accept_releases_scheduled_epic_gate(kanban_home):
+    """Accepting a SCHEDULED epic-acceptance gate completes it atomically."""
+    with kb.connect() as conn:
+        tid, approval_id = _make_epic_acceptance_gate(conn, status="scheduled")
+        assert kb.get_task(conn, tid).status == "scheduled"
+        kb.record_task_acceptance(conn, tid, "keith", source="cli")
+        task = kb.get_task(conn, tid)
+    assert task.status == "done"
+    assert task.completed_at is not None
+    with kb.connect() as conn:
+        row = conn.execute(
+            "SELECT status FROM task_approvals WHERE approval_id = ?",
+            (approval_id,),
+        ).fetchone()
+    assert row["status"] == "approved"
+
+
+def test_accept_releases_blocked_epic_gate(kanban_home):
+    """Accepting a still-BLOCKED epic-acceptance gate completes it too."""
+    with kb.connect() as conn:
+        tid, _ = _make_epic_acceptance_gate(conn, status="blocked")
+        kb.record_task_acceptance(conn, tid, "keith", source="cli")
+        task = kb.get_task(conn, tid)
+    assert task.status == "done"
+
+
+def test_accept_release_emits_single_completed_event(kanban_home):
+    """notify-once: exactly one ``completed`` event from the atomic release."""
+    with kb.connect() as conn:
+        tid, _ = _make_epic_acceptance_gate(conn, status="scheduled")
+        kb.record_task_acceptance(conn, tid, "keith", source="cli")
+        events = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? AND kind = 'completed'",
+            (tid,),
+        ).fetchall()
+    assert len(events) == 1
+
+
+def test_accept_does_not_release_gate_with_open_children(kanban_home):
+    """Defensive 'no other holds remain': a gate with an unfinished child is
+    NOT auto-completed — the accept is still recorded, but status is unchanged."""
+    with kb.connect() as conn:
+        tid, _ = _make_epic_acceptance_gate(conn, status="scheduled")
+        child = kb.create_task(conn, title="open child")
+        conn.execute(
+            "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+            (tid, child),
+        )
+        kb.record_task_acceptance(conn, tid, "keith", source="cli")
+        task = kb.get_task(conn, tid)
+        # Acceptance event still recorded even though release was declined.
+        assert kb._has_task_acceptance(conn, tid) is True
+    assert task.status == "scheduled"
+
+
+def test_accept_regular_task_not_auto_completed(kanban_home):
+    """Parity: a regular (non-acceptance) task is NOT auto-completed by accept —
+    its completion stays owned by the worker/CLI via complete_task."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ordinary build task")
+        kb.claim_task(conn, tid, claimer="w", ttl_seconds=300)
+        kb.record_task_acceptance(conn, tid, "keith", source="cli")
+        task = kb.get_task(conn, tid)
+    # Still running — accept recorded an event but did not complete it.
+    assert task.status == "running"
+    assert task.status != "done"
+
+
+def test_accept_release_is_idempotent(kanban_home):
+    """A second accept on an already-released gate is a harmless no-op."""
+    with kb.connect() as conn:
+        tid, _ = _make_epic_acceptance_gate(conn, status="scheduled")
+        kb.record_task_acceptance(conn, tid, "keith", source="cli")
+        assert kb.get_task(conn, tid).status == "done"
+        # Second accept: gate already done → release no-ops, no crash.
+        kb.record_task_acceptance(conn, tid, "keith", source="cli")
+        task = kb.get_task(conn, tid)
+    assert task.status == "done"
+
+
+def test_release_helper_no_op_on_done_gate(kanban_home):
+    """_release_epic_acceptance_gate returns False for an already-done task."""
+    with kb.connect() as conn:
+        tid, _ = _make_epic_acceptance_gate(conn, status="scheduled")
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (tid,))
+        with kb.write_txn(conn):
+            released = kb._release_epic_acceptance_gate(conn, tid, "keith")
+    assert released is False
+
+
+# ---------------------------------------------------------------------------
 # v18 four-level QA gate wiring (complete_task)
 # ---------------------------------------------------------------------------
 

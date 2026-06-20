@@ -257,13 +257,18 @@ def test_acceptance_sweep_completes_on_accept(kanban_home):
         root, child_ids = _decompose_epic(conn)
         _finish_epic(conn, root, child_ids)
         (acc_id,) = ka.generate_epic_acceptances(conn)
+        # One-step accept release: record_task_acceptance now completes the
+        # epic-acceptance gate atomically in the same txn (run-547 fix), so
+        # the gate is already done before any sweep runs.
         kb.record_task_acceptance(conn, acc_id, "keith", source="cli")
-        out = ka.sweep_acceptance_tasks(conn)
-        assert out["completed"] == [acc_id]
         assert kb.get_task(conn, acc_id).status == "done"
         # Approval row flipped approved for audit symmetry.
         approvals = kb.list_task_approvals(acc_id)
         assert approvals[0]["status"] == "approved"
+        # The sweep is now a no-op for an already-released gate (the gate no
+        # longer matches the blocked/scheduled filter).
+        out = ka.sweep_acceptance_tasks(conn)
+        assert out["completed"] == []
 
 
 def test_acceptance_rejection_spawns_fix_story_and_rearms(kanban_home):
@@ -294,10 +299,12 @@ def test_acceptance_rejection_spawns_fix_story_and_rearms(kanban_home):
         # (list_task_approvals orders by created_at only; same-second
         # creation makes index 0 ambiguous — assert on the set instead)
         assert any(a["status"] == "pending" for a in approvals)
-        # Operator accepts the rework.
+        # Operator accepts the rework — one-step release completes it atomically.
         kb.record_task_acceptance(conn, acc_id, "keith", source="cli")
+        assert kb.get_task(conn, acc_id).status == "done"
+        # Sweep is a no-op now that the gate is already released.
         out4 = ka.sweep_acceptance_tasks(conn)
-        assert out4["completed"] == [acc_id]
+        assert out4["completed"] == []
 
 
 def test_autonomy_tick_respects_feature_gates(kanban_home):

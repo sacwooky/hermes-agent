@@ -4011,6 +4011,110 @@ class QaGateError(Exception):
 # ---------------------------------------------------------------------------
 
 
+def _is_epic_acceptance_gate(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return ``True`` when *task_id* is a dispatcher-generated epic-acceptance
+    gate (``task_metadata.work_item_type == 'acceptance'``).
+
+    These gate cards are created by
+    :func:`hermes_cli.kanban_autonomy.generate_epic_acceptances` and carry the
+    G3 ``epic_acceptance`` approval. They are the only tasks whose *sole*
+    remaining hold is operator acceptance, so they are the only ones safe to
+    release atomically from inside :func:`record_task_acceptance`. A regular
+    acceptance-gated build task (``work_item_type`` of ``story``/``feature``/…)
+    is NOT a gate — its completion stays owned by the worker/CLI caller via
+    :func:`complete_task`, preserving the older per-task accept semantics.
+    """
+    row = conn.execute(
+        "SELECT work_item_type FROM task_metadata WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    return bool(row) and (row["work_item_type"] == "acceptance")
+
+
+def _release_epic_acceptance_gate(
+    conn: sqlite3.Connection, task_id: str, accepted_by: str
+) -> bool:
+    """Atomically complete an epic-acceptance gate, in the caller's open txn.
+
+    Mirrors the completion half of
+    :func:`hermes_cli.kanban_autonomy.sweep_acceptance_tasks` but runs in the
+    SAME transaction as the ``accepted`` event so a one-step
+    ``hermes kanban accept`` releases the G3 gate without waiting for the next
+    dispatcher tick (the bug this fixes: the gate self-corrected
+    ``blocked``→``scheduled`` per
+    ``decision-kanban-approval-gates-scheduled-not-blocked-v1`` and then no
+    sweep/``complete_task`` path could move it because both only matched
+    ``blocked``/``running``/``ready`` — never ``scheduled`` — so the accepted
+    gate stranded).
+
+    Releases only when the gate's *only* remaining hold is the acceptance
+    itself: it has no incomplete (non-done/archived) child tasks. Marks any
+    pending ``epic_acceptance`` approval approved for audit symmetry, ends the
+    run, and emits a ``completed`` event. No-op (returns ``False``) when the
+    task is already ``done``/``archived`` or has unfinished children.
+
+    Caller MUST already hold a ``write_txn(conn)``.
+    """
+    trow = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if trow is None or trow["status"] in ("done", "archived"):
+        return False
+    # Defensive "no other holds remain" check: an epic-acceptance gate is
+    # created child-free, but never auto-complete a gate that somehow still
+    # has incomplete children.
+    open_children = conn.execute(
+        "SELECT 1 FROM task_links l JOIN tasks c ON c.id = l.child_id "
+        "WHERE l.parent_id = ? AND c.status NOT IN ('done', 'archived') LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if open_children is not None:
+        return False
+    now = int(time.time())
+    summary = f"Epic accepted by {accepted_by}."
+    # Mark the pending epic_acceptance approval approved (audit symmetry with
+    # the sweep path), if one exists.
+    conn.execute(
+        "UPDATE task_approvals SET status='approved', decision='approved', "
+        "approver=?, decided_at=?, updated_at=? "
+        "WHERE task_id=? AND approval_type='epic_acceptance' AND status='pending'",
+        (accepted_by, now, now, task_id),
+    )
+    # The gate may sit in any of these non-terminal states by the time the
+    # operator accepts. Crucially this includes ``scheduled`` — the state the
+    # gate self-corrects into — which complete_task's own UPDATE never covers.
+    cur = conn.execute(
+        "UPDATE tasks SET status='done', result=?, completed_at=?, "
+        "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
+        "WHERE id=? AND status IN ('blocked', 'scheduled', 'ready', 'running')",
+        (summary, now, task_id),
+    )
+    if cur.rowcount != 1:
+        return False
+    run_id = _end_run(
+        conn,
+        task_id,
+        outcome="completed",
+        status="done",
+        summary=summary,
+    )
+    if run_id is None:
+        run_id = _synthesize_ended_run(
+            conn,
+            task_id,
+            outcome="completed",
+            summary=summary,
+        )
+    _append_event(
+        conn,
+        task_id,
+        "completed",
+        {"result_len": len(summary), "summary": summary, "released_by": "accept"},
+        run_id=run_id,
+    )
+    return True
+
+
 def record_task_acceptance(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4024,6 +4128,15 @@ def record_task_acceptance(
     Writes an ``accepted`` event to ``task_events`` and a
     ``ACCEPTED: <body>`` comment to ``task_comments`` so the acceptance
     is visible in both the event log and the comment thread.
+
+    For a dispatcher-generated **epic-acceptance gate**
+    (``work_item_type == 'acceptance'``) whose only remaining hold is the
+    acceptance itself, the gate is also **released to ``done`` atomically in
+    the same transaction** — so ``hermes kanban accept <gate>`` completes the
+    G3 gate in one step instead of leaving it stranded in ``scheduled`` until
+    (or past) the next dispatcher sweep. Regular acceptance-gated build tasks
+    are untouched: their completion stays owned by the worker/CLI caller via
+    :func:`complete_task` (older per-task accept parity).
 
     Returns ``True`` on success.  Raises ``ValueError`` for unknown tasks.
     """
@@ -4054,6 +4167,10 @@ def record_task_acceptance(
             "commented",
             {"author": accepted_by, "len": len(comment_body)},
         )
+        # One-step accept release for the G3 epic-acceptance gate: complete it
+        # in the SAME txn as the accept so it never strands in ``scheduled``.
+        if _is_epic_acceptance_gate(conn, task_id):
+            _release_epic_acceptance_gate(conn, task_id, accepted_by)
     return True
 
 
