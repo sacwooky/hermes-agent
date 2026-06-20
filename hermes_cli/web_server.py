@@ -762,6 +762,19 @@ class ModelAssignment(BaseModel):
     profile: Optional[str] = None
 
 
+class LaneApply(BaseModel):
+    """Payload for POST /api/lane/apply — set a benchmark lane's models.
+
+    lane       → a benchmark lane key (e.g. "vision", "builder", "default_chat").
+    primary    → the 9Router model id to set as the lane's primary/default.
+    fallbacks  → ordered 9Router model ids for the lane's fallback chain.
+    Both primary and fallbacks must be benchmark-known router ids.
+    """
+    lane: str
+    primary: str
+    fallbacks: list[str] = []
+
+
 def _normalize_main_model_assignment(provider: str, model: str) -> tuple[str, str]:
     """Normalize a main-slot (provider, model) pair before persisting.
 
@@ -3179,6 +3192,329 @@ async def get_defaults():
 @app.get("/api/config/schema")
 async def get_schema():
     return {"fields": CONFIG_SCHEMA, "category_order": _CATEGORY_ORDER}
+
+
+# Candidate locations for the model-benchmark dataset, in priority order. The
+# source file (web/public/data) is updated in place by
+# scripts/model_benchmark/build_benchmark.py, so re-running the builder refreshes
+# this endpoint WITHOUT a web rebuild. An optional HERMES_HOME drop lets an
+# operator override without touching the repo. web_dist is the baked fallback.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_HERMES_HOME = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
+_BENCHMARK_CANDIDATES = [
+    _HERMES_HOME / "model-benchmark.json",
+    _REPO_ROOT / "web" / "public" / "data" / "model-benchmark.json",
+    WEB_DIST / "data" / "model-benchmark.json",
+]
+_BENCHMARK_HISTORY_DIR = _HERMES_HOME / "benchmark-history"
+
+
+def _benchmark_iso_from_safe(safe: str) -> str:
+    """Reconstruct an ISO timestamp from a snapshot id like 20260616T211000Z."""
+    try:
+        d, t = safe.rstrip("Z").split("T")
+        return f"{d[0:4]}-{d[4:6]}-{d[6:8]}T{t[0:2]}:{t[2:4]}:{t[4:6]}Z"
+    except (ValueError, IndexError):
+        return safe
+
+
+def _read_benchmark(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail=f"benchmark file unreadable: {exc}") from exc
+    meta = data.setdefault("meta", {})
+    meta["served_from"] = str(path)
+    meta["served_mtime"] = datetime.fromtimestamp(
+        path.stat().st_mtime, tz=timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return data
+
+
+@app.get("/api/model-benchmark/history")
+def get_model_benchmark_history():
+    """List available dated benchmark snapshots (newest first) for the UI filter."""
+    out = []
+    if _BENCHMARK_HISTORY_DIR.is_dir():
+        for f in sorted(_BENCHMARK_HISTORY_DIR.glob("model-benchmark-*.json"), reverse=True):
+            safe = f.stem.replace("model-benchmark-", "")
+            out.append({"id": safe, "generated_at": _benchmark_iso_from_safe(safe)})
+    return {"snapshots": out}
+
+
+# ── Run Benchmark: launch the live sweep from the webui (GATED — spends $) ────
+_SWEEP_STATUS_PATH = _HERMES_HOME / "benchmark-sweep-status.json"
+_RUN_SWEEP_SCRIPT = _REPO_ROOT / "scripts" / "model_benchmark" / "run_sweep.py"
+
+
+@app.get("/api/model-benchmark/run-sweep/status")
+def get_sweep_status():
+    """Progress/result of the most recent live sweep (public, read-only)."""
+    if _SWEEP_STATUS_PATH.is_file():
+        try:
+            return JSONResponse(json.loads(_SWEEP_STATUS_PATH.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            pass
+    return {"state": "idle"}
+
+
+@app.post("/api/model-benchmark/run-sweep")
+def run_benchmark_sweep():
+    """Launch the live sweep detached, then rebuild the benchmark. SPENDS TOKENS.
+
+    Auth-gated (NOT public). Refuses if a sweep is already running.
+    """
+    if _SWEEP_STATUS_PATH.is_file():
+        try:
+            st = json.loads(_SWEEP_STATUS_PATH.read_text(encoding="utf-8"))
+            if st.get("state") == "running":
+                raise HTTPException(status_code=409, detail="a sweep is already running")
+        except (OSError, ValueError):
+            pass
+    if not _RUN_SWEEP_SCRIPT.is_file():
+        raise HTTPException(status_code=500, detail="run_sweep.py not found")
+    try:
+        logf = open(_HERMES_HOME / "benchmark-sweep.log", "a", encoding="utf-8")
+        subprocess.Popen(
+            [sys.executable, str(_RUN_SWEEP_SCRIPT)],
+            stdout=logf, stderr=subprocess.STDOUT, start_new_session=True,
+            env=os.environ.copy(), cwd=str(_REPO_ROOT),
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"failed to launch sweep: {exc}") from exc
+    # Seed an immediate "running" status so the UI flips before run_sweep writes.
+    try:
+        _SWEEP_STATUS_PATH.write_text(json.dumps({
+            "state": "running", "done": 0, "total": 0,
+            "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }), encoding="utf-8")
+    except OSError:
+        pass
+    return {"state": "running"}
+
+
+@app.get("/api/model-benchmark")
+def get_model_benchmark(at: Optional[str] = None):
+    """Serve the model-benchmark dataset live from disk (no rebuild needed).
+
+    ``?at=<snapshot-id>`` serves a specific dated snapshot from
+    ``benchmark-history/``; otherwise the current dataset is returned. Reading
+    happens per-request, so re-running build_benchmark.py refreshes this without
+    a web rebuild. Read-only; never mutates routing.
+    """
+    if at:
+        safe = "".join(c for c in at if c.isalnum())  # path-traversal guard
+        snap = _BENCHMARK_HISTORY_DIR / f"model-benchmark-{safe}.json"
+        if not snap.is_file():
+            raise HTTPException(status_code=404, detail=f"snapshot {safe} not found")
+        return JSONResponse(_read_benchmark(snap))
+    for path in _BENCHMARK_CANDIDATES:
+        if path and path.is_file():
+            return JSONResponse(_read_benchmark(path))
+    raise HTTPException(
+        status_code=404,
+        detail="model-benchmark.json not found — run scripts/model_benchmark/build_benchmark.py",
+    )
+
+
+# ── Lane apply: write a lane's primary + fallback chain to config (GATED) ──────
+# Maps a benchmark lane key → where its model is configured on THIS host:
+#   ("main", profile)       → model.default + fallback_providers (host or profile)
+#   ("auxiliary", profile, slot) → auxiliary.<slot>.model + .fallback_chain
+#   ("delegation", None)    → delegation.model (top-level)
+#   ("readonly", reason)    → not settable here (e.g. Robin review lanes)
+_LANE_TARGETS: dict = {
+    "default_chat": ("main", None, None),
+    "orchestrator": ("main", "orchestrator", None),
+    "builder": ("main", "builder", None),
+    "integrator": ("main", "integrator", None),
+    "maintainer": ("main", "maintainer", None),
+    "researcher": ("main", "researcher", None),
+    "km_agent": ("main", "km-agent", None),
+    "ops_watch": ("main", "ops-watch", None),
+    "qa_functional": ("main", "qa", None),
+    "qa_vision": ("auxiliary", "qa", "vision"),
+    "reviewer": ("readonly", "governed by Robin review lanes — set on the review host, not here", None),
+    "delegation": ("delegation", None, None),
+}
+# Host auxiliary slots settable directly (no profile).
+for _slot in (
+    "vision", "web_extract", "compression", "skills_hub", "approval", "mcp",
+    "title_generation", "tts_audio_tags", "triage_specifier", "kanban_decomposer",
+    "profile_describer", "curator", "monitor", "session_search", "flush_memories",
+):
+    _LANE_TARGETS.setdefault(_slot, ("auxiliary", None, _slot))
+
+_NINEROUTER_PROVIDER = "custom:9router-codex"
+_NINEROUTER_BASE_URL = "http://127.0.0.1:20128/v1"
+_LANE_VAULT_RUN = Path(
+    "/srv/fluxlabs/vault/conductor-vault/runs/2026-06-16-434-model-benchmark-optimization.md"
+)
+
+
+def _valid_benchmark_routers() -> set:
+    """The set of router ids the benchmark knows — the apply allowlist."""
+    for path in _BENCHMARK_CANDIDATES:
+        if path and path.is_file():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            return {m.get("router") for m in data.get("models", []) if m.get("router")}
+    return set()
+
+
+def _log_lane_apply_to_vault(lane: str, target: str, primary: str, fallbacks: list) -> None:
+    if not _LANE_VAULT_RUN.parent.is_dir():
+        return
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    line = (
+        f"\n- {ts} · lane **{lane}** ({target}) set via webui → primary `{primary}`"
+        f"; fallbacks: {', '.join(f'`{f}`' for f in fallbacks) or '(none)'}"
+        f" · backup written; mirror to Morgan if this is a process change."
+    )
+    try:
+        with open(_LANE_VAULT_RUN, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError:
+        _log.debug("vault lane-apply log skipped", exc_info=True)
+
+
+@app.get("/api/lane/current")
+def get_lane_current():
+    """Return each benchmark lane's LIVE wiring (primary + fallbacks) from config.
+
+    Reads the real config.yaml / profile configs (not the benchmark snapshot),
+    so the webui "Wired today" box reflects reality and updates after an apply.
+    Read-only; public.
+    """
+    cfg_cache: dict = {}
+
+    def cfg_for(profile):
+        key = profile or ""
+        if key not in cfg_cache:
+            try:
+                with _profile_scope(profile):
+                    cfg_cache[key] = load_config()
+            except Exception:
+                cfg_cache[key] = {}
+        return cfg_cache[key]
+
+    out: dict = {}
+    for lane, (kind, profile, slot) in _LANE_TARGETS.items():
+        if kind == "readonly":
+            out[lane] = {"settable": False, "primary": None, "fallbacks": [], "target": "robin"}
+            continue
+        cfg = cfg_for(profile)
+        primary = None
+        fbs: list = []
+        if kind == "main":
+            mc = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+            primary = mc.get("default") or mc.get("name") or None
+            fbs = [f.get("model") for f in (cfg.get("fallback_providers") or [])
+                   if isinstance(f, dict) and f.get("model")]
+            target = "main" + (f":{profile}" if profile else "")
+        elif kind == "auxiliary":
+            aux = cfg.get("auxiliary") if isinstance(cfg.get("auxiliary"), dict) else {}
+            sc = aux.get(slot) if isinstance(aux.get(slot), dict) else {}
+            primary = sc.get("model") or None
+            if not primary and str(sc.get("provider", "auto") or "auto") in ("auto", ""):
+                primary = "auto"
+            fbs = [f.get("model") for f in (sc.get("fallback_chain") or [])
+                   if isinstance(f, dict) and f.get("model")]
+            target = "auxiliary" + (f":{profile}" if profile else "") + f"/{slot}"
+        elif kind == "delegation":
+            dc = cfg.get("delegation") if isinstance(cfg.get("delegation"), dict) else {}
+            primary = dc.get("model") or None
+            target = "delegation"
+        else:
+            target = kind
+        out[lane] = {"settable": True, "primary": primary, "fallbacks": fbs, "target": target}
+    return {"lanes": out}
+
+
+@app.post("/api/lane/apply")
+async def apply_lane_assignment(body: "LaneApply"):
+    """Write a benchmark lane's primary model + fallback chain to config (live).
+
+    Backs up the target config.yaml first, writes through ``_profile_scope`` so
+    profile lanes land in their own config, then logs to the vault run record.
+    Applies to NEW sessions only. Auth-gated (NOT in PUBLIC_API_PATHS).
+    """
+    lane = (body.lane or "").strip()
+    primary = (body.primary or "").strip()
+    fallbacks = [f.strip() for f in (body.fallbacks or []) if f and f.strip()]
+
+    target = _LANE_TARGETS.get(lane)
+    if not target:
+        raise HTTPException(status_code=400, detail=f"unknown lane '{lane}'")
+    kind, profile, slot = target
+    if kind == "readonly":
+        raise HTTPException(status_code=400, detail=f"lane '{lane}' is read-only: {profile}")
+
+    allow = _valid_benchmark_routers()
+    for rid in [primary, *fallbacks]:
+        if rid not in allow:
+            raise HTTPException(status_code=400, detail=f"model '{rid}' is not a benchmark-known router id")
+
+    def _apply():
+        from hermes_cli.config import get_config_path
+        import shutil
+
+        with _profile_scope(profile):
+            cfg_path = Path(get_config_path())
+            # Timestamped backup before any write.
+            if cfg_path.is_file():
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                shutil.copy2(cfg_path, cfg_path.with_name(cfg_path.name + f".bak-laneset-{ts}"))
+            cfg = load_config()
+            if kind == "main":
+                mc = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+                mc = dict(mc)
+                mc["provider"] = _NINEROUTER_PROVIDER
+                mc["default"] = primary
+                mc.setdefault("base_url", _NINEROUTER_BASE_URL)
+                cfg["model"] = mc
+                cfg["fallback_providers"] = [
+                    {"provider": _NINEROUTER_PROVIDER, "model": f} for f in fallbacks
+                ]
+            elif kind == "auxiliary":
+                aux = cfg.get("auxiliary") if isinstance(cfg.get("auxiliary"), dict) else {}
+                aux = dict(aux)
+                slot_cfg = dict(aux.get(slot) if isinstance(aux.get(slot), dict) else {})
+                slot_cfg["provider"] = _NINEROUTER_PROVIDER
+                slot_cfg["model"] = primary
+                slot_cfg["base_url"] = _NINEROUTER_BASE_URL
+                slot_cfg["fallback_chain"] = [
+                    {"provider": _NINEROUTER_PROVIDER, "model": f, "base_url": _NINEROUTER_BASE_URL}
+                    for f in fallbacks
+                ]
+                aux[slot] = slot_cfg
+                cfg["auxiliary"] = aux
+            elif kind == "delegation":
+                dc = dict(cfg.get("delegation") if isinstance(cfg.get("delegation"), dict) else {})
+                dc["provider"] = _NINEROUTER_PROVIDER
+                dc["model"] = primary
+                dc.setdefault("base_url", _NINEROUTER_BASE_URL)
+                cfg["delegation"] = dc
+            save_config(cfg)
+            return str(cfg_path)
+
+    try:
+        cfg_path = await asyncio.to_thread(_apply)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _log.exception("POST /api/lane/apply failed")
+        raise HTTPException(status_code=500, detail=f"Failed to apply lane assignment: {exc}") from exc
+
+    target_label = f"{kind}" + (f":{profile}" if profile else "") + (f"/{slot}" if slot else "")
+    _log_lane_apply_to_vault(lane, target_label, primary, fallbacks)
+    return {
+        "ok": True, "lane": lane, "target": target_label, "config_path": cfg_path,
+        "primary": primary, "fallbacks": fallbacks,
+        "note": "Applied to new sessions only. Backup written. Mirror to Morgan if this is a process change.",
+    }
 
 
 _EMPTY_MODEL_INFO: dict = {
