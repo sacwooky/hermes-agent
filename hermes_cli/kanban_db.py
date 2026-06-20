@@ -3979,6 +3979,33 @@ class AcceptanceRequiredError(Exception):
         )
 
 
+class QaGateError(Exception):
+    """Raised by ``complete_task`` when the v18 four-level QA gate refuses a
+    completion.
+
+    Two refusal classes (both opt-in per board via
+    ``require_qa_gate_for_done`` in ``board.json``):
+
+    * A *UI story* (``work_item_type='story'`` with ``metadata.ui`` truthy)
+      may only reach ``done`` when it carries a non-empty
+      ``metadata.browser_evidence`` list AND ``metadata.sc_qa_approved`` is
+      boolean ``True`` (enforced via :func:`v18_validators.validate_ui_story_qa`).
+    * A *feature/epic/final* roll-up task may only reach ``done`` when every
+      one of its QA child tasks (``work_item_type='qa'``) is itself ``done``.
+
+    The ``.violations`` attribute holds the human-readable violation strings.
+    Like :class:`AcceptanceRequiredError`, this is a deliberate policy
+    rejection — the task is NOT mutated, so a worker may retry after
+    supplying the missing evidence / completing child QA.
+    """
+
+    def __init__(self, task_id: str, violations: list[str]):
+        self.task_id = task_id
+        self.violations = list(violations)
+        joined = "; ".join(violations) if violations else "QA gate refusal"
+        super().__init__(f"qa-gate: task {task_id} blocked: {joined}")
+
+
 # ---------------------------------------------------------------------------
 # Per-task operator acceptance
 # ---------------------------------------------------------------------------
@@ -4060,6 +4087,110 @@ def _board_requires_acceptance(board: Optional[str] = None) -> bool:
         return False
 
 
+def _board_requires_qa_gate(board: Optional[str] = None) -> bool:
+    """Return ``True`` when the board opts into the v18 four-level QA gate.
+
+    Reads ``require_qa_gate_for_done`` from ``board.json``. Defaults to
+    ``False`` so boards that don't opt in are completely unaffected (the
+    gate is additive and inert until a board enables it).
+    """
+    try:
+        meta = read_board_metadata(board)
+        return bool(meta.get("require_qa_gate_for_done", False))
+    except Exception:
+        return False
+
+
+def _task_meta_for_gate(conn: sqlite3.Connection, task_id: str) -> dict:
+    """Read the Portfolio metadata row for ``task_id`` via *conn*.
+
+    Returns a dict with ``work_item_type`` (str, default ``'unclassified'``)
+    and ``metadata`` (the free-form dict, default ``{}``). Connection-scoped
+    twin of :func:`get_task_metadata` so the QA gate can run inside
+    ``complete_task`` on the same connection without opening a second one.
+    """
+    row = conn.execute(
+        "SELECT work_item_type, metadata_json FROM task_metadata "
+        "WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return {"work_item_type": "unclassified", "metadata": {}}
+    md = _decode_metadata_json(row["metadata_json"])
+    return {
+        "work_item_type": row["work_item_type"] or "unclassified",
+        "metadata": md if isinstance(md, dict) else {},
+    }
+
+
+def _qa_gate_violations(
+    conn: sqlite3.Connection, task_id: str
+) -> list[str]:
+    """Evaluate the v18 four-level QA gate for ``task_id``.
+
+    Returns a list of human-readable violation strings (empty == passes).
+    Two independent checks:
+
+    1. **UI story evidence** — when the task is a ``story`` whose
+       ``metadata.ui`` is truthy, delegate to
+       :func:`v18_validators.validate_ui_story_qa` (with ``status='done'``
+       forced, since this runs at the done transition). It requires a
+       non-empty ``browser_evidence`` list and ``sc_qa_approved is True``.
+    2. **Roll-up child QA** — when the task is a ``feature``/``epic``/``final``
+       roll-up, every child task classified as ``qa`` must already be
+       ``done``. A roll-up with no QA child is not blocked by this check
+       (the UI-story check is what forces QA to exist on UI work).
+
+    Pure read-path: no mutation, no event emission.
+    """
+    # Local import keeps kanban_db free of a module-load dependency on the
+    # validators and avoids any import cycle; the cost is one import per
+    # gated completion, which is negligible.
+    from hermes_cli.v18_validators import validate_ui_story_qa
+
+    info = _task_meta_for_gate(conn, task_id)
+    wtype = info["work_item_type"]
+    md = info["metadata"]
+    violations: list[str] = []
+
+    # ---- (1) UI story evidence ----
+    if wtype == "story" and bool(md.get("ui")):
+        story_view = {
+            "id": task_id,
+            "status": "done",
+            "metadata": md,
+        }
+        violations.extend(validate_ui_story_qa(story_view))
+
+    # ---- (2) roll-up child QA must be done ----
+    # QA tasks relate to a feature/epic/final roll-up via task_links. The link
+    # direction depends on how the board models the gate:
+    #   * QA-as-dependency (parent): the roll-up cannot dispatch until QA is
+    #     done — QA shows up in ``parent_ids``.
+    #   * QA-as-child (the card's "child QA" wording): QA hangs off the
+    #     roll-up and shows up in ``child_ids``.
+    # Check BOTH directions so the completion gate is correct regardless of
+    # which representation the decomposer used; a roll-up with no related QA
+    # task is not blocked by this check.
+    if wtype in ("feature", "epic", "final"):
+        related = set(child_ids(conn, task_id)) | set(parent_ids(conn, task_id))
+        for related_id in sorted(related):
+            related_info = _task_meta_for_gate(conn, related_id)
+            if related_info["work_item_type"] != "qa":
+                continue
+            crow = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (related_id,)
+            ).fetchone()
+            related_status = crow["status"] if crow else None
+            if related_status != "done":
+                violations.append(
+                    f"Task {task_id}: {wtype} cannot complete — QA child "
+                    f"{related_id} status='{related_status}' (not done)"
+                )
+
+    return violations
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4115,6 +4246,28 @@ def complete_task(
     # going to be allowed.
     if _board_requires_acceptance(board) and not _has_task_acceptance(conn, task_id):
         raise AcceptanceRequiredError(task_id)
+
+    # ── v18 four-level QA gate ──
+    # Opt-in per board. A UI story needs browser evidence + SC-QA approval,
+    # and a feature/epic/final roll-up needs all its QA children done, before
+    # it may transition to ``done``. Runs before any state mutation so a
+    # refusal leaves the task untouched and retryable. Fails OPEN on an
+    # internal error so a gate bug can never wedge the dispatcher.
+    if _board_requires_qa_gate(board):
+        try:
+            qa_violations = _qa_gate_violations(conn, task_id)
+        except Exception:  # pragma: no cover - defensive fail-open
+            _log.exception("qa-gate evaluation failed for %s; allowing", task_id)
+            qa_violations = []
+        if qa_violations:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "completion_blocked_qa_gate",
+                    {"violations": qa_violations[:20]},
+                )
+            raise QaGateError(task_id, qa_violations)
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a

@@ -484,6 +484,46 @@ def record_review_verdict(
                 "verdict": verdict,
                 "reason": "awaiting_operator_acceptance",
             }
+        except kb.QaGateError as qa_err:
+            # v18 QA gate refused this auto-completion (e.g. a roll-up whose
+            # QA children aren't all done). Don't crash the autonomy loop or
+            # lose the signed verdict — park the task blocked with the gate
+            # detail on record so the operator/flow-manager can resolve it.
+            detail = "; ".join(qa_err.violations) or "QA evidence missing"
+            with kb.write_txn(conn):
+                now = int(time.time())
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        task_id,
+                        "robin-review",
+                        f"REVIEW PASS ({model_lane or 'robin'}) — signed verdict, "
+                        f"but v18 QA gate blocked auto-completion: {detail}.\n"
+                        f"{summary}",
+                        now,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL "
+                    "WHERE id = ?",
+                    (task_id,),
+                )
+                kb._append_event(
+                    conn,
+                    task_id,
+                    "blocked",
+                    {
+                        "reason": f"qa-gate: {detail}",
+                        "verdict": "pass",
+                    },
+                )
+            return {
+                "ok": True,
+                "verdict": verdict,
+                "reason": "qa_gate_blocked",
+            }
         return {"ok": True, "verdict": verdict, "reason": None}
 
     # verdict == "block": findings go back to the builder lane.

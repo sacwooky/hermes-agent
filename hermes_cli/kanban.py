@@ -1958,6 +1958,16 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 continue
+            except kb.QaGateError as qa_err:
+                failed.append(tid)
+                detail = "; ".join(qa_err.violations) or "QA evidence missing"
+                print(
+                    f"qa-gate: {tid} blocked — {detail}. Supply browser "
+                    f"evidence + SC-QA approval (UI story) or complete all QA "
+                    f"children (feature/epic/final) before marking done.",
+                    file=sys.stderr,
+                )
+                continue
             if not ok:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)

@@ -4763,3 +4763,138 @@ def test_board_without_acceptance_gate_allows_complete(kanban_home):
 def test_board_requires_acceptance_returns_false_by_default(kanban_home):
     """_board_requires_acceptance defaults to False."""
     assert kb._board_requires_acceptance(None) is False
+
+
+# ---------------------------------------------------------------------------
+# v18 four-level QA gate wiring (complete_task)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def qa_gate_board(kanban_home, monkeypatch):
+    """Board with ``require_qa_gate_for_done`` enabled."""
+    board_slug = "qa-gate-test"
+    board_dir = kb.board_dir(board_slug)
+    board_dir.mkdir(parents=True, exist_ok=True)
+    (board_dir / "board.json").write_text(json.dumps({
+        "slug": board_slug,
+        "name": "QA Gate Test",
+        "require_qa_gate_for_done": True,
+    }), encoding="utf-8")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board_slug)
+    kb.init_db()
+    return board_slug
+
+
+def test_board_requires_qa_gate_default_false(kanban_home):
+    """_board_requires_qa_gate defaults to False (gate inert by default)."""
+    assert kb._board_requires_qa_gate(None) is False
+
+
+def test_ui_story_blocked_without_evidence(qa_gate_board):
+    """A UI story cannot reach done without browser_evidence + sc_qa_approved."""
+    with kb.connect(board=qa_gate_board) as conn:
+        tid = kb.create_task(conn, title="S1-F1-E1 — render cart")
+        kb.claim_task(conn, tid, claimer="w", ttl_seconds=300)
+    kb.upsert_task_metadata(
+        tid, work_item_type="story", metadata={"ui": True},
+    )
+    with pytest.raises(kb.QaGateError, match="qa-gate"):
+        with kb.connect(board=qa_gate_board) as conn:
+            kb.complete_task(conn, tid, summary="done", board=qa_gate_board)
+    with kb.connect(board=qa_gate_board) as conn:
+        task = kb.get_task(conn, tid)
+        # Task must NOT be done; an audit event must be recorded.
+        assert task is not None and task.status != "done"
+        ev = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND "
+            "kind = 'completion_blocked_qa_gate' LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert ev is not None
+
+
+def test_ui_story_allowed_with_full_evidence(qa_gate_board):
+    """A UI story with evidence + SC-QA approval completes normally."""
+    with kb.connect(board=qa_gate_board) as conn:
+        tid = kb.create_task(conn, title="S1-F1-E1 — render cart")
+        kb.claim_task(conn, tid, claimer="w", ttl_seconds=300)
+    kb.upsert_task_metadata(
+        tid,
+        work_item_type="story",
+        metadata={
+            "ui": True,
+            "browser_evidence": ["screenshot-desktop.png"],
+            "sc_qa_approved": True,
+        },
+    )
+    with kb.connect(board=qa_gate_board) as conn:
+        ok = kb.complete_task(conn, tid, summary="shipped", board=qa_gate_board)
+    assert ok is True
+    with kb.connect(board=qa_gate_board) as conn:
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_non_ui_story_unaffected_by_qa_gate(qa_gate_board):
+    """A non-UI story (no ui flag) is not gated."""
+    with kb.connect(board=qa_gate_board) as conn:
+        tid = kb.create_task(conn, title="S1-F1-E1 — backend wiring")
+        kb.claim_task(conn, tid, claimer="w", ttl_seconds=300)
+    kb.upsert_task_metadata(tid, work_item_type="story", metadata={"ui": False})
+    with kb.connect(board=qa_gate_board) as conn:
+        ok = kb.complete_task(conn, tid, summary="done", board=qa_gate_board)
+    assert ok is True
+    with kb.connect(board=qa_gate_board) as conn:
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_feature_rollup_blocked_until_qa_child_done(qa_gate_board):
+    """A feature roll-up cannot complete while its related QA task is not done."""
+    with kb.connect(board=qa_gate_board) as conn:
+        qa_child = kb.create_task(conn, title="QA: checkout")
+        feature = kb.create_task(conn, title="F1-E1 — checkout feature")
+        # QA is the dependency (parent); feature waits on it. The completion
+        # gate must also refuse the feature's done transition until QA is done.
+        kb.link_tasks(conn, qa_child, feature)
+        kb.claim_task(conn, feature, claimer="w", ttl_seconds=300)
+    kb.upsert_task_metadata(feature, work_item_type="feature")
+    kb.upsert_task_metadata(qa_child, work_item_type="qa")
+    # QA still not done → feature blocked.
+    with pytest.raises(kb.QaGateError, match="QA child"):
+        with kb.connect(board=qa_gate_board) as conn:
+            kb.complete_task(conn, feature, summary="done", board=qa_gate_board)
+    with kb.connect(board=qa_gate_board) as conn:
+        assert kb.get_task(conn, feature).status != "done"
+
+
+def test_feature_rollup_allowed_when_qa_child_done(qa_gate_board):
+    """A feature roll-up completes once its related QA task is done."""
+    with kb.connect(board=qa_gate_board) as conn:
+        qa_child = kb.create_task(conn, title="QA: checkout")
+        feature = kb.create_task(conn, title="F1-E1 — checkout feature")
+        kb.link_tasks(conn, qa_child, feature)
+        kb.claim_task(conn, qa_child, claimer="w", ttl_seconds=300)
+    kb.upsert_task_metadata(feature, work_item_type="feature")
+    kb.upsert_task_metadata(qa_child, work_item_type="qa")
+    # Complete the QA task first; its done state promotes the feature to ready.
+    with kb.connect(board=qa_gate_board) as conn:
+        kb.complete_task(conn, qa_child, summary="qa pass", board=qa_gate_board)
+    # Now the feature roll-up may complete (it is now 'ready').
+    with kb.connect(board=qa_gate_board) as conn:
+        ok = kb.complete_task(conn, feature, summary="done", board=qa_gate_board)
+    assert ok is True
+    with kb.connect(board=qa_gate_board) as conn:
+        assert kb.get_task(conn, feature).status == "done"
+
+
+def test_qa_gate_inert_on_non_optin_board(kanban_home):
+    """Without require_qa_gate_for_done a UI story completes with no evidence."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="S1-F1-E1 — render cart")
+        kb.claim_task(conn, tid, claimer="w", ttl_seconds=300)
+    kb.upsert_task_metadata(tid, work_item_type="story", metadata={"ui": True})
+    with kb.connect() as conn:
+        ok = kb.complete_task(conn, tid, summary="done")
+    assert ok is True
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"

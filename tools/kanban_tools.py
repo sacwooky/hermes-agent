@@ -589,6 +589,20 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"Accept action) first. Write evidence as a comment and "
                     f"block with reason='acceptance-required: ...' instead."
                 )
+            except kb.QaGateError as qa_err:
+                # v18 QA gate refusal — the task is NOT mutated (the gate runs
+                # before the write txn), so the worker can retry after the
+                # missing evidence / child QA lands. Spell out the recovery so
+                # the model retries instead of treating this as terminal.
+                detail = "; ".join(qa_err.violations) or "QA evidence missing"
+                return tool_error(
+                    f"qa-gate: {tid} blocked — {detail}. "
+                    f"Your task is still in-flight (no state change). For a UI "
+                    f"story, supply metadata.browser_evidence (non-empty list) "
+                    f"and metadata.sc_qa_approved=True; for a feature/epic/final "
+                    f"roll-up, ensure every QA child task is done first, then "
+                    f"retry kanban_complete."
+                )
             if not ok:
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"

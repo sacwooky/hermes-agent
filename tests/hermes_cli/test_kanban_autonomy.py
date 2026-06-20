@@ -352,7 +352,7 @@ def test_unintegrated_sweep_creates_integrate_task(kanban_home, git_repo):
         )
         kb.complete_task(conn, tid, result="done on worktree")
         created = ka.find_unintegrated_done_tasks(
-            conn, integration_branch="integration"
+            conn, integration_branch="integration", require_review=False
         )
         assert len(created) == 1
         integ = kb.get_task(conn, created[0])
@@ -361,7 +361,7 @@ def test_unintegrated_sweep_creates_integrate_task(kanban_home, git_repo):
         assert kb.get_task_metadata(created[0])["work_item_type"] == "integrate"
         # Dedup on second sweep.
         assert ka.find_unintegrated_done_tasks(
-            conn, integration_branch="integration"
+            conn, integration_branch="integration", require_review=False
         ) == []
 
 
