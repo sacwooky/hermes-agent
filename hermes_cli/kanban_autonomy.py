@@ -38,8 +38,10 @@ import hmac
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -409,6 +411,7 @@ def record_review_verdict(
                 "run_record": run_record,
                 "fetched_via": fetched_via,
                 "signature_prefix": signature[:16],
+                "signature": signature,  # full HMAC -> exact dedup (verdict courier)
                 # Phase 6: carry the Fusion run id + confidence so LoopState.fusion_run_id
                 # populates and the G3 packet can surface real confidence×risk.
                 "fusion_run_id": fusion_run_id,
@@ -2266,6 +2269,161 @@ def find_unintegrated_done_tasks(
 # ---------------------------------------------------------------------------
 
 
+# --- In-loop Robin verdict courier -----------------------------------------
+# Records Robin's signed review verdicts automatically so a task leaves the
+# review phase without a human running record-robin-verdict.sh by hand. This is
+# the PRODUCER of the ``verdict_recorded`` event that review_loop already
+# consumes. Out-of-band + HMAC integrity is enforced downstream by
+# record_review_verdict; this sweep only discovers WHICH signed verdicts are
+# pending on Robin and feeds them in. Fail-open: an unreachable Robin just
+# leaves the verdicts queued for a later tick (never crashes the tick).
+
+_ROBIN_VERDICT_DIR = "~/.hermes/verdicts"
+
+
+def _host_verdict_key_path() -> str:
+    """Absolute path to the shared Robin verdict key on the HOST home.
+
+    Worker profiles run with HOME=<host>/.hermes/profiles/<p>/home where the key
+    is absent; strip that suffix so verification uses the real host key.
+    """
+    home = os.path.expanduser("~")
+    marker = "/.hermes/profiles/"
+    if marker in home:
+        home = home.split(marker, 1)[0]
+    return os.path.join(home, ".hermes", "credentials", "robin-verdict-key")
+
+
+def _robin_list_verdict_files(robin_ssh: str, *, timeout: int = 20) -> dict:
+    """Map task_id -> newest signed-verdict path on Robin (out-of-band).
+
+    Returns {} on any ssh failure so an unreachable Robin never breaks the tick.
+    """
+    try:
+        proc = subprocess.run(
+            ["ssh", robin_ssh, "ls -t %s/*.json 2>/dev/null" % _ROBIN_VERDICT_DIR],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except Exception:
+        _log.warning("verdict_courier: cannot reach %s to list verdicts (queued)", robin_ssh)
+        return {}
+    newest: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        path = line.strip()
+        if not path:
+            continue
+        base = path.rsplit("/", 1)[-1]
+        tid = base.split("__", 1)[0]  # <task_id>__<commit>__<ts>.json
+        if tid and tid not in newest:  # ls -t: first occurrence is newest
+            newest[tid] = path
+    return newest
+
+
+def _verdict_already_recorded(conn: sqlite3.Connection, task_id: str, signature: str) -> bool:
+    """True if a verdict_recorded event for this task already carries this verdict.
+
+    Matches on the FULL HMAC signature (record_review_verdict stores it on the
+    event). Falls back to the 16-char ``signature_prefix`` only for legacy events
+    written before the full signature was stored; the prefix is never used when a
+    full signature is present, so two distinct signatures sharing a 16-char prefix
+    are never conflated.
+    """
+    sig = signature or ""
+    sig16 = sig[:16]
+    for row in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'verdict_recorded'",
+        (task_id,),
+    ).fetchall():
+        try:
+            ev = json.loads(row["payload"]) or {}
+        except Exception:
+            continue
+        stored = ev.get("signature")
+        if stored:
+            if stored == sig:
+                return True
+        elif ev.get("signature_prefix") == sig16:
+            return True
+    return False
+
+
+def sweep_pending_robin_verdicts(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    robin_ssh: str = "robin",
+    key_path: Optional[str] = None,
+) -> dict:
+    """Record signed Robin verdicts pending on Robin's host (in-loop courier).
+
+    For each task on this board with a fresh signed verdict on Robin and no
+    matching ``verdict_recorded`` event, fetch it out-of-band and honor it via
+    :func:`record_review_verdict` (which re-verifies channel + HMAC + task match,
+    then transitions the card). Idempotent (deduped by signature) and fail-open.
+
+    Board scoping: ``conn`` is the per-board kanban DB (kanban_db.connect opens
+    one DB per board; there is no cross-board ``tasks`` table), so a verdict for
+    a task on another board is simply absent from this connection and is never
+    recorded here. ``board`` is forwarded to record_review_verdict for the record.
+    """
+    pending = _robin_list_verdict_files(robin_ssh)
+    if not pending:
+        return {"recorded": [], "rejected": [], "seen": 0}
+    # Candidates = Robin verdict task_ids present in THIS board's DB. conn is
+    # board-scoped (one DB per board; tasks has no board column), so the
+    # IN-filter against this connection scopes candidates to the current board
+    # -- same per-board-conn model as sweep_acceptance_tasks.
+    placeholders = ",".join("?" * len(pending))
+    on_board = {
+        r["id"]
+        for r in conn.execute(
+            "SELECT id FROM tasks WHERE id IN (%s)" % placeholders, tuple(pending)
+        ).fetchall()
+    }
+    key_path = key_path or _host_verdict_key_path()
+    recorded: list[str] = []
+    rejected: list[str] = []
+    for tid in on_board:
+        tmp = None
+        try:
+            tmp = tempfile.mkdtemp(prefix="verdict-courier-")
+            local = os.path.join(tmp, "verdict.json")
+            scp = subprocess.run(
+                ["scp", "-q", "%s:%s" % (robin_ssh, pending[tid]), local],
+                capture_output=True, text=True, timeout=30,
+            )
+            if scp.returncode != 0 or not os.path.exists(local):
+                _log.warning("verdict_courier: scp failed for %s (queued)", tid)
+                continue
+            with open(local, encoding="utf-8") as fh:
+                signed = json.load(fh)
+            payload = signed.get("payload") or {}
+            signature = str(signed.get("signature") or "").strip()
+            if not payload or not signature:
+                continue
+            if _verdict_already_recorded(conn, tid, signature):
+                continue
+            payload_json = json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            )
+            res = record_review_verdict(
+                conn, tid, payload_json, signature,
+                fetched_via="robin-ssh", key_path=key_path, board=board,
+            )
+            if res.get("ok"):
+                recorded.append(tid)
+            else:
+                rejected.append("%s: %s" % (tid, res.get("reason")))
+        except Exception:
+            _log.exception("verdict_courier: failed honoring verdict for %s", tid)
+        finally:
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+    if recorded or rejected:
+        _log.info("verdict_courier: recorded=%s rejected=%s", recorded, rejected)
+    return {"recorded": recorded, "rejected": rejected, "seen": len(on_board)}
+
+
 def run_autonomy_tick(
     conn: sqlite3.Connection,
     *,
@@ -2288,6 +2446,9 @@ def run_autonomy_tick(
             enabled: true
             branch: integration
             assignee: integrator
+          verdict_courier:
+            enabled: true
+            robin_ssh: robin
 
     Every sweep is individually guarded; a failure in one never stops
     the others or the dispatcher tick (same isolation philosophy as the
@@ -2325,4 +2486,16 @@ def run_autonomy_tick(
             )
         except Exception:
             _log.exception("autonomy: find_unintegrated_done_tasks failed")
+    vc_cfg = cfg.get("verdict_courier") or {}
+    if vc_cfg.get("enabled"):
+        try:
+            out["verdict_courier"] = sweep_pending_robin_verdicts(
+                conn,
+                board=board,
+                robin_ssh=str(vc_cfg.get("robin_ssh") or "robin"),
+                key_path=vc_cfg.get("key_path") or None,
+            )
+        except Exception:
+            _log.exception("autonomy: sweep_pending_robin_verdicts failed")
+
     return out
