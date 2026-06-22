@@ -163,6 +163,22 @@ class TestResolveProvider:
     def test_explicit_zai(self):
         assert resolve_provider("zai") == "zai"
 
+    def test_bare_custom(self):
+        # The bare "custom" form has always resolved to the generic custom
+        # auth class.
+        assert resolve_provider("custom") == "custom"
+
+    def test_named_custom_provider(self):
+        # Regression: a canonical "custom:<name>" provider string (declared in
+        # config.yaml custom_providers:, e.g. the 9router proxy) must resolve to
+        # the generic "custom" auth class, NOT raise AuthError("Unknown
+        # provider"). Workers boot with model.provider="custom:9router-codex";
+        # a fatal raise here aborts the spawn. See kanban t_adb1ac07.
+        assert resolve_provider("custom:9router-codex") == "custom"
+        assert resolve_provider("custom:9router-openrouter") == "custom"
+        # Case-insensitive (resolve_provider lowercases input).
+        assert resolve_provider("Custom:9Router-Codex") == "custom"
+
     def test_explicit_kimi_coding(self):
         assert resolve_provider("kimi-coding") == "kimi-coding"
 

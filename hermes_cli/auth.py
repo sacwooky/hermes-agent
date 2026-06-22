@@ -1559,6 +1559,16 @@ def resolve_provider(
         return "openrouter"
     if normalized == "custom":
         return "custom"
+    # Named custom providers — the canonical "custom:<name>" form declared in
+    # config.yaml's ``custom_providers:`` (e.g. "custom:9router-codex"). These
+    # all share the generic ``custom`` auth class (api_key via the entry's
+    # key_env); the named slug + base_url is carried separately by
+    # ``runtime_provider``. Resolving the auth class to "custom" mirrors the
+    # bare-"custom" branch above and prevents a fatal "Unknown provider" when a
+    # caller resolves the configured provider string directly. See
+    # tests/hermes_cli/test_api_key_providers.py::test_named_custom_provider.
+    if normalized.startswith("custom:"):
+        return "custom"
     if normalized in PROVIDER_REGISTRY:
         return normalized
     if normalized != "auto":
