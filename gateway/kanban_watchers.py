@@ -26,6 +26,81 @@ logger = logging.getLogger("gateway.run")
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
+    def _track_background_task(self, task: "asyncio.Task") -> "asyncio.Task":
+        """Retain a strong reference to a background task so it cannot be
+        garbage-collected mid-flight.
+
+        ``asyncio.create_task`` only stores a *weak* reference in the event
+        loop, so a fire-and-forget task whose handle is discarded can be
+        collected at any ``await`` point and vanish silently — no exception,
+        no log (CPython docs, ``asyncio.create_task`` "Important" note). The
+        gateway's long-lived watcher loops MUST be retained or they die at
+        their first suspension point. ``self._background_tasks`` is the
+        canonical retention set (created in ``__init__`` and cancelled on
+        ``stop()``); register the task there and drop the reference when it
+        finishes.
+        """
+        tasks = getattr(self, "_background_tasks", None)
+        if tasks is None:  # defensive — __init__ always creates the set
+            tasks = set()
+            self._background_tasks = tasks
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return task
+
+    async def _supervised_watcher(
+        self,
+        factory: "Any",
+        *,
+        name: str,
+        restart_delay: float = 5.0,
+    ) -> None:
+        """Run a watcher coroutine and auto-restart it if it ever exits.
+
+        ``factory`` is a zero-arg callable returning a fresh coroutine for the
+        watcher (e.g. ``self._kanban_dispatcher_watcher``). A correctly
+        written watcher loops forever until ``self._running`` flips False, so
+        any *return* or *exception* while the gateway is still running is a
+        bug — the loop silently stopped iterating, which is exactly the
+        failure this guards against. We log it loudly and respawn after a
+        short backoff so the dispatcher CANNOT silently die for the life of
+        the gateway.
+
+        Clean shutdown is honoured: a ``CancelledError`` (gateway ``stop()``
+        cancels ``_background_tasks``) or ``self._running`` being False ends
+        supervision without a restart.
+        """
+        while getattr(self, "_running", False):
+            try:
+                await factory()
+            except asyncio.CancelledError:
+                logger.debug("%s supervisor: cancelled", name)
+                raise
+            except Exception:
+                logger.exception(
+                    "%s supervisor: watcher raised; restarting in %.0fs",
+                    name,
+                    restart_delay,
+                )
+            else:
+                # The watcher returned. If we're shutting down that's
+                # expected; otherwise it stopped iterating and must be
+                # respawned so automation doesn't silently stall.
+                if not getattr(self, "_running", False):
+                    break
+                logger.error(
+                    "%s supervisor: watcher loop exited while gateway is "
+                    "running (silent stall) — restarting in %.0fs",
+                    name,
+                    restart_delay,
+                )
+            # Backoff in 1s slices so a shutdown mid-backoff is snappy.
+            slept = 0.0
+            while slept < restart_delay and getattr(self, "_running", False):
+                await asyncio.sleep(min(1.0, restart_delay - slept))
+                slept += 1.0
+        logger.debug("%s supervisor: stopped (gateway no longer running)", name)
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
@@ -1033,7 +1108,23 @@ class GatewayKanbanWatchersMixin:
         logger.info(
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
         )
+        tick_count = 0
+        last_heartbeat_at = 0.0
         while self._running:
+            tick_count += 1
+            # Per-tick heartbeat so a wedged/dead dispatcher is observable in
+            # the logs (the original silent-stall bug logged the "embedded"
+            # line once and then went quiet forever). Throttled to at most
+            # once every ~5 min on a busy/short interval so an idle gateway
+            # stays readable, but always fires on the first tick.
+            now_hb = time.monotonic()
+            if tick_count == 1 or (now_hb - last_heartbeat_at) >= 300.0:
+                logger.info(
+                    "kanban dispatcher: heartbeat (tick=%d, interval=%.1fs)",
+                    tick_count,
+                    interval,
+                )
+                last_heartbeat_at = now_hb
             try:
                 # Reap zombie children before per-board work so a board DB
                 # failure cannot block cleanup of unrelated workers.

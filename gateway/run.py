@@ -5478,24 +5478,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.error("Recovered watcher setup error: %s", e)
 
         # Start background session expiry watcher to finalize expired sessions
-        asyncio.create_task(self._session_expiry_watcher())
+        self._track_background_task(asyncio.create_task(self._session_expiry_watcher()))
 
         # Start background kanban notifier — delivers `completed`, `blocked`,
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
         # so human-in-the-loop workflows hear back without polling.
-        asyncio.create_task(self._kanban_notifier_watcher())
+        self._track_background_task(asyncio.create_task(self._kanban_notifier_watcher()))
 
         # Start background kanban dispatcher — spawns workers for ready
         # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
         # When false, users run `hermes kanban daemon` externally or
         # simply don't use kanban; this loop becomes a no-op.
-        asyncio.create_task(self._kanban_dispatcher_watcher())
+        #
+        # Wrapped in a supervisor + retained in _background_tasks: the bare
+        # `asyncio.create_task(...)` form (handle discarded) let the event
+        # loop's *weak* task reference get garbage-collected at the first
+        # await, silently killing the dispatcher right after its "embedded in
+        # gateway" log (restart-proof stall, 2026-06-22). Retaining the handle
+        # fixes the GC death; the supervisor additionally respawns the loop if
+        # it ever exits for any other reason, so the dispatcher cannot
+        # silently die for the life of the gateway.
+        self._track_background_task(
+            asyncio.create_task(
+                self._supervised_watcher(
+                    self._kanban_dispatcher_watcher,
+                    name="kanban dispatcher",
+                )
+            )
+        )
 
         # Start background kanban escalation watcher — three-gate autonomy's
         # "nothing waits silently" guarantee: blocked tasks, stuck review
         # queues, and epic-acceptance pings reach the operator as one-line
         # decision asks. Gated by `kanban.escalation.enabled` (default off).
-        asyncio.create_task(self._kanban_escalation_watcher())
+        self._track_background_task(asyncio.create_task(self._kanban_escalation_watcher()))
 
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
@@ -5504,19 +5520,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 len(self._failed_platforms),
                 ", ".join(p.value for p in self._failed_platforms),
             )
-        asyncio.create_task(self._platform_reconnect_watcher())
+        self._track_background_task(asyncio.create_task(self._platform_reconnect_watcher()))
 
         # Start background handoff watcher — picks up CLI sessions marked
         # handoff_state='pending' in state.db and re-binds them to the
         # destination platform's home channel, then forges a synthetic user
         # turn so the agent kicks off the new chat.
-        asyncio.create_task(self._handoff_watcher())
+        self._track_background_task(asyncio.create_task(self._handoff_watcher()))
 
         # Start background async-delegation watcher — drains completion events
         # from delegate_task(background=true) subagents and injects each
         # result back into its originating session as a new turn, covering the
         # idle case where the subagent finishes with no agent turn running.
-        asyncio.create_task(self._async_delegation_watcher())
+        self._track_background_task(asyncio.create_task(self._async_delegation_watcher()))
 
         logger.info("Press Ctrl+C to stop")
         
@@ -14965,7 +14981,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # explaining that no response arrived (so the agent can adapt
             # rather than hang forever).
             # ------------------------------------------------------------------
-            def _clarify_callback_sync(question: str, choices) -> str:
+            def _clarify_callback_sync(question: str, choices, gate: bool = False) -> str:
                 from tools import clarify_gateway as _clarify_mod
                 import uuid as _uuid
 
@@ -15020,10 +15036,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _clarify_mod.clear_session(session_key or "")
                     return "[clarify prompt could not be delivered]"
 
-                timeout = _clarify_mod.get_clarify_timeout()
+                # Gate questions (intake/wireframe/build/delivery sign-off) must
+                # NOT auto-proceed: wait on the long gate bound and, even if it
+                # is hit, tell the agent to hold and re-ask — never fabricate a
+                # default. Non-gate questions keep the short auto-proceed bound.
+                if gate:
+                    timeout = _clarify_mod.get_clarify_gate_timeout()
+                else:
+                    timeout = _clarify_mod.get_clarify_timeout()
                 response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
                 if response is None or response == "":
                     # Timeout or session-boundary cancellation
+                    if gate:
+                        return (
+                            "The user has not answered this GATE question yet. "
+                            "Treat this silence as 'still blocked', NEVER as approval "
+                            "or a chosen default. Do NOT proceed on assumptions, do NOT "
+                            "fabricate a default, and do NOT advance to the next phase. "
+                            "Re-ask the question (re-issue the clarify with gate=true) "
+                            "and keep waiting for an explicit answer."
+                        )
                     return f"[user did not respond within {int(timeout / 60)}m]"
                 return response
 
