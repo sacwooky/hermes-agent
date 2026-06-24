@@ -255,8 +255,16 @@ def record_review_verdict(
     key_path: Optional[str] = None,
     vault_root: Optional[str] = None,
     board: Optional[str] = None,
+    expected_review_type: Optional[str] = None,
 ) -> dict:
     """Honor a signed Robin review verdict — the ONLY path out of review.
+
+    ``expected_review_type`` is set by the SC-gate dispatch (WIREFRAME-SC /
+    PRD-SC) to make the Supreme Court contract REQUIRED rather than opt-in: when
+    set, a verdict with no/unrecognized ``review_type`` is rejected outright
+    (closing the run-557 leak where hollow freeform-chat PASSes carried no
+    ``review_type`` and bypassed the contract). Left ``None`` (code review /
+    legacy) the behaviour is unchanged.
 
     Verification ladder (all must pass, in order):
       1. ``fetched_via`` is an out-of-band channel (``robin-api`` /
@@ -332,6 +340,24 @@ def record_review_verdict(
     # requeue, the same posture R8 uses for a lane-less PASS. Legacy/fusion
     # verdicts (no review_type) skip this and rely on the existing R8 check.
     sc_review_type = _normalize_review_type(payload.get("review_type"))
+    # SC-gate dispatch sets ``expected_review_type`` ⇒ the contract is REQUIRED,
+    # not opt-in: a verdict with no/unrecognized review_type cannot clear an SC
+    # gate. This is the in-recorder half of the run-557 fix (the dispatch must
+    # also route through the deterministic, review_type-stamping path — see
+    # review_loop/sc_review.py).
+    if expected_review_type is not None:
+        exp = _normalize_review_type(expected_review_type)
+        if sc_review_type is None:
+            return _reject(
+                f"SC gate verdict is missing or has an unrecognized review_type "
+                f"(expected {expected_review_type!r}); a verdict without a "
+                f"recognized review_type cannot clear an SC gate (fail-closed, requeue)"
+            )
+        if exp is not None and sc_review_type != exp:
+            return _reject(
+                f"SC gate verdict review_type={sc_review_type!r} does not match the "
+                f"expected {exp!r} for this gate (fail-closed, requeue)"
+            )
     if sc_review_type is not None:
         violation = enforce_supreme_court_contract(payload, sc_review_type)
         if violation:

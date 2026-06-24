@@ -756,6 +756,48 @@ def test_sc_unrecognized_review_type_is_not_enforced(
         assert out["ok"] is True and out["verdict"] == "pass"
 
 
+def _sc_record_expecting(conn, tid, payload, verdict_key, vault, expected, fetched_via="robin-ssh"):
+    sig = ka.sign_verdict_payload(payload.encode(), key_path=verdict_key)
+    return ka.record_review_verdict(
+        conn, tid, payload, sig, fetched_via=fetched_via,
+        key_path=verdict_key, vault_root=str(vault),
+        expected_review_type=expected,
+    )
+
+
+def test_sc_gate_rejects_verdict_missing_review_type(kanban_home, verdict_key, vault):
+    """557 fix: with expected_review_type set, a verdict carrying NO review_type
+    cannot clear an SC gate (the hollow freeform-chat PASS class)."""
+    with kb.connect() as conn:
+        tid = _mk_review_task(conn)
+        payload = _payload(tid, verdict="pass")  # legacy-shaped, no review_type
+        out = _sc_record_expecting(conn, tid, payload, verdict_key, vault, "wireframe")
+        assert out["ok"] is False
+        assert "review_type" in (out.get("reason") or "")
+        assert kb.get_task(conn, tid).status != "done"
+
+
+def test_sc_gate_rejects_review_type_mismatch(kanban_home, verdict_key, vault):
+    """A verdict whose review_type is not the gate's type is rejected."""
+    with kb.connect() as conn:
+        tid = _mk_review_task(conn)
+        payload = _sc_payload(tid, review_type="prd")  # conforming, but wrong type
+        out = _sc_record_expecting(conn, tid, payload, verdict_key, vault, "wireframe")
+        assert out["ok"] is False
+        reason = out.get("reason") or ""
+        assert "prd" in reason and "wireframe" in reason
+
+
+def test_sc_gate_accepts_matching_conforming_verdict(kanban_home, verdict_key, vault):
+    """A conforming wireframe verdict at a wireframe gate still passes."""
+    with kb.connect() as conn:
+        tid = _mk_review_task(conn)
+        payload = _sc_payload(tid, review_type="wireframe")
+        out = _sc_record_expecting(conn, tid, payload, verdict_key, vault, "wireframe")
+        assert out == {"ok": True, "verdict": "pass", "reason": None}
+        assert kb.get_task(conn, tid).status == "done"
+
+
 def test_enforce_supreme_court_contract_unit():
     """Direct unit coverage of the pure validator (no DB)."""
     good = {

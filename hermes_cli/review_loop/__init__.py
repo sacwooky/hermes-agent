@@ -17,6 +17,15 @@ from hermes_cli.review_loop.l0_gate import (
     L0Result,
     run_l0_gate,
 )
+from hermes_cli.review_loop.sc_review import (
+    SC_DISPATCH_TYPES,
+    build_sc_messages,
+    build_sc_review_payload,
+    parse_sc_reply,
+    render_prd_evidence,
+    render_wireframe_evidence,
+    review_sc,
+)
 from hermes_cli.review_loop.state import (
     LoopState,
     compute_loop_state,
@@ -32,6 +41,14 @@ __all__ = [
     "compute_loop_state",
     "LoopState",
     "human_surfaces",
+    # SC-gate deterministic dispatch builder (run-557 fix)
+    "SC_DISPATCH_TYPES",
+    "render_wireframe_evidence",
+    "render_prd_evidence",
+    "build_sc_messages",
+    "parse_sc_reply",
+    "build_sc_review_payload",
+    "review_sc",
 ]
 
 
