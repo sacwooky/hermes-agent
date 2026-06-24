@@ -224,3 +224,56 @@ class TestGatewayTextIntercept:
         
         # Clean up
         cm.clear_session("sk-tf")
+
+
+# ---------------------------------------------------------------------------
+# Gate-clarify behavior (run 2026-06-21-551): gate questions must never
+# auto-proceed; the `gate` flag threads from the tool to platform callbacks.
+# ---------------------------------------------------------------------------
+
+class TestGateClarify:
+    def test_schema_exposes_gate(self):
+        from tools.clarify_tool import CLARIFY_SCHEMA
+        props = CLARIFY_SCHEMA["parameters"]["properties"]
+        assert "gate" in props
+        assert props["gate"]["type"] == "boolean"
+
+    def test_gate_threads_to_gate_aware_callback(self):
+        import json
+        from tools.clarify_tool import clarify_tool
+        seen = {}
+
+        def cb(q, c, gate=False):
+            seen["gate"] = gate
+            return "approved"
+
+        out = json.loads(clarify_tool("Approve build?", ["Yes", "No"], cb, gate=True))
+        assert seen["gate"] is True
+        assert out["gate"] is True
+        assert out["user_response"] == "approved"
+
+    def test_legacy_two_arg_callback_unaffected(self):
+        import json
+        from tools.clarify_tool import clarify_tool
+
+        def legacy(q, c):  # no gate param
+            return "ok"
+
+        # gate=True must NOT crash a legacy 2-arg callback
+        out = json.loads(clarify_tool("pick", ["a", "b"], legacy, gate=True))
+        assert out["user_response"] == "ok"
+
+    def test_kwargs_callback_receives_gate(self):
+        from tools.clarify_tool import _invoke_clarify_callback
+        seen = {}
+
+        def cb(q, c, **kw):
+            seen["gate"] = kw.get("gate")
+            return "x"
+
+        _invoke_clarify_callback(cb, "q", None, True)
+        assert seen["gate"] is True
+
+    def test_gate_timeout_default(self):
+        from tools.clarify_gateway import get_clarify_gate_timeout
+        assert get_clarify_gate_timeout() == 86400

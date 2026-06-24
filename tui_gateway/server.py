@@ -1418,6 +1418,41 @@ def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
         return _answers.pop(rid, "")
 
 
+_GATE_HOLD_MSG = (
+    "The user has not answered this GATE question yet. Treat this silence as "
+    "'still blocked', NEVER as approval or a chosen default. Do NOT proceed on "
+    "assumptions, do NOT fabricate a default, and do NOT advance to the next "
+    "phase. Re-ask the question (re-issue the clarify with gate=true) and keep "
+    "waiting for an explicit answer."
+)
+
+
+def _clarify_block(sid: str, question: str, choices, gate: bool = False) -> str:
+    """Clarify bridge with gate semantics.
+
+    GATE questions (intake/wireframe/build/delivery sign-off) wait on the long
+    gate bound and never auto-proceed: if the bound is somehow hit (empty
+    answer), return a hold message telling the agent to re-ask, never a default.
+    Non-gate questions keep the short default and current empty-on-timeout shape.
+    """
+    if gate:
+        try:
+            from tools.clarify_gateway import get_clarify_gate_timeout
+            timeout = get_clarify_gate_timeout()
+        except Exception:
+            timeout = 86400
+    else:
+        timeout = 300
+    ans = _block(
+        "clarify.request", sid,
+        {"question": question, "choices": choices, "gate": bool(gate)},
+        timeout=timeout,
+    )
+    if gate and (ans is None or ans == ""):
+        return _GATE_HOLD_MSG
+    return ans
+
+
 def _clear_pending(sid: str | None = None) -> None:
     """Release pending prompts with an empty answer.
 
@@ -3019,9 +3054,7 @@ def _agent_cbs(sid: str) -> dict:
         "notice_clear_callback": lambda key: _emit(
             "notification.clear", sid, {"key": key}
         ),
-        "clarify_callback": lambda q, c: _block(
-            "clarify.request", sid, {"question": q, "choices": c}
-        ),
+        "clarify_callback": lambda q, c, gate=False: _clarify_block(sid, q, c, gate),
         # read_terminal tool (desktop GUI): same blocking bridge as clarify — the
         # renderer answers terminal.read.respond with the serialized buffer.
         "read_terminal_callback": lambda start=None, count=None: _block(

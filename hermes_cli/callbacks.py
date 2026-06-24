@@ -15,15 +15,20 @@ from hermes_cli.secret_prompt import masked_secret_prompt
 from hermes_constants import display_hermes_home
 
 
-def clarify_callback(cli, question, choices):
+def clarify_callback(cli, question, choices, gate=False):
     """Prompt for clarifying question through the TUI.
 
     Sets up the interactive selection UI, then blocks until the user
-    responds. Returns the user's choice or a timeout message.
+    responds. Returns the user's choice or a hold message. GATE questions
+    (``gate=True``) wait on a long bound, re-notify the user, and never
+    auto-proceed or fabricate a default.
     """
     from cli import CLI_CONFIG
 
-    timeout = CLI_CONFIG.get("clarify", {}).get("timeout", 120)
+    _clarify_cfg = CLI_CONFIG.get("clarify", {})
+    timeout = _clarify_cfg.get("gate_timeout", 86400) if gate else _clarify_cfg.get("timeout", 120)
+    _renotify_every = 300
+    _last_renotify = _time.monotonic()
     response_queue = queue.Queue()
     is_open_ended = not choices
 
@@ -50,16 +55,28 @@ def clarify_callback(cli, question, choices):
                 break
             if hasattr(cli, "_app") and cli._app:
                 cli._app.invalidate()
+            if gate and _time.monotonic() - _last_renotify >= _renotify_every:
+                _last_renotify = _time.monotonic()
+                cprint(
+                    f"\n{_DIM}(still waiting on a gate question — holding for "
+                    f"your answer, not proceeding){_RST}"
+                )
 
     cli._clarify_state = None
     cli._clarify_freetext = False
     cli._clarify_deadline = 0
     if hasattr(cli, "_app") and cli._app:
         cli._app.invalidate()
-    cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
+    if gate:
+        cprint(f"\n{_DIM}(gate clarify still unanswered after {timeout}s — holding, agent must re-ask, never proceed){_RST}")
+    else:
+        cprint(f"\n{_DIM}(clarify timed out after {timeout}s — re-asking, holding for the user){_RST}")
     return (
-        "The user did not provide a response within the time limit. "
-        "Use your best judgement to make the choice and proceed."
+        "The user has not answered yet. Treat this silence as 'still blocked', "
+        "NEVER as approval or a chosen default. If this is a human gate "
+        "(intake, wireframe selection, build approval, delivery, or any sign-off), "
+        "do NOT proceed on assumptions and do NOT fabricate defaults. Re-ask the "
+        "question (re-issue the clarify) and keep waiting for an explicit answer."
     )
 
 

@@ -544,6 +544,7 @@ def run_conversation(
     final_response = None
     interrupted = False
     failed = False
+    clarify_enforce_retries = 0  # #3 (run 555): bounded clarify-dialog enforcement
     codex_ack_continuations = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
@@ -1067,6 +1068,23 @@ def run_conversation(
         if _step.action is TurnAction.RETURN:
             return _step.terminal_result
         if _step.action is TurnAction.BREAK:
+            # #3 (run 2026-06-21-555): clarify-dialog enforcement. If the model is
+            # ending the turn by asking the user a question INLINE instead of via the
+            # clarify dialog, push back ONCE and let it re-ask through the dialog.
+            # Kill-switch (agent.clarify_enforcement / HERMES_CLARIFY_ENFORCEMENT=off),
+            # bounded (max_retries), and fail-open (any error => normal break).
+            try:
+                from agent.clarify_enforcement import (
+                    should_enforce_dialog,
+                    CLARIFY_CORRECTION,
+                )
+                if should_enforce_dialog(agent, final_response, clarify_enforce_retries):
+                    clarify_enforce_retries += 1
+                    messages.append({"role": "user", "content": CLARIFY_CORRECTION})
+                    final_response = None
+                    continue
+            except Exception as _clarify_exc:  # fail-open: never break the turn engine
+                logger.debug("clarify enforcement skipped: %s", _clarify_exc)
             break
         # TurnAction.CONTINUE: fall through to the next loop iteration.
         continue

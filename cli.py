@@ -463,7 +463,8 @@ def load_cli_config() -> Dict[str, Any]:
             "skin": "default",
         },
         "clarify": {
-            "timeout": 120,  # Seconds to wait for a clarify answer before auto-proceeding
+            "timeout": 120,  # Seconds to wait for a NON-gate clarify before auto-proceeding
+            "gate_timeout": 86400,  # Seconds to hold a GATE clarify (24h); never auto-proceeds/fabricates
         },
         "code_execution": {
             "timeout": 300,    # Max seconds a sandbox script can run before being killed (5 min)
@@ -9518,18 +9519,30 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             outcome = outcome[:119] + "…"
         _cprint(f"\n{_DIM}{icon} {label}: {detail} → {outcome}{_RST}")
 
-    def _clarify_callback(self, question, choices):
+    def _clarify_callback(self, question, choices, gate=False):
         """
         Platform callback for the clarify tool. Called from the agent thread.
 
         Sets up the interactive selection UI (or freetext prompt for open-ended
         questions), then blocks until the user responds via the prompt_toolkit
-        key bindings.  If no response arrives within the configured timeout the
-        question is dismissed and the agent is told to decide on its own.
+        key bindings.
+
+        For ordinary (non-gate) questions, if no response arrives within the
+        short configured timeout the question is dismissed and the agent is
+        told to hold/re-ask. For GATE questions (``gate=True`` — intake sign-off,
+        wireframe selection, build/PRD approval, delivery, any consequential
+        approval) we wait on a long bound, re-notify the user periodically, and
+        NEVER auto-proceed or fabricate a default.
         """
         import time as _time
 
-        timeout = CLI_CONFIG.get("clarify", {}).get("timeout", 120)
+        _clarify_cfg = CLI_CONFIG.get("clarify", {})
+        if gate:
+            timeout = _clarify_cfg.get("gate_timeout", 86400)
+        else:
+            timeout = _clarify_cfg.get("timeout", 120)
+        _renotify_every = 300  # gate: re-print "still waiting" every N seconds
+        _last_renotify = _time.monotonic()
         response_queue = queue.Queue()
         is_open_ended = not choices
 
@@ -9567,16 +9580,30 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 if now - _last_countdown_refresh >= 1.0:
                     _last_countdown_refresh = now
                     self._paint_now()
+                # Gate questions never silently auto-proceed — re-notify the
+                # user that we are still holding for their answer.
+                if gate and now - _last_renotify >= _renotify_every:
+                    _last_renotify = now
+                    _cprint(
+                        f"\n{_DIM}(still waiting on a gate question — holding for "
+                        f"your answer, not proceeding){_RST}"
+                    )
 
-        # Timed out — tear down the UI and let the agent decide
+        # Timed out — tear down the UI but HOLD; do not let the agent self-proceed.
         self._clarify_state = None
         self._clarify_freetext = False
         self._clarify_deadline = 0
         self._paint_now()
-        _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
+        if gate:
+            _cprint(f"\n{_DIM}(gate clarify still unanswered after {timeout}s — holding, agent must re-ask, never proceed){_RST}")
+        else:
+            _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — re-asking, holding for the user){_RST}")
         return (
-            "The user did not provide a response within the time limit. "
-            "Use your best judgement to make the choice and proceed."
+            "The user has not answered yet. Treat this silence as 'still blocked', "
+            "NEVER as approval or a chosen default. If this is a human gate "
+            "(intake, wireframe selection, build approval, delivery, or any sign-off), "
+            "do NOT proceed on assumptions and do NOT fabricate defaults. Re-ask the "
+            "question (re-issue the clarify) and keep waiting for an explicit answer."
         )
 
     def _sudo_password_callback(self) -> str:

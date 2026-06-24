@@ -11,8 +11,35 @@ gateway/run.py for messaging). This module defines the schema, validation, and
 a thin dispatcher that delegates to a platform-provided callback.
 """
 
+import inspect
 import json
 from typing import List, Optional, Callable
+
+
+def _invoke_clarify_callback(callback, question, choices, gate):
+    """Call a platform clarify callback, passing ``gate`` only if it accepts it.
+
+    Older callbacks have signature ``(question, choices)``; gate-aware ones add
+    a third ``gate`` parameter. We inspect rather than try/except TypeError so a
+    genuine TypeError raised *inside* the callback is never silently swallowed.
+    """
+    pass_gate = False
+    try:
+        params = list(inspect.signature(callback).parameters.values())
+        names = {p.name for p in params}
+        has_varkw = any(p.kind == p.VAR_KEYWORD for p in params)
+        positional = [
+            p for p in params
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        ]
+        pass_gate = "gate" in names or has_varkw or len(positional) >= 3
+    except (TypeError, ValueError):
+        pass_gate = False
+    if pass_gate:
+        # Pass as keyword so it works for both ``(q, c, gate)`` and
+        # ``(q, c, **kwargs)`` shapes (positional would fail the latter).
+        return callback(question, choices, gate=gate)
+    return callback(question, choices)
 
 
 # Maximum number of predefined choices the agent can offer.
@@ -24,6 +51,7 @@ def clarify_tool(
     question: str,
     choices: Optional[List[str]] = None,
     callback: Optional[Callable] = None,
+    gate: bool = False,
 ) -> str:
     """
     Ask the user a question, optionally with multiple-choice options.
@@ -33,8 +61,12 @@ def clarify_tool(
         choices:  Up to 4 predefined answer choices. When omitted the
                   question is purely open-ended.
         callback: Platform-provided function that handles the actual UI
-                  interaction. Signature: callback(question, choices) -> str.
+                  interaction. Signature: callback(question, choices[, gate]).
                   Injected by the agent runner (cli.py / gateway).
+        gate:     When True this is a HUMAN GATE question (intake sign-off,
+                  wireframe selection, build approval, delivery, etc.). The
+                  platform waits on a long bound and re-notifies the user
+                  instead of auto-proceeding; it NEVER fabricates a default.
 
     Returns:
         JSON string with the user's response.
@@ -61,7 +93,7 @@ def clarify_tool(
         )
 
     try:
-        user_response = callback(question, choices)
+        user_response = _invoke_clarify_callback(callback, question, choices, bool(gate))
     except Exception as exc:
         return json.dumps(
             {"error": f"Failed to get user input: {exc}"},
@@ -71,6 +103,7 @@ def clarify_tool(
     return json.dumps({
         "question": question,
         "choices_offered": choices,
+        "gate": bool(gate),
         "user_response": str(user_response).strip(),
     }, ensure_ascii=False)
 
@@ -93,14 +126,35 @@ CLARIFY_SCHEMA = {
         "or types their own answer via a 5th 'Other' option.\n"
         "2. **Open-ended** — omit choices entirely. The user types a free-form "
         "response.\n\n"
+        "**Always ask through this dialog.** Whenever you need the user to "
+        "answer a question, make a decision, or pick a direction, use THIS tool "
+        "so it renders as the interactive pop-up — do NOT write the question as "
+        "plain assistant text and ask the user to reply by typing a number or "
+        "copying an option. Provide `choices` whenever the question has discrete "
+        "options (they render as clickable buttons). When you have several "
+        "decisions, ask them as a short SERIES of these dialogs (one decision "
+        "per pop-up), never one text blob of numbered questions. This is about "
+        "FORMAT, not frequency — still avoid over-asking; but when you do ask, "
+        "ask here.\n\n"
         "Use this tool when:\n"
         "- The task is ambiguous and you need the user to choose an approach\n"
         "- You want post-task feedback ('How did that work out?')\n"
         "- You want to offer to save a skill or update memory\n"
         "- A decision has meaningful trade-offs the user should weigh in on\n\n"
         "Do NOT use this tool for simple yes/no confirmation of dangerous "
-        "commands (the terminal tool handles that). Prefer making a reasonable "
-        "default choice yourself when the decision is low-stakes."
+        "commands (the terminal tool handles that). The restraint is about "
+        "FREQUENCY, not FORMAT: don't manufacture trivial questions you could "
+        "reasonably decide yourself — but ANY question you do put to the user "
+        "goes through this dialog, never as inline numbered text in your reply.\n\n"
+        "Set `gate=true` when the question is a HUMAN GATE that must be "
+        "answered before you may proceed — e.g. intake/discovery sign-off, "
+        "Phase-5 confirmation, design-interview, wireframe direction "
+        "selection, build/PRD approval, delivery sign-off, or any approval "
+        "with real consequences. A gate question is NEVER auto-proceeded: the "
+        "platform waits (re-notifying the user) until they answer, and you "
+        "must NOT fabricate a default or advance to the next phase on silence. "
+        "Leave `gate` false (default) for low-stakes mid-task clarifications, "
+        "where an unanswered question may time out and you re-ask."
     ),
     "parameters": {
         "type": "object",
@@ -119,6 +173,17 @@ CLARIFY_SCHEMA = {
                     "automatically appends an 'Other (type your answer)' option."
                 ),
             },
+            "gate": {
+                "type": "boolean",
+                "description": (
+                    "Set true ONLY for a human gate that blocks progress "
+                    "(intake/discovery sign-off, wireframe selection, build/PRD "
+                    "approval, delivery sign-off, any consequential approval). "
+                    "A gate question is never auto-proceeded and never resolved "
+                    "by a fabricated default — the platform holds and re-notifies "
+                    "until the user answers. Default false."
+                ),
+            },
         },
         "required": ["question"],
     },
@@ -135,7 +200,8 @@ registry.register(
     handler=lambda args, **kw: clarify_tool(
         question=args.get("question", ""),
         choices=args.get("choices"),
-        callback=kw.get("callback")),
+        callback=kw.get("callback"),
+        gate=bool(args.get("gate", False))),
     check_fn=check_clarify_requirements,
     emoji="❓",
 )
