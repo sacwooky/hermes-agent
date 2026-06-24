@@ -32,6 +32,46 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
+def _load_bundled_plugin_module(slug: str):
+    """Register a bundled directory plugin under ``hermes_plugins.<slug>`` for
+    tests, mirroring hermes_cli.plugins._load_directory_module.
+
+    At runtime the plugin loader publishes enabled plugins into sys.modules at
+    startup; pytest does not run discovery, so core seams that
+    ``from hermes_plugins.<slug> import ...`` would otherwise miss it. This makes
+    the always-on fleet plugins importable without depending on config enablement.
+    """
+    import importlib.util
+    import types
+
+    module_name = f"hermes_plugins.{slug}"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+    plugin_dir = PROJECT_ROOT / "plugins" / slug
+    init_file = plugin_dir / "__init__.py"
+    if not init_file.exists():
+        return None
+    if "hermes_plugins" not in sys.modules:
+        ns_pkg = types.ModuleType("hermes_plugins")
+        ns_pkg.__path__ = []  # type: ignore[attr-defined]
+        ns_pkg.__package__ = "hermes_plugins"
+        sys.modules["hermes_plugins"] = ns_pkg
+    spec = importlib.util.spec_from_file_location(
+        module_name, init_file, submodule_search_locations=[str(plugin_dir)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    module.__package__ = module_name
+    module.__path__ = [str(plugin_dir)]  # type: ignore[attr-defined]
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+# Always-on fleet plugins consumed by core seams (clarify_gate). Load at import
+# time so they're available before any test imports the seam call sites.
+_load_bundled_plugin_module("clarify_gate")
+
+
 # ── Per-file process isolation ──────────────────────────────────────────────
 # Tests run via ``scripts/run_tests_parallel.py``, which spawns a fresh
 # ``python -m pytest <file>`` subprocess per test file. Cross-file state

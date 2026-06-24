@@ -275,5 +275,6 @@ class TestGateClarify:
         assert seen["gate"] is True
 
     def test_gate_timeout_default(self):
-        from tools.clarify_gateway import get_clarify_gate_timeout
-        assert get_clarify_gate_timeout() == 86400
+        # Relocated into the clarify_gate plugin.
+        from hermes_plugins.clarify_gate import get_gate_timeout
+        assert get_gate_timeout() == 86400

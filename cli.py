@@ -463,8 +463,7 @@ def load_cli_config() -> Dict[str, Any]:
             "skin": "default",
         },
         "clarify": {
-            "timeout": 120,  # Seconds to wait for a NON-gate clarify before auto-proceeding
-            "gate_timeout": 86400,  # Seconds to hold a GATE clarify (24h); never auto-proceeds/fabricates
+            "timeout": 120,  # Seconds to wait for a clarify answer before auto-proceeding
         },
         "code_execution": {
             "timeout": 300,    # Max seconds a sandbox script can run before being killed (5 min)
@@ -9536,12 +9535,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         """
         import time as _time
 
+        # Fleet clarify_gate plugin owns the gate prose/timeouts; fail-open to the
+        # upstream short-timeout shape (no gate hold) when it's absent/disabled.
+        try:
+            from hermes_plugins import clarify_gate as _cg
+        except Exception:
+            _cg = None
         _clarify_cfg = CLI_CONFIG.get("clarify", {})
-        if gate:
-            timeout = _clarify_cfg.get("gate_timeout", 86400)
+        if _cg:
+            timeout = _cg.resolve_cli_timeout(gate, _clarify_cfg)
+            _renotify_every = _cg.RENOTIFY_EVERY
         else:
             timeout = _clarify_cfg.get("timeout", 120)
-        _renotify_every = 300  # gate: re-print "still waiting" every N seconds
+            _renotify_every = 300
         _last_renotify = _time.monotonic()
         response_queue = queue.Queue()
         is_open_ended = not choices
@@ -9582,28 +9588,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     self._paint_now()
                 # Gate questions never silently auto-proceed — re-notify the
                 # user that we are still holding for their answer.
-                if gate and now - _last_renotify >= _renotify_every:
+                if gate and _cg and now - _last_renotify >= _renotify_every:
                     _last_renotify = now
-                    _cprint(
-                        f"\n{_DIM}(still waiting on a gate question — holding for "
-                        f"your answer, not proceeding){_RST}"
-                    )
+                    _cprint(f"\n{_DIM}{_cg.RENOTIFY_TEXT}{_RST}")
 
         # Timed out — tear down the UI but HOLD; do not let the agent self-proceed.
         self._clarify_state = None
         self._clarify_freetext = False
         self._clarify_deadline = 0
         self._paint_now()
-        if gate:
-            _cprint(f"\n{_DIM}(gate clarify still unanswered after {timeout}s — holding, agent must re-ask, never proceed){_RST}")
-        else:
-            _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — re-asking, holding for the user){_RST}")
+        if _cg:
+            _cprint(f"\n{_DIM}{_cg.cli_timeout_message(gate, timeout)}{_RST}")
+            return _cg.CLI_HOLD_MESSAGE
+        # Upstream fallback (plugin absent): old auto-proceed behavior.
+        _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
         return (
-            "The user has not answered yet. Treat this silence as 'still blocked', "
-            "NEVER as approval or a chosen default. If this is a human gate "
-            "(intake, wireframe selection, build approval, delivery, or any sign-off), "
-            "do NOT proceed on assumptions and do NOT fabricate defaults. Re-ask the "
-            "question (re-issue the clarify) and keep waiting for an explicit answer."
+            "The user did not provide a response within the time limit. "
+            "Use your best judgement to make the choice and proceed."
         )
 
     def _sudo_password_callback(self) -> str:

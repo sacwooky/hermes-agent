@@ -1873,6 +1873,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     question=next_args.get("question", ""),
                     choices=next_args.get("choices"),
                     callback=agent.clarify_callback,
+                    gate=bool(next_args.get("gate", False)),
                 ),
                 next_args,
             )

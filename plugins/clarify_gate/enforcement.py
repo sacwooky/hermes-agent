@@ -13,6 +13,9 @@ Design rules (because this rides the core loop on every agent / both hosts):
   * Kill-switch — `agent.clarify_enforcement` config (default on) + env
     `HERMES_CLARIFY_ENFORCEMENT=off`.
   * Fail-open — the caller wraps this in try/except; any error => normal break.
+
+Relocated from agent/clarify_enforcement.py into the clarify_gate plugin so the
+upstream tree carries no fleet-only file here.
 """
 from __future__ import annotations
 

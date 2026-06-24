@@ -964,21 +964,7 @@ DEFAULT_CONFIG = {
         # unblocks with "[user did not respond within Xm]" so it can adapt
         # rather than pinning the running-agent guard forever.  CLI clarify
         # blocks indefinitely (input() is synchronous) and ignores this.
-        # NOTE: applies to NON-gate clarifies only.
         "clarify_timeout": 600,
-        # Maximum time (seconds) to hold a GATE clarify (intake/wireframe/build/
-        # delivery sign-off, any consequential approval). Gate questions NEVER
-        # auto-proceed: the platform waits this long, re-notifying the user, and
-        # even if the bound is hit the agent is told to hold and re-ask — never
-        # to fabricate a default. Default 86400 (24h).
-        "clarify_gate_timeout": 86400,
-        # Clarify-dialog ENFORCEMENT (#3, run 555): when the model ends a turn by
-        # asking the user a question INLINE instead of via the clarify dialog, the
-        # turn loop pushes back once and lets it re-ask through the dialog. Default
-        # on; set false (or env HERMES_CLARIFY_ENFORCEMENT=off) to disable. Bounded
-        # by clarify_enforcement_max_retries; fail-open.
-        "clarify_enforcement": True,
-        "clarify_enforcement_max_retries": 1,
         # Periodic "still working" notification interval (seconds).
         # Sends a status message every N seconds so the user knows the
         # agent hasn't died during long tasks.  0 = disable notifications.

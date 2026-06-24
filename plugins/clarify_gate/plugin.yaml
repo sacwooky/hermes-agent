@@ -1,0 +1,4 @@
+name: clarify_gate
+version: 1.0.0
+description: "Fleet three-gate clarify customization. Gate-aware clarify holds (intake/wireframe/build/delivery sign-off never auto-proceed) plus turn-end inline-question enforcement. Logic lives here; core files keep thin fail-open seams that import hermes_plugins.clarify_gate."
+author: "FluxLabs"

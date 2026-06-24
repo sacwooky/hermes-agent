@@ -11,34 +11,23 @@ gateway/run.py for messaging). This module defines the schema, validation, and
 a thin dispatcher that delegates to a platform-provided callback.
 """
 
-import inspect
 import json
 from typing import List, Optional, Callable
 
 
 def _invoke_clarify_callback(callback, question, choices, gate):
-    """Call a platform clarify callback, passing ``gate`` only if it accepts it.
+    """Dispatch to the platform clarify callback, gate-aware via the clarify_gate
+    plugin. The plugin's shim passes ``gate`` only to callbacks that accept it.
 
-    Older callbacks have signature ``(question, choices)``; gate-aware ones add
-    a third ``gate`` parameter. We inspect rather than try/except TypeError so a
-    genuine TypeError raised *inside* the callback is never silently swallowed.
+    Fail-open: if the plugin is absent/disabled, fall back to the plain
+    ``(question, choices)`` call — i.e. upstream behavior, gate ignored.
     """
-    pass_gate = False
     try:
-        params = list(inspect.signature(callback).parameters.values())
-        names = {p.name for p in params}
-        has_varkw = any(p.kind == p.VAR_KEYWORD for p in params)
-        positional = [
-            p for p in params
-            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
-        ]
-        pass_gate = "gate" in names or has_varkw or len(positional) >= 3
-    except (TypeError, ValueError):
-        pass_gate = False
-    if pass_gate:
-        # Pass as keyword so it works for both ``(q, c, gate)`` and
-        # ``(q, c, **kwargs)`` shapes (positional would fail the latter).
-        return callback(question, choices, gate=gate)
+        from hermes_plugins import clarify_gate as _cg
+    except Exception:
+        _cg = None
+    if _cg is not None:
+        return _cg.invoke_clarify_callback(callback, question, choices, gate)
     return callback(question, choices)
 
 
@@ -126,35 +115,14 @@ CLARIFY_SCHEMA = {
         "or types their own answer via a 5th 'Other' option.\n"
         "2. **Open-ended** — omit choices entirely. The user types a free-form "
         "response.\n\n"
-        "**Always ask through this dialog.** Whenever you need the user to "
-        "answer a question, make a decision, or pick a direction, use THIS tool "
-        "so it renders as the interactive pop-up — do NOT write the question as "
-        "plain assistant text and ask the user to reply by typing a number or "
-        "copying an option. Provide `choices` whenever the question has discrete "
-        "options (they render as clickable buttons). When you have several "
-        "decisions, ask them as a short SERIES of these dialogs (one decision "
-        "per pop-up), never one text blob of numbered questions. This is about "
-        "FORMAT, not frequency — still avoid over-asking; but when you do ask, "
-        "ask here.\n\n"
         "Use this tool when:\n"
         "- The task is ambiguous and you need the user to choose an approach\n"
         "- You want post-task feedback ('How did that work out?')\n"
         "- You want to offer to save a skill or update memory\n"
         "- A decision has meaningful trade-offs the user should weigh in on\n\n"
         "Do NOT use this tool for simple yes/no confirmation of dangerous "
-        "commands (the terminal tool handles that). The restraint is about "
-        "FREQUENCY, not FORMAT: don't manufacture trivial questions you could "
-        "reasonably decide yourself — but ANY question you do put to the user "
-        "goes through this dialog, never as inline numbered text in your reply.\n\n"
-        "Set `gate=true` when the question is a HUMAN GATE that must be "
-        "answered before you may proceed — e.g. intake/discovery sign-off, "
-        "Phase-5 confirmation, design-interview, wireframe direction "
-        "selection, build/PRD approval, delivery sign-off, or any approval "
-        "with real consequences. A gate question is NEVER auto-proceeded: the "
-        "platform waits (re-notifying the user) until they answer, and you "
-        "must NOT fabricate a default or advance to the next phase on silence. "
-        "Leave `gate` false (default) for low-stakes mid-task clarifications, "
-        "where an unanswered question may time out and you re-ask."
+        "commands (the terminal tool handles that). Prefer making a reasonable "
+        "default choice yourself when the decision is low-stakes."
     ),
     "parameters": {
         "type": "object",

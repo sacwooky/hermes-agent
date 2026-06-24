@@ -247,24 +247,6 @@ def get_clarify_timeout() -> int:
         return 600
 
 
-def get_clarify_gate_timeout() -> int:
-    """Read the GATE clarify wait (seconds) from config.
-
-    Gate questions (intake sign-off, wireframe selection, build/PRD approval,
-    delivery, any consequential approval) must NOT auto-proceed. They wait on
-    this long bound — default 86400 (24h) — re-notifying the user, and even if
-    the bound is somehow hit the agent is told to hold and re-ask, never to
-    fabricate a default. Reads ``agent.clarify_gate_timeout`` from config.yaml.
-    """
-    try:
-        from hermes_cli.config import load_config
-        cfg = load_config() or {}
-        agent_cfg = cfg.get("agent", {}) or {}
-        return int(agent_cfg.get("clarify_gate_timeout", 86400))
-    except Exception:
-        return 86400
-
-
 # =========================================================================
 # Per-session notify hook (gateway → adapter bridge)
 # =========================================================================

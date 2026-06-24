@@ -1068,13 +1068,14 @@ def run_conversation(
         if _step.action is TurnAction.RETURN:
             return _step.terminal_result
         if _step.action is TurnAction.BREAK:
-            # #3 (run 2026-06-21-555): clarify-dialog enforcement. If the model is
-            # ending the turn by asking the user a question INLINE instead of via the
-            # clarify dialog, push back ONCE and let it re-ask through the dialog.
-            # Kill-switch (agent.clarify_enforcement / HERMES_CLARIFY_ENFORCEMENT=off),
-            # bounded (max_retries), and fail-open (any error => normal break).
+            # #3 (run 2026-06-21-555): clarify-dialog enforcement (fleet clarify_gate
+            # plugin). If the model is ending the turn by asking the user a question
+            # INLINE instead of via the clarify dialog, push back ONCE and let it
+            # re-ask through the dialog. Kill-switch (agent.clarify_enforcement /
+            # HERMES_CLARIFY_ENFORCEMENT=off), bounded (max_retries), fail-open: any
+            # error — incl. the plugin being disabled/absent — means a normal break.
             try:
-                from agent.clarify_enforcement import (
+                from hermes_plugins.clarify_gate import (
                     should_enforce_dialog,
                     CLARIFY_CORRECTION,
                 )

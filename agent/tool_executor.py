@@ -1053,6 +1053,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     question=next_args.get("question", ""),
                     choices=next_args.get("choices"),
                     callback=agent.clarify_callback,
+                    gate=bool(next_args.get("gate", False)),
                 )
             function_result, function_args = _run_agent_tool_execution_middleware(
                 agent,

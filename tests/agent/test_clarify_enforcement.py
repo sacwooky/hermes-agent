@@ -3,8 +3,10 @@
 Detector must be HIGH-PRECISION (no false positives — they cost a wasted
 regeneration on the live core loop). Gating must honor kill-switches + bounds.
 """
-import agent.clarify_enforcement as ce
-from agent.clarify_enforcement import (
+# Relocated into the clarify_gate plugin; tests/conftest.py loads it as
+# hermes_plugins.clarify_gate (mirrors runtime plugin discovery).
+from hermes_plugins.clarify_gate import enforcement as ce
+from hermes_plugins.clarify_gate.enforcement import (
     looks_like_inline_question_to_user as Q,
     should_enforce_dialog as S,
 )

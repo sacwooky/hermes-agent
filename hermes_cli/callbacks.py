@@ -25,9 +25,19 @@ def clarify_callback(cli, question, choices, gate=False):
     """
     from cli import CLI_CONFIG
 
+    # Fleet clarify_gate plugin owns the gate prose/timeouts; fail-open to the
+    # upstream short-timeout shape (no gate hold) when it's absent/disabled.
+    try:
+        from hermes_plugins import clarify_gate as _cg
+    except Exception:
+        _cg = None
     _clarify_cfg = CLI_CONFIG.get("clarify", {})
-    timeout = _clarify_cfg.get("gate_timeout", 86400) if gate else _clarify_cfg.get("timeout", 120)
-    _renotify_every = 300
+    if _cg:
+        timeout = _cg.resolve_cli_timeout(gate, _clarify_cfg)
+        _renotify_every = _cg.RENOTIFY_EVERY
+    else:
+        timeout = _clarify_cfg.get("timeout", 120)
+        _renotify_every = 300
     _last_renotify = _time.monotonic()
     response_queue = queue.Queue()
     is_open_ended = not choices
@@ -55,28 +65,23 @@ def clarify_callback(cli, question, choices, gate=False):
                 break
             if hasattr(cli, "_app") and cli._app:
                 cli._app.invalidate()
-            if gate and _time.monotonic() - _last_renotify >= _renotify_every:
+            if gate and _cg and _time.monotonic() - _last_renotify >= _renotify_every:
                 _last_renotify = _time.monotonic()
-                cprint(
-                    f"\n{_DIM}(still waiting on a gate question — holding for "
-                    f"your answer, not proceeding){_RST}"
-                )
+                cprint(f"\n{_DIM}{_cg.RENOTIFY_TEXT}{_RST}")
 
     cli._clarify_state = None
     cli._clarify_freetext = False
     cli._clarify_deadline = 0
     if hasattr(cli, "_app") and cli._app:
         cli._app.invalidate()
-    if gate:
-        cprint(f"\n{_DIM}(gate clarify still unanswered after {timeout}s — holding, agent must re-ask, never proceed){_RST}")
-    else:
-        cprint(f"\n{_DIM}(clarify timed out after {timeout}s — re-asking, holding for the user){_RST}")
+    if _cg:
+        cprint(f"\n{_DIM}{_cg.cli_timeout_message(gate, timeout)}{_RST}")
+        return _cg.CLI_HOLD_MESSAGE
+    # Upstream fallback (plugin absent): old auto-proceed behavior.
+    cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
     return (
-        "The user has not answered yet. Treat this silence as 'still blocked', "
-        "NEVER as approval or a chosen default. If this is a human gate "
-        "(intake, wireframe selection, build approval, delivery, or any sign-off), "
-        "do NOT proceed on assumptions and do NOT fabricate defaults. Re-ask the "
-        "question (re-issue the clarify) and keep waiting for an explicit answer."
+        "The user did not provide a response within the time limit. "
+        "Use your best judgement to make the choice and proceed."
     )
 
 
