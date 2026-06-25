@@ -5250,3 +5250,48 @@ def test_dispatch_tick_lock_degrades_to_noop_without_fcntl(kanban_home, monkeypa
     db_path = kb.kanban_db_path()
     with kb._dispatch_tick_lock(db_path) as held:
         assert held is True, "missing lock backend must degrade to no-op, not block"
+
+
+def test_ensure_task_worktree_materializes_and_reuses(tmp_path):
+    """Replacement coverage for the dropped upstream worktree tests, against the
+    fleet's own implementation: ensure_task_worktree materializes an isolated
+    linked worktree + per-task branch (.kanban-worktrees/<repo>/<id> on
+    kanban/<id>), registers it with git, and a rerun reuses it idempotently."""
+    import subprocess
+
+    repo = tmp_path / "myrepo"
+    repo.mkdir()
+
+    def git(*a, cwd=repo):
+        subprocess.run(["git", "-C", str(cwd), *a], check=True, capture_output=True)
+
+    git("init", "-q")
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    (repo / "f.txt").write_text("x")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+
+    res = kb.ensure_task_worktree(str(repo), "t_abc123")
+    assert res is not None, "a git repo must materialize a worktree"
+    wt, branch = res
+    assert branch == "kanban/t_abc123"
+    assert wt == repo.parent / ".kanban-worktrees" / "myrepo" / "t_abc123"
+    assert wt.exists() and (wt / ".git").exists(), "linked worktree must be materialized"
+
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        capture_output=True, text=True,
+    ).stdout
+    assert str(wt) in listed, "worktree must be registered with git"
+
+    # Rerun reuses the existing worktree/branch idempotently (no error, same path).
+    assert kb.ensure_task_worktree(str(repo), "t_abc123") == (wt, branch)
+
+
+def test_ensure_task_worktree_returns_none_for_non_git_repo(tmp_path):
+    """Non-git path: ensure_task_worktree returns None so the dispatcher falls
+    back to the shared dir rather than failing the spawn."""
+    plain = tmp_path / "notgit"
+    plain.mkdir()
+    assert kb.ensure_task_worktree(str(plain), "t_x") is None
