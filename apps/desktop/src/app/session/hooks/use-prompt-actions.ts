@@ -27,17 +27,22 @@ import { triggerHaptic } from '@/lib/haptics'
 import { setMutableRef } from '@/lib/mutable-ref'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { setSessionYolo } from '@/lib/yolo-session'
+import { openCommandPalettePage } from '@/store/command-palette'
 import {
   $composerAttachments,
   clearComposerAttachments,
   type ComposerAttachment,
   setComposerAttachmentUploadState,
+  setComposerDraft,
   terminalContextBlocksFromDraft,
   updateComposerAttachment
 } from '@/store/composer'
 import { resetSessionBackground } from '@/store/composer-status'
+import { clearPreviewArtifacts } from '@/store/preview-status'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
+import { setPetScale } from '@/store/pet-gallery'
+import { $petGenInput, openPetGenerate } from '@/store/pet-generate'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import {
   $busy,
@@ -57,8 +62,8 @@ import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
 
 import type {
-  ClientSessionState,
   BrowserManageResponse,
+  ClientSessionState,
   FileAttachResponse,
   HandoffFailResponse,
   HandoffRequestResponse,
@@ -550,7 +555,14 @@ export function usePromptActions({
     async (rawText: string, options?: SubmitTextOptions) => {
       const visibleText = rawText.trim()
       const usingComposerAttachments = !options?.attachments
-      const attachments = options?.attachments ?? $composerAttachments.get()
+      // Drop undefined/null holes a session switch or draft restore can leave in
+      // the attachments array (same bug class as AttachmentList #49624). Without
+      // this, the sibling iterations below (a.kind / a.label / a.refText, and the
+      // sync step) throw "Cannot read properties of undefined (reading 'refText')"
+      // and break the chat surface.
+      const attachments = (options?.attachments ?? $composerAttachments.get()).filter(
+        (a): a is ComposerAttachment => Boolean(a)
+      )
 
       const terminalContextBlocks = terminalContextBlocksFromDraft(rawText).join('\n\n')
       const hasImage = attachments.some(a => a.kind === 'image')
@@ -563,14 +575,17 @@ export function usePromptActions({
       let attachmentRefs = attachments.map(optimisticAttachmentRef).filter((r): r is string => Boolean(r))
 
       const buildContextText = (atts: ComposerAttachment[]): string => {
-        const contextRefs = atts
+        // atts may be the post-sync array, which can reintroduce holes; filter
+        // before touching a.refText / a.kind.
+        const present = atts.filter((a): a is ComposerAttachment => Boolean(a))
+        const contextRefs = present
           .map(a => a.refText)
           .filter(Boolean)
           .join('\n')
 
         return (
           [contextRefs, terminalContextBlocks, visibleText].filter(Boolean).join('\n\n') ||
-          (atts.some(a => a.kind === 'image') ? 'What do you see in this image?' : '')
+          (present.some(a => a.kind === 'image') ? 'What do you see in this image?' : '')
         )
       }
 
@@ -914,31 +929,7 @@ export function usePromptActions({
           return
         }
 
-        try {
-          const result = await requestGateway<SlashExecResponse>('slash.exec', {
-            session_id: sessionId,
-            command: command.replace(/^\/+/, '')
-          })
-
-          const body = result?.output || `/${name}: no output`
-          renderSlashOutput(result?.warning ? `warning: ${result.warning}\n${body}` : body)
-
-          return
-        } catch {
-          // Fall back to command.dispatch for skill/send/alias directives.
-        }
-
-        try {
-          const dispatch = parseCommandDispatch(
-            await requestGateway<unknown>('command.dispatch', { session_id: sessionId, name, arg })
-          )
-
-          if (!dispatch) {
-            renderSlashOutput('error: invalid response: command.dispatch')
-
-            return
-          }
-
+        const handleDispatch = async (dispatch: NonNullable<ReturnType<typeof parseCommandDispatch>>): Promise<void> => {
           if (dispatch.type === 'exec' || dispatch.type === 'plugin') {
             renderSlashOutput(dispatch.output ?? '(no output)')
 
@@ -951,7 +942,25 @@ export function usePromptActions({
             return
           }
 
+          // send / prefill carry an optional `notice` (e.g. "⊙ Goal set …")
+          // that the backend wants shown as a system line before the message
+          // is acted on. Mirrors the TUI's createSlashHandler — without it a
+          // `/goal <text>` looked like it did nothing.
+          if ((dispatch.type === 'send' || dispatch.type === 'prefill') && dispatch.notice?.trim()) {
+            renderSlashOutput(dispatch.notice.trim())
+          }
+
           const message = ('message' in dispatch ? dispatch.message : '')?.trim() ?? ''
+
+          // /undo returns a prefill directive: drop the backed-up message into
+          // the composer for editing instead of submitting it immediately.
+          if (dispatch.type === 'prefill') {
+            if (message) {
+              setComposerDraft(message)
+            }
+
+            return
+          }
 
           if (!message) {
             renderSlashOutput(
@@ -972,6 +981,43 @@ export function usePromptActions({
           }
 
           await submitPromptText(message)
+        }
+
+        try {
+          const result = await requestGateway<unknown>('slash.exec', {
+            session_id: sessionId,
+            command: command.replace(/^\/+/, '')
+          })
+
+          const dispatch = parseCommandDispatch(result)
+
+          if (dispatch) {
+            await handleDispatch(dispatch)
+
+            return
+          }
+
+          const output = result && typeof result === 'object' ? (result as SlashExecResponse) : null
+          const body = output?.output || `/${name}: no output`
+          renderSlashOutput(output?.warning ? `warning: ${output.warning}\n${body}` : body)
+
+          return
+        } catch {
+          // Fall back to command.dispatch for skill/send/alias directives.
+        }
+
+        try {
+          const dispatch = parseCommandDispatch(
+            await requestGateway<unknown>('command.dispatch', { session_id: sessionId, name, arg })
+          )
+
+          if (!dispatch) {
+            renderSlashOutput('error: invalid response: command.dispatch')
+
+            return
+          }
+
+          await handleDispatch(dispatch)
         } catch (err) {
           renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
         }
@@ -1142,6 +1188,47 @@ export function usePromptActions({
           } catch (err) {
             renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
           }
+        },
+        // /hatch opens the pet generator overlay (the desktop's rich, multi-step
+        // generate→pick→hatch→adopt flow). A typed description seeds the prompt
+        // so `/hatch a cyber fox` lands on the composer step prefilled.
+        hatch: async ({ arg }) => {
+          const concept = arg.trim()
+
+          if (concept) {
+            $petGenInput.set(concept)
+          }
+
+          openPetGenerate()
+        },
+        pet: async ctx => {
+          const [sub = '', rawValue = ''] = ctx.arg.trim().split(/\s+/)
+          const lower = sub.toLowerCase()
+
+          if (lower === 'list' || lower === 'gallery' || lower === 'browse' || lower === 'all') {
+            openCommandPalettePage('pets')
+
+            return
+          }
+
+          // `/pet scale <n>` resizes the floating pet locally (instant) and
+          // persists via the store — no round-trip to the slash worker.
+          if (lower === 'scale') {
+            const value = Number(rawValue)
+
+            if (!rawValue || Number.isNaN(value)) {
+              const resolved = await withSlashOutput(ctx)
+              resolved?.render('usage: /pet scale <factor>  (e.g. /pet scale 0.5)')
+
+              return
+            }
+
+            setPetScale(requestGateway, value)
+
+            return
+          }
+
+          await runExec(ctx)
         },
         // /browser connect|disconnect|status manages the live CDP connection on
         // the gateway host, mirroring the TUI's browser.manage RPC. It mutates
@@ -1359,6 +1446,7 @@ export function usePromptActions({
 
   const cancelRun = useCallback(async () => {
     const sessionId = activeSessionId || activeSessionIdRef.current
+
     const releaseBusy = () => {
       setMutableRef(busyRef, false)
       setBusy(false)
@@ -1611,6 +1699,7 @@ export function usePromptActions({
       // rows (and kill the live processes) before the fresh run repopulates.
       clearSessionTodos(sessionId)
       resetSessionBackground(sessionId)
+      clearPreviewArtifacts(sessionId)
 
       clearNotifications()
       setMutableRef(busyRef, true)
@@ -1673,6 +1762,7 @@ export function usePromptActions({
       // processes) before the re-run repopulates them.
       clearSessionTodos(sessionId)
       resetSessionBackground(sessionId)
+      clearPreviewArtifacts(sessionId)
 
       clearNotifications()
       setMutableRef(busyRef, true)
