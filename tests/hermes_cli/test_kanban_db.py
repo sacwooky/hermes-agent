@@ -5422,3 +5422,43 @@ def test_qa_gate_inert_on_non_optin_board(kanban_home):
     assert ok is True
     with kb.connect() as conn:
         assert kb.get_task(conn, tid).status == "done"
+
+
+def test_dispatch_once_skips_when_tick_lock_held(kanban_home, all_assignees_spawnable):
+    """dispatch_once is a thin wrapper that takes the board's non-blocking
+    single-writer lock (upstream #35240 port). When another holder owns the
+    lock, the tick must SKIP — return skipped_locked=True and do no writes —
+    rather than racing on WAL frames."""
+    import fcntl
+
+    db_path = kb.kanban_db_path()
+    lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    spawned = []
+
+    def fake_spawn(task, workspace):
+        spawned.append(getattr(task, "id", task))
+
+    with kb.connect() as conn:
+        kb.create_task(conn, title="locked-out", assignee="alice")
+
+        # Hold the board dispatch lock from a separate fd; flock is per-open-fd,
+        # so dispatch_once's own acquire on the same path is refused.
+        holder = open(lock_path, "a+b")
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        finally:
+            fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+            holder.close()
+
+    assert res.skipped_locked is True
+    assert spawned == [], "no task may be spawned while the dispatch lock is held"
+    assert res.promoted == 0 and res.reclaimed == 0
+
+    # With the lock free, a normal tick proceeds and spawns.
+    with kb.connect() as conn:
+        res2 = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+    assert res2.skipped_locked is False
+    assert spawned, "dispatch should spawn once the lock is free"
