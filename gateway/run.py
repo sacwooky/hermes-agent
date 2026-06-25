@@ -6173,7 +6173,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "scale-to-zero: armed (idle timeout %.0fs) — watching for idle",
                     self._scale_to_zero_idle_timeout_seconds(),
                 )
-                asyncio.create_task(self._scale_to_zero_watcher())
+                self._track_background_task(
+                    asyncio.create_task(self._scale_to_zero_watcher())
+                )
         except Exception:  # noqa: BLE001 - arming must never block startup
             logger.debug("scale-to-zero: arm check failed at startup", exc_info=True)
 
