@@ -5424,6 +5424,7 @@ def test_qa_gate_inert_on_non_optin_board(kanban_home):
         assert kb.get_task(conn, tid).status == "done"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="test holds the lock via POSIX fcntl; production also supports msvcrt on Windows")
 def test_dispatch_once_skips_when_tick_lock_held(kanban_home, all_assignees_spawnable):
     """dispatch_once is a thin wrapper that takes the board's non-blocking
     single-writer lock (upstream #35240 port). When another holder owns the
