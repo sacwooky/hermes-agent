@@ -5298,11 +5298,15 @@ def test_ensure_task_worktree_returns_none_for_non_git_repo(tmp_path):
 
 
 def test_dispatch_isolates_builder_task_into_worktree(kanban_home, all_assignees_spawnable, tmp_path):
-    """Dispatch-level worktree coverage (replaces the dropped upstream dispatch
-    tests, against the fleet's actual flow): a builder task with a dir workspace
-    in a git repo is auto-isolated into a linked worktree + kanban/<id> branch;
-    the resolved workspace_path/branch_name are persisted onto the task and the
-    worker spawns INTO the worktree; a rerun reuses the same worktree."""
+    """Dispatch-level worktree coverage (against the fleet's actual flow): a
+    builder task with a dir workspace in a git repo is auto-isolated by
+    dispatch_once into a linked worktree + kanban/<id> branch; the resolved
+    workspace_kind/workspace_path/branch_name are persisted onto the task and the
+    worker spawns INTO the worktree.
+
+    Reuse/idempotency (a second materialize reuses the same worktree without
+    duplicating it) is covered by test_ensure_task_worktree_materializes_and_reuses.
+    """
     import subprocess
 
     repo = tmp_path / "repo"
