@@ -8242,12 +8242,27 @@ def dispatch_once(
         max_in_progress_per_profile=max_in_progress_per_profile,
         autonomy_cfg=autonomy_cfg,
     )
+    # Key the lock off the ACTUAL db file backing ``conn`` (via PRAGMA), not
+    # kanban_db_path(board): if a caller passes board=None while conn points at a
+    # non-default board, kanban_db_path would resolve a DIFFERENT lock file than
+    # the db being written, and two dispatchers could still race (Robin finding).
+    db_path = None
     try:
-        db_path = kanban_db_path(board=board)
+        for _seq, _name, _file in conn.execute("PRAGMA database_list").fetchall():
+            if _name == "main" and _file:
+                db_path = Path(_file)
+                break
     except Exception:
-        # Path resolution should never fail; if it somehow does, don't lose the
-        # tick -- fall through to an unguarded dispatch rather than dropping work.
-        return _dispatch_once_locked(conn, **_kw)
+        db_path = None
+    if db_path is None:
+        # In-memory db (tests) or path unavailable. An in-memory db is never
+        # shared across processes, so the single-writer lock is moot; fall back to
+        # the board path for parity, or run unguarded if even that fails rather
+        # than dropping the tick.
+        try:
+            db_path = kanban_db_path(board=board)
+        except Exception:
+            return _dispatch_once_locked(conn, **_kw)
     with _dispatch_tick_lock(db_path) as held:
         if not held:
             return DispatchResult(skipped_locked=True)
