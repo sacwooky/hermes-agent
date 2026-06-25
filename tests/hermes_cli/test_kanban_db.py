@@ -5295,3 +5295,50 @@ def test_ensure_task_worktree_returns_none_for_non_git_repo(tmp_path):
     plain = tmp_path / "notgit"
     plain.mkdir()
     assert kb.ensure_task_worktree(str(plain), "t_x") is None
+
+
+def test_dispatch_isolates_builder_task_into_worktree(kanban_home, all_assignees_spawnable, tmp_path):
+    """Dispatch-level worktree coverage (replaces the dropped upstream dispatch
+    tests, against the fleet's actual flow): a builder task with a dir workspace
+    in a git repo is auto-isolated into a linked worktree + kanban/<id> branch;
+    the resolved workspace_path/branch_name are persisted onto the task and the
+    worker spawns INTO the worktree; a rerun reuses the same worktree."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*a, cwd=repo):
+        subprocess.run(["git", "-C", str(cwd), *a], check=True, capture_output=True)
+
+    git("-c", "init.defaultBranch=main", "init", "-q")
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    (repo / "f").write_text("x")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+
+    autocfg = {"integration": {"enabled": True, "branch": "main"}}
+    expected_wt = repo.parent / ".kanban-worktrees" / "repo"
+
+    spawned = []
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="build", assignee="builder",
+            workspace_kind="dir", workspace_path=str(repo),
+        )
+        kb.dispatch_once(
+            conn, spawn_fn=lambda t, w: spawned.append((t.id, str(w))),
+            autonomy_cfg=autocfg,
+        )
+
+    wt = expected_wt / tid
+    assert spawned and spawned[0][0] == tid
+    assert spawned[0][1] == str(wt), "builder must spawn INTO the materialized worktree"
+    assert wt.exists(), "worktree must be materialized on disk"
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.workspace_kind == "worktree"
+    assert task.branch_name == f"kanban/{tid}"
+    assert task.workspace_path == str(wt)
