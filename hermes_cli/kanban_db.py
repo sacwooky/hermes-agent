@@ -8165,6 +8165,8 @@ def _dispatch_tick_lock(db_path: Path):
                 nb_lock = getattr(msvcrt, "LK_NBLCK")
                 locking(handle.fileno(), nb_lock, 1)
                 acquired = True
+            except ImportError:
+                acquired = True  # no msvcrt -> degrade to no-op (proceed)
             except (OSError, AttributeError):
                 acquired = False
         else:
@@ -8172,6 +8174,11 @@ def _dispatch_tick_lock(db_path: Path):
                 import fcntl
 
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except ImportError:
+                # No fcntl on this platform -- single-writer enforcement is
+                # best-effort; degrade to a no-op (proceed) rather than crashing
+                # dispatch, as the docstring promises.
                 acquired = True
             except (BlockingIOError, OSError):
                 acquired = False
@@ -8197,7 +8204,7 @@ def _dispatch_tick_lock(db_path: Path):
                         import fcntl
 
                         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            except (OSError, AttributeError):
+            except (OSError, AttributeError, ImportError):
                 pass
             finally:
                 handle.close()

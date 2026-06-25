@@ -5463,3 +5463,14 @@ def test_dispatch_once_skips_when_tick_lock_held(kanban_home, all_assignees_spaw
         res2 = kb.dispatch_once(conn, spawn_fn=fake_spawn)
     assert res2.skipped_locked is False
     assert spawned, "dispatch should spawn once the lock is free"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="exercises the POSIX fcntl branch")
+def test_dispatch_tick_lock_degrades_to_noop_without_fcntl(kanban_home, monkeypatch):
+    """When the lock backend is unavailable, _dispatch_tick_lock must degrade to
+    a no-op (yield True) so dispatch proceeds — not crash with ImportError."""
+    # Setting sys.modules['fcntl'] = None makes `import fcntl` raise ImportError.
+    monkeypatch.setitem(sys.modules, "fcntl", None)
+    db_path = kb.kanban_db_path()
+    with kb._dispatch_tick_lock(db_path) as held:
+        assert held is True, "missing lock backend must degrade to no-op, not block"
