@@ -16,7 +16,7 @@ import os
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
@@ -70,6 +70,34 @@ def _release_singleton_lock(handle) -> None:
         handle.close()
     except Exception:
         pass
+
+
+def _resolve_auto_decompose_settings(
+    load_config: "Callable[[], Any]",
+) -> "tuple[bool, int]":
+    """Resolve the live (enabled, per_tick) auto-decompose settings.
+
+    Read fresh from config on every dispatcher tick (upstream #49638) so that
+    flipping ``kanban.auto_decompose: false`` to STOP runaway fan-out takes
+    effect on the next tick instead of requiring a gateway restart.
+
+    Fails SAFE: if the config read raises, return ``(False, 3)`` -- a transient
+    read error must never re-enable a feature the user turned off, nor fall back
+    to the burst-prone default-on behaviour. ``per_tick`` is clamped to ``>= 1``.
+    """
+    try:
+        cfg = load_config()
+    except Exception:
+        return False, 3
+    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    enabled = bool(kcfg.get("auto_decompose", True))
+    try:
+        per_tick = int(kcfg.get("auto_decompose_per_tick", 3) or 3)
+    except (TypeError, ValueError):
+        per_tick = 3
+    if per_tick < 1:
+        per_tick = 1
+    return enabled, per_tick
 
 
 class GatewayKanbanWatchersMixin:
@@ -1093,17 +1121,13 @@ class GatewayKanbanWatchersMixin:
         # ``kanban.auto_decompose_per_tick`` (default 3) so a bulk-load
         # of triage tasks doesn't burst-spend the aux LLM in one tick;
         # remainder defers to subsequent ticks.
-        auto_decompose_enabled = bool(kanban_cfg.get("auto_decompose", True))
-        try:
-            auto_decompose_per_tick = int(
-                kanban_cfg.get("auto_decompose_per_tick", 3) or 3
-            )
-        except (TypeError, ValueError):
-            auto_decompose_per_tick = 3
-        if auto_decompose_per_tick < 1:
-            auto_decompose_per_tick = 1
+        # Resolved fresh EACH TICK (upstream #49638 port, 2026-06-25) -- flipping
+        # ``kanban.auto_decompose: false`` to halt runaway fan-out takes effect on
+        # the next tick without a gateway restart, and fails safe.
+        def _read_auto_decompose_settings() -> "tuple[bool, int]":
+            return _resolve_auto_decompose_settings(_load_config)
 
-        def _auto_decompose_tick() -> int:
+        def _auto_decompose_tick(auto_decompose_per_tick: int) -> int:
             """Run the auto-decomposer for up to N triage tasks across all
             boards. Returns the number of triage tasks that were
             successfully decomposed or specified this tick.
@@ -1215,8 +1239,9 @@ class GatewayKanbanWatchersMixin:
                     logger.exception("kanban dispatcher: zombie reaper failed")
 
                 try:
-                    if auto_decompose_enabled:
-                        await asyncio.to_thread(_auto_decompose_tick)
+                    _auto_dec_enabled, _auto_dec_per_tick = _read_auto_decompose_settings()
+                    if _auto_dec_enabled:
+                        await asyncio.to_thread(_auto_decompose_tick, _auto_dec_per_tick)
                     results = await asyncio.to_thread(_tick_once)
                     any_spawned = False
                     for slug, res in (results or []):

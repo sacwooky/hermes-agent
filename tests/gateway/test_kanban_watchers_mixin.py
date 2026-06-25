@@ -230,3 +230,27 @@ def test_singleton_dispatcher_lock_is_exclusive(tmp_path):
     h3, st3 = _acquire_singleton_lock(lock)
     assert st3 == "held" and h3 is not None
     _release_singleton_lock(h3)
+
+
+def test_resolve_auto_decompose_settings_fails_safe_and_clamps():
+    """Per-tick resolver (upstream #49638 port): live read, fail-safe, clamp.
+
+    Flipping auto_decompose off must take effect without a restart; a config
+    read error must DISABLE (never re-enable a feature the user turned off);
+    per_tick clamps to >= 1.
+    """
+    from gateway.kanban_watchers import _resolve_auto_decompose_settings
+
+    # Live read of current config values.
+    assert _resolve_auto_decompose_settings(lambda: {"kanban": {"auto_decompose": False}}) == (False, 3)
+    assert _resolve_auto_decompose_settings(lambda: {"kanban": {"auto_decompose": True, "auto_decompose_per_tick": 5}}) == (True, 5)
+    # per_tick=0 is treated as unset (-> default 3 via ``or 3``); negatives clamp to >= 1.
+    assert _resolve_auto_decompose_settings(lambda: {"kanban": {"auto_decompose_per_tick": 0}})[1] == 3
+    assert _resolve_auto_decompose_settings(lambda: {"kanban": {"auto_decompose_per_tick": -5}})[1] == 1
+    # Bad per_tick falls back to 3, not a crash.
+    assert _resolve_auto_decompose_settings(lambda: {"kanban": {"auto_decompose_per_tick": "nope"}})[1] == 3
+
+    # Fail SAFE: a config-read error disables, never re-enables.
+    def _boom():
+        raise RuntimeError("config unreadable")
+    assert _resolve_auto_decompose_settings(_boom) == (False, 3)
