@@ -113,6 +113,8 @@ class TurnContext:
     plugin_user_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
+    # Conductor-vault grounding preflight block (injected at API-call time).
+    grounding_context_block: str = ""
 
 
 def build_turn_context(
@@ -460,6 +462,20 @@ def build_turn_context(
         except Exception:
             pass
 
+    # Conductor-vault grounding preflight: ground the turn in the vault + host
+    # skills BEFORE the loop runs. Mirrors the memory prefetch above; injected
+    # at API-call time only (never mutates the persisted message). Guarded so a
+    # preflight failure never breaks the turn.
+    grounding_context_block = ""
+    try:
+        from agent.grounding_preflight import build_grounding_context_block
+        grounding_context_block = build_grounding_context_block(
+            original_user_message, conversation_history
+        )
+    except Exception:
+        logger.debug("grounding preflight build failed", exc_info=True)
+        grounding_context_block = ""
+
     return TurnContext(
         user_message=user_message,
         original_user_message=original_user_message,
@@ -472,4 +488,5 @@ def build_turn_context(
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
+        grounding_context_block=grounding_context_block,
     )
