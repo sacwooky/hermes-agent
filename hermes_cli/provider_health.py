@@ -470,6 +470,10 @@ def record_failure(
     Bounded-failure + backoff (§0a#2):
       * CONTENT_POLICY is request-scoped and NEVER marks the credential — this
         function no-ops (returns CLOSED) for it.
+      * An ":unresolved" AUTH cid (the key env was not injected into this
+        process) also no-ops — it is an injection/config bug, not a provider
+        rejection, and must not strand an unclearable credential breaker
+        (§0a#8 addendum).
       * In CLOSED: increment the consecutive counter inside the rolling window
         (a failure outside the window restarts the count at 1). Open only when
         the count reaches the threshold.
@@ -481,6 +485,24 @@ def record_failure(
     """
     if failure_class == CONTENT_POLICY:
         return CLOSED  # never marks the credential (§0a#3)
+
+    if failure_class == AUTH and cid.endswith(":unresolved"):
+        # §0a#8 addendum: an ":unresolved" cid means cred_id() could not
+        # fingerprint the key — the KEY env var was not injected into THIS
+        # process (a caller / boot-order injection bug), NOT a credential the
+        # provider rejected (a real 401 always carries a resolved fingerprint).
+        # Opening a credential breaker here strands a record that can never
+        # clear (a later success uses the resolved-fingerprint id, not
+        # ":unresolved") and surfaces in The Bridge as a false "fix it in
+        # FluxCreds" alarm. No-op the credential breaker; surface the injection
+        # gap loudly instead so the missing-injection bug gets fixed.
+        logger.warning(
+            "provider-auth: %s not resolved in this process — check secret "
+            "injection (Infisical/FluxCreds) for this service; not opening a "
+            "credential breaker",
+            cid.split(":")[0],
+        )
+        return CLOSED
 
     now = now_ms if now_ms is not None else _now_ms()
     threshold, window_s, base_s, cap_s = _params_for_class(failure_class)

@@ -40,6 +40,24 @@ def test_n_consecutive_opens(state_path):
     assert ph.is_open("k:abc", path=state_path, now_ms=1300) is True
 
 
+def test_unresolved_auth_cid_never_opens(state_path):
+    """§0a#8 addendum — an ":unresolved" cid means the key env was not injected
+    into THIS process (a caller/boot-order bug), not a provider rejection. AUTH
+    failures on it must NOT open a credential breaker: such a record could never
+    clear (a later success uses the resolved-fingerprint id) and would render in
+    The Bridge as a false "fix it in FluxCreds" alarm. A resolved-fingerprint
+    cid with the same env still opens normally."""
+    cid = "NINEROUTER_KEY:unresolved"
+    for t in (1000, 1100, 1200, 1300):
+        assert ph.record_failure(cid, ph.AUTH, path=state_path, now_ms=t) == ph.CLOSED
+    assert ph.is_open(cid, path=state_path, now_ms=1400) is False
+    # Contrast: the SAME env with a resolved fingerprint still opens at N=3.
+    resolved = "NINEROUTER_KEY:7e66a8e4"
+    ph.record_failure(resolved, ph.AUTH, path=state_path, now_ms=1000)
+    ph.record_failure(resolved, ph.AUTH, path=state_path, now_ms=1100)
+    assert ph.record_failure(resolved, ph.AUTH, path=state_path, now_ms=1200) == ph.OPEN
+
+
 def test_failures_outside_window_do_not_accumulate(state_path):
     """A failure outside the 120s rolling window restarts the count at 1."""
     ph.record_failure("k:abc", ph.AUTH, path=state_path, now_ms=1000)
