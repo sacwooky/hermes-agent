@@ -230,6 +230,12 @@ def _is_kimi_model(model: Optional[str]) -> bool:
     return bare.startswith("kimi-") or bare == "kimi"
 
 
+def _is_fable_model(model: Optional[str]) -> bool:
+    """True for Claude Fable-family models that reject ``temperature`` entirely."""
+    bare = (model or "").strip().lower().rsplit("/", 1)[-1]
+    return bare.startswith("claude-fable-")
+
+
 def _is_arcee_trinity_thinking(model: Optional[str]) -> bool:
     """True for Arcee Trinity Large Thinking (direct or via OpenRouter)."""
     bare = (model or "").strip().lower().rsplit("/", 1)[-1]
@@ -273,14 +279,18 @@ def _fixed_temperature_for_model(
 
     Returns:
         ``OMIT_TEMPERATURE`` — caller must remove the ``temperature`` key so the
-            provider chooses its own default.  Used for all Kimi / Moonshot
-            models whose gateway selects temperature server-side.
+            provider chooses its own default. Used for Kimi / Moonshot models
+            whose gateway selects temperature server-side and Claude Fable
+            models, which reject the parameter entirely.
         ``float`` — a specific value the caller must use (reserved for future
             models with fixed-temperature contracts).
         ``None`` — no override; caller should use its own default.
     """
     if _is_kimi_model(model):
         logger.debug("Omitting temperature for Kimi model %r (server-managed)", model)
+        return OMIT_TEMPERATURE
+    if _is_fable_model(model):
+        logger.debug("Omitting temperature for Fable model %r (unsupported)", model)
         return OMIT_TEMPERATURE
     if _is_arcee_trinity_thinking(model):
         return 0.5
@@ -2645,6 +2655,7 @@ def _is_unsupported_parameter_error(exc: Exception, param: str) -> bool:
         "unrecognized request argument",
         "unrecognized parameter",
         "invalid parameter",
+        "deprecated",
     ))
 
 

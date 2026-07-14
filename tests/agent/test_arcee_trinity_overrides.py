@@ -14,10 +14,12 @@ from __future__ import annotations
 import pytest
 
 from agent.auxiliary_client import (
+    OMIT_TEMPERATURE,
     _compression_threshold_for_model,
     _fixed_temperature_for_model,
     _is_arcee_trinity_thinking,
     _is_codex_gpt55,
+    _is_fable_model,
 )
 
 
@@ -61,6 +63,30 @@ def test_fixed_temperature_sibling_arcee_models_unaffected() -> None:
     # Preview and mini do not pin temperature — caller chooses its default.
     assert _fixed_temperature_for_model("trinity-large-preview") is None
     assert _fixed_temperature_for_model("trinity-mini") is None
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "claude-fable-5",
+        "cc/claude-fable-5",
+        "CLAUDE-FABLE-5",
+        "  cc/claude-fable-5  ",
+        "claude-fable-5-preview",
+    ],
+)
+def test_is_fable_model_matches(model: str) -> None:
+    assert _is_fable_model(model) is True
+    assert _fixed_temperature_for_model(model) is OMIT_TEMPERATURE
+
+
+@pytest.mark.parametrize(
+    "model",
+    [None, "", "claude-opus-4-8", "claude-sonnet-4-6", "fable-5", "mythos-5"],
+)
+def test_is_fable_model_rejects_non_matches(model) -> None:
+    assert _is_fable_model(model) is False
+    assert _fixed_temperature_for_model(model) is None
 
 
 def test_compression_threshold_for_trinity_thinking() -> None:

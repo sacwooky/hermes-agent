@@ -48,6 +48,8 @@ class TestIsUnsupportedTemperatureError:
         "this model does not support temperature",
         # Anthropic-style via OAI-compat
         "temperature: unknown parameter",
+        # Claude Fable rejects the parameter as deprecated.
+        "`temperature` is deprecated for this model.",
         # Some gateways
         "unrecognized request argument supplied: temperature",
     ])
