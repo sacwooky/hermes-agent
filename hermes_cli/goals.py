@@ -878,7 +878,12 @@ def judge_goal(
         return "continue", "empty response (nothing to evaluate)", False, None
 
     try:
-        from agent.auxiliary_client import get_auxiliary_extra_body, get_text_auxiliary_client
+        from agent.auxiliary_client import (
+            OMIT_TEMPERATURE,
+            _fixed_temperature_for_model,
+            get_auxiliary_extra_body,
+            get_text_auxiliary_client,
+        )
     except Exception as exc:
         logger.debug("goal judge: auxiliary client import failed: %s", exc)
         return "continue", "auxiliary client unavailable", False, None
@@ -941,10 +946,11 @@ def judge_goal(
                 {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0,
             max_tokens=_goal_judge_max_tokens(),
             timeout=timeout,
             extra_body=get_auxiliary_extra_body() or None,
+            **({} if _fixed_temperature_for_model(model) is OMIT_TEMPERATURE
+               else {"temperature": 0}),
         )
     except Exception as exc:
         logger.info("goal judge: API call failed (%s) — falling through to continue", exc)
@@ -999,7 +1005,12 @@ def draft_contract(objective: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT) ->
         return None
 
     try:
-        from agent.auxiliary_client import get_auxiliary_extra_body, get_text_auxiliary_client
+        from agent.auxiliary_client import (
+            OMIT_TEMPERATURE,
+            _fixed_temperature_for_model,
+            get_auxiliary_extra_body,
+            get_text_auxiliary_client,
+        )
     except Exception as exc:
         logger.debug("goal draft: auxiliary client import failed: %s", exc)
         return None
@@ -1020,10 +1031,11 @@ def draft_contract(objective: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT) ->
                 {"role": "system", "content": DRAFT_CONTRACT_SYSTEM_PROMPT},
                 {"role": "user", "content": f"Objective:\n{_truncate(objective, 4000)}"},
             ],
-            temperature=0,
             max_tokens=_goal_judge_max_tokens(),
             timeout=timeout,
             extra_body=get_auxiliary_extra_body() or None,
+            **({} if _fixed_temperature_for_model(model) is OMIT_TEMPERATURE
+               else {"temperature": 0}),
         )
     except Exception as exc:
         logger.info("goal draft: API call failed (%s)", exc)

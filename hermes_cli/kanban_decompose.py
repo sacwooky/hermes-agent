@@ -299,6 +299,8 @@ def decompose_task(
 
     try:
         from agent.auxiliary_client import (  # type: ignore
+            OMIT_TEMPERATURE,
+            _fixed_temperature_for_model,
             get_auxiliary_extra_body,
             get_text_auxiliary_client,
         )
@@ -323,18 +325,24 @@ def decompose_task(
         default_assignee=default_assignee,
     )
 
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.3,
-            max_tokens=4000,
-            timeout=timeout or 180,
-            extra_body=get_auxiliary_extra_body() or None,
+    create_kwargs = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+        "max_tokens": 4000,
+        "timeout": timeout or 180,
+        "extra_body": get_auxiliary_extra_body() or None,
+    }
+    fixed_temperature = _fixed_temperature_for_model(model)
+    if fixed_temperature is not OMIT_TEMPERATURE:
+        create_kwargs["temperature"] = (
+            0.3 if fixed_temperature is None else fixed_temperature
         )
+
+    try:
+        resp = client.chat.completions.create(**create_kwargs)
     except Exception as exc:
         logger.info(
             "decompose: API call failed for %s (%s)", task_id, exc,
