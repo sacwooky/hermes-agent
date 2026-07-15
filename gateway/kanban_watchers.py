@@ -100,6 +100,66 @@ def _resolve_auto_decompose_settings(
     return enabled, per_tick
 
 
+def _format_kanban_terminal_message(
+    sub: dict, task: Any, title: str, ev: Any
+) -> "Optional[str]":
+    """Render one terminal ``task_event`` as a human-facing notification line.
+
+    Shared by both delivery paths so they can't drift: the ``adapter.send()``
+    push (chat platforms) and the synthetic-inbound wake (stateless WebUI).
+    Returns ``None`` for event kinds that are not user-facing terminal states.
+    """
+    kind = ev.kind
+    # Identity prefix: attribute terminal pings to the worker that did the
+    # work. Makes fleets (where one chat subscribes to many tasks) legible.
+    who = (task.assignee if task and task.assignee else None)
+    tag = f"@{who} " if who else ""
+    if kind == "completed":
+        # Prefer the run's summary (the worker's intentional human-facing
+        # handoff, carried in the event payload), then fall back to
+        # task.result for legacy rows written before runs shipped.
+        handoff = ""
+        payload_summary = None
+        if ev.payload and ev.payload.get("summary"):
+            payload_summary = str(ev.payload["summary"])
+        if payload_summary:
+            lines = payload_summary.strip().splitlines()
+            h = lines[0][:200] if lines else payload_summary[:200]
+            handoff = f"\n{h}"
+        elif task and task.result:
+            lines = task.result.strip().splitlines()
+            r = lines[0][:160] if lines else task.result[:160]
+            handoff = f"\n{r}"
+        return f"✔ {tag}Kanban {sub['task_id']} done — {title}{handoff}"
+    if kind == "blocked":
+        reason = ""
+        if ev.payload and ev.payload.get("reason"):
+            reason = f": {str(ev.payload['reason'])[:160]}"
+        return f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
+    if kind == "gave_up":
+        err = ""
+        if ev.payload and ev.payload.get("error"):
+            err = f"\n{str(ev.payload['error'])[:200]}"
+        return (
+            f"✖ {tag}Kanban {sub['task_id']} gave up "
+            f"after repeated spawn failures{err}"
+        )
+    if kind == "crashed":
+        return (
+            f"✖ {tag}Kanban {sub['task_id']} worker crashed "
+            f"(pid gone); dispatcher will retry"
+        )
+    if kind == "timed_out":
+        limit = 0
+        if ev.payload and ev.payload.get("limit_seconds"):
+            limit = int(ev.payload["limit_seconds"])
+        return (
+            f"⏱ {tag}Kanban {sub['task_id']} timed out "
+            f"(max_runtime={limit}s); will retry"
+        )
+    return None
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -387,63 +447,69 @@ class GatewayKanbanWatchersMixin:
                         )
                         continue
                     title = (task.title if task else sub["task_id"])[:120]
-                    for ev in d["events"]:
-                        kind = ev.kind
-                        # Identity prefix: attribute terminal pings to the
-                        # worker that did the work. Makes fleets (where one
-                        # chat subscribes to many tasks) legible at a glance.
-                        who = (task.assignee if task and task.assignee else None)
-                        tag = f"@{who} " if who else ""
-                        if kind == "completed":
-                            # Prefer the run's summary (the worker's
-                            # intentional human-facing handoff, carried
-                            # in the event payload), then fall back to
-                            # task.result for legacy rows written before
-                            # runs shipped.
-                            handoff = ""
-                            payload_summary = None
-                            if ev.payload and ev.payload.get("summary"):
-                                payload_summary = str(ev.payload["summary"])
-                            if payload_summary:
-                                lines = payload_summary.strip().splitlines()
-                                h = lines[0][:200] if lines else payload_summary[:200]
-                                handoff = f"\n{h}"
-                            elif task and task.result:
-                                lines = task.result.strip().splitlines()
-                                r = lines[0][:160] if lines else task.result[:160]
-                                handoff = f"\n{r}"
-                            msg = (
-                                f"✔ {tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
+
+                    # Stateless channels (WebUI/api_server) declare
+                    # ``supports_async_delivery = False``: their ``send()`` is a
+                    # no-op stub that silently drops the ping (and the notifier
+                    # would then advance the cursor as if delivered, losing the
+                    # event forever). For those, wake the originating agent turn
+                    # via the same synthetic-inbound rail background processes
+                    # and async delegations use, so it re-engages, checks the
+                    # board, drives remaining/blocked work, and reports back —
+                    # instead of leaving the user to poll "update?". Chat
+                    # platforms keep the existing push path unchanged.
+                    if getattr(adapter, "supports_async_delivery", True) is False:
+                        sub_key = (
+                            sub["task_id"], sub["platform"],
+                            sub["chat_id"], sub.get("thread_id") or "",
+                        )
+                        woke = await self._kanban_wake_stateless_session(
+                            sub, task, title, d["events"],
+                        )
+                        if woke:
+                            sub_fail_counts.pop(sub_key, None)
+                            await asyncio.to_thread(
+                                self._kanban_advance, sub, d["cursor"], board_slug,
                             )
-                        elif kind == "blocked":
-                            reason = ""
-                            if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
-                        elif kind == "gave_up":
-                            err = ""
-                            if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
-                            msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
-                            )
-                        elif kind == "crashed":
-                            msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
-                            )
-                        elif kind == "timed_out":
-                            limit = 0
-                            if ev.payload and ev.payload.get("limit_seconds"):
-                                limit = int(ev.payload["limit_seconds"])
-                            msg = (
-                                f"⏱ {tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
-                            )
+                            if task and task.status in {"done", "archived"}:
+                                await asyncio.to_thread(
+                                    self._kanban_unsub, sub, board_slug,
+                                )
                         else:
+                            # Could not route the wake (no session_key, or the
+                            # origin session is gone from the session store).
+                            # Bound the retry-spin the same way the send() path
+                            # bounds a dead chat: rewind and retry a few ticks,
+                            # then drop the subscription so we don't rewind
+                            # every 5s forever against a session that will
+                            # never come back.
+                            fails = sub_fail_counts.get(sub_key, 0) + 1
+                            sub_fail_counts[sub_key] = fails
+                            if fails >= MAX_SEND_FAILURES:
+                                logger.warning(
+                                    "kanban notifier: dropping stateless sub %s "
+                                    "after %d unroutable wake attempts",
+                                    sub["task_id"], fails,
+                                )
+                                await asyncio.to_thread(
+                                    self._kanban_unsub, sub, board_slug,
+                                )
+                                sub_fail_counts.pop(sub_key, None)
+                            else:
+                                await asyncio.to_thread(
+                                    self._kanban_rewind,
+                                    sub,
+                                    d["cursor"],
+                                    d.get("old_cursor", 0),
+                                    board_slug,
+                                )
+                        continue
+
+                    for ev in d["events"]:
+                        msg = _format_kanban_terminal_message(sub, task, title, ev)
+                        if msg is None:
                             continue
+                        kind = ev.kind
                         metadata: dict[str, Any] = {}
                         if sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
@@ -539,6 +605,83 @@ class GatewayKanbanWatchersMixin:
                 if not self._running:
                     return
                 await asyncio.sleep(1)
+
+    async def _kanban_wake_stateless_session(
+        self, sub: dict, task: Any, title: str, events: list,
+    ) -> bool:
+        """Wake a stateless (WebUI) session with coalesced terminal events.
+
+        Builds ONE synthetic inbound turn from all of this tick's terminal
+        events for the subscription and injects it via the same rail used by
+        background-process and async-delegation completions
+        (:meth:`_inject_watch_notification` -> ``adapter.handle_message`` ->
+        a fresh agent turn). Coalescing avoids N wakes when a board finishes
+        several cards in one 5s tick.
+
+        Returns ``True`` when a wake was routed (caller advances the cursor),
+        ``False`` when the subscription can't be routed to a live origin
+        session — either it predates the ``session_key`` column, or the origin
+        is no longer in the session store (session ended). The caller bounds
+        retries so an unroutable sub is eventually dropped rather than
+        rewound forever.
+        """
+        session_key = (sub.get("session_key") or "").strip()
+        if not session_key:
+            logger.debug(
+                "kanban notifier: stateless sub for %s has no session_key; "
+                "cannot wake",
+                sub.get("task_id"),
+            )
+            return False
+
+        evt = {
+            "session_key": session_key,
+            "platform": sub.get("platform") or "",
+            "chat_id": sub.get("chat_id") or "",
+            "thread_id": sub.get("thread_id") or "",
+            "user_id": sub.get("user_id") or "",
+        }
+        # Resolve routing up front: _inject_watch_notification swallows a
+        # no-route as a warning and returns, which would let us advance the
+        # cursor and lose the event. Check first so an unresolvable origin
+        # returns False (retry/drop) instead of a false success.
+        if self._build_process_event_source(evt) is None:
+            logger.debug(
+                "kanban notifier: cannot resolve origin session for %s "
+                "(key=%s); will retry",
+                sub.get("task_id"), session_key,
+            )
+            return False
+
+        lines = [
+            line for line in (
+                _format_kanban_terminal_message(sub, task, title, ev)
+                for ev in events
+            ) if line
+        ]
+        if not lines:
+            # Only non-user-facing events this tick; treat as handled so the
+            # cursor advances past them (matches the send() path's `continue`).
+            return True
+
+        body = "\n".join(lines)
+        synth_text = (
+            "[KANBAN UPDATE] Board work you dispatched reached a terminal "
+            "state:\n"
+            f"{body}\n\n"
+            "Check the board for remaining and blocked tasks. Continue any "
+            "unblocked work, retry or escalate blockers, then give a brief "
+            "status update. If all board work is complete, report completion."
+        )
+        try:
+            await self._inject_watch_notification(synth_text, evt)
+            return True
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: wake injection failed for %s: %s",
+                sub.get("task_id"), exc,
+            )
+            return False
 
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,

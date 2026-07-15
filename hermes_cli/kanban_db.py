@@ -1179,6 +1179,11 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     thread_id     TEXT NOT NULL DEFAULT '',
     user_id       TEXT,
     notifier_profile TEXT,
+    -- Originating gateway session_key captured at subscribe time. Needed to
+    -- wake stateless channels (WebUI/api_server) whose adapter.send() is a
+    -- no-op stub: the notifier routes a synthetic inbound turn to this key
+    -- instead. NULL for legacy rows and for channels that deliver via send().
+    session_key   TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
@@ -1839,6 +1844,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
             )
+        if "session_key" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "session_key", "session_key TEXT"
+            )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2062,7 +2071,7 @@ _REBUILD_SPECS = {
         "CREATE TABLE kanban_notify_subs ("
         " task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,"
         " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
-        " notifier_profile TEXT, created_at INTEGER NOT NULL,"
+        " notifier_profile TEXT, session_key TEXT, created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
@@ -9786,16 +9795,22 @@ def add_notify_sub(
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
+    session_key: Optional[str] = None,
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
-    for ``task_id``. Idempotent on (task, platform, chat, thread)."""
+    for ``task_id``. Idempotent on (task, platform, chat, thread).
+
+    ``session_key`` is the originating gateway session key. It lets the
+    notifier wake stateless channels (WebUI/api_server) — whose ``send()``
+    can't push — by injecting a synthetic inbound turn routed to that key.
+    """
     now = int(time.time())
     with write_txn(conn):
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, session_key, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -9804,6 +9819,7 @@ def add_notify_sub(
                 thread_id or "",
                 user_id,
                 notifier_profile,
+                session_key or None,
                 now,
             ),
         )
@@ -9818,6 +9834,19 @@ def add_notify_sub(
                    AND (notifier_profile IS NULL OR notifier_profile = '')
                 """,
                 (notifier_profile, task_id, platform, chat_id, thread_id or ""),
+            )
+        if session_key:
+            # Same self-heal for session_key: an existing row created before
+            # this column (or via the send() path) gets its routing key
+            # backfilled so a later wake can reach the originating session.
+            conn.execute(
+                """
+                UPDATE kanban_notify_subs
+                   SET session_key = ?
+                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                   AND (session_key IS NULL OR session_key = '')
+                """,
+                (session_key, task_id, platform, chat_id, thread_id or ""),
             )
 
 

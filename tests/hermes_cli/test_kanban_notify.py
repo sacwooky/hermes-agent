@@ -653,3 +653,162 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     # Only the real file was uploaded.
     assert len(documents_uploaded) == 1
     assert "real.pdf" in documents_uploaded[0]
+
+
+# ---------------------------------------------------------------------------
+# Stateless-channel wake (WebUI / api_server): adapter.send() is a no-op stub,
+# so terminal events must wake the originating agent turn via the
+# _inject_watch_notification rail instead of being silently dropped.
+# ---------------------------------------------------------------------------
+
+def test_add_notify_sub_stores_session_key(kanban_home):
+    """session_key passed at subscribe time is persisted on the sub row."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="wake task")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="api_server", chat_id="webui-1",
+            session_key="agent:main:webui:dm:user-1",
+        )
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    assert subs[0]["session_key"] == "agent:main:webui:dm:user-1"
+
+
+def test_add_notify_sub_backfills_session_key(kanban_home):
+    """A row first created without a session_key is backfilled when a later
+    subscribe call for the same (task, platform, chat, thread) supplies one."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="backfill task")
+        kb.add_notify_sub(conn, task_id=tid, platform="api_server", chat_id="webui-1")
+        assert kb.list_notify_subs(conn, tid)[0]["session_key"] in (None, "")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="api_server", chat_id="webui-1",
+            session_key="agent:main:webui:dm:user-1",
+        )
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+    assert subs[0]["session_key"] == "agent:main:webui:dm:user-1"
+
+
+@pytest.mark.asyncio
+async def test_wake_stateless_session_routes_via_inject(kanban_home):
+    """With a resolvable origin, the helper injects a coalesced wake turn
+    (not adapter.send) and returns True."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._inject_watch_notification = AsyncMock()
+    runner._build_process_event_source = MagicMock(
+        return_value=SimpleNamespace(platform="api_server", chat_id="webui-1", thread_id=None)
+    )
+
+    sub = {
+        "task_id": "t1", "platform": "api_server", "chat_id": "webui-1",
+        "thread_id": "", "user_id": "u1",
+        "session_key": "agent:main:webui:dm:user-1",
+    }
+    task = SimpleNamespace(assignee="worker1", result=None, status="done", title="Build X")
+    events = [
+        SimpleNamespace(kind="completed", payload={"summary": "shipped X"}),
+        SimpleNamespace(kind="blocked", payload={"reason": "needs key"}),
+    ]
+
+    woke = await runner._kanban_wake_stateless_session(sub, task, "Build X", events)
+
+    assert woke is True
+    runner._inject_watch_notification.assert_awaited_once()
+    synth_text, evt = runner._inject_watch_notification.await_args[0]
+    # Coalesced: one wake carrying both events + a drive-to-done directive.
+    assert "[KANBAN UPDATE]" in synth_text
+    assert "done" in synth_text and "blocked" in synth_text
+    assert "Continue any" in synth_text
+    assert evt["session_key"] == "agent:main:webui:dm:user-1"
+
+
+@pytest.mark.asyncio
+async def test_wake_stateless_session_false_without_session_key(kanban_home):
+    """No session_key → cannot route → returns False and never injects
+    (the caller then bounds retries and eventually drops the sub)."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._inject_watch_notification = AsyncMock()
+    runner._build_process_event_source = MagicMock(return_value=None)
+
+    sub = {
+        "task_id": "t1", "platform": "api_server", "chat_id": "webui-1",
+        "thread_id": "", "user_id": "u1", "session_key": "",
+    }
+    task = SimpleNamespace(assignee=None, result=None, status="done", title="X")
+    events = [SimpleNamespace(kind="completed", payload=None)]
+
+    woke = await runner._kanban_wake_stateless_session(sub, task, "X", events)
+
+    assert woke is False
+    runner._inject_watch_notification.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_notifier_wakes_stateless_channel_instead_of_send(kanban_home):
+    """End-to-end: a completed event on an api_server (send()-incapable)
+    subscription wakes the agent via inject, never calls adapter.send, and
+    unsubscribes once the task is done."""
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="webui task", assignee="worker1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="api_server", chat_id="webui-1",
+            session_key="agent:main:webui:dm:user-1",
+        )
+        kb.complete_task(conn, tid, result="done by agent")
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    runner._build_process_event_source = MagicMock(
+        return_value=SimpleNamespace(platform="api_server", chat_id="webui-1", thread_id=None)
+    )
+
+    async def _inject_and_stop(synth_text, evt):
+        runner._injected = synth_text
+        runner._running = False
+
+    runner._inject_watch_notification = AsyncMock(side_effect=_inject_and_stop)
+
+    # Stateless adapter: send() must never be called.
+    fake_adapter = MagicMock()
+    fake_adapter.supports_async_delivery = False
+    fake_adapter.send = AsyncMock()
+    runner.adapters = {Platform.API_SERVER: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        await _orig_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    fake_adapter.send.assert_not_called()
+    runner._inject_watch_notification.assert_awaited()
+    assert "[KANBAN UPDATE]" in runner._injected
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+    assert subs == [], "done task should unsubscribe after the wake"
