@@ -8,11 +8,30 @@ from pathlib import Path
 from typing import List, Optional
 
 import os
+import re
 
 logger = logging.getLogger(__name__)
 
+# gpt-5.5 is SILENTLY DROPPED by the ChatGPT Codex OAuth backend
+# (chatgpt.com/backend-api/codex): the connection is accepted but no stream
+# events are emitted and no error is raised, so a request hangs until the
+# stale-call detector kills it (see run_agent._codex_silent_hang_hint,
+# hermes-agent#21444). The backend still *advertises* the slug, so live
+# discovery re-surfaces it even when it is removed from the static fallback
+# below — it must be filtered at the resolution chokepoint, not just the list.
+# Excluded from every Codex picker fleet-wide; the hint remains as a backstop
+# for any path that still reaches the model.
+_SILENT_HANG_CODEX_RE = re.compile(r"(?:^|[/\-_])gpt-5\.5(?:$|[\-_])", re.IGNORECASE)
+
+
+def _is_silent_hang_codex_model(model_id: str) -> bool:
+    """True for the gpt-5.5 family, which silent-hangs on the Codex backend."""
+    return bool(_SILENT_HANG_CODEX_RE.search((model_id or "").lower()))
+
+
 DEFAULT_CODEX_MODELS: List[str] = [
-    "gpt-5.5",
+    # gpt-5.5 intentionally omitted — silent-hang family (see
+    # _is_silent_hang_codex_model above); filtered on resolution regardless.
     "gpt-5.4-mini",
     "gpt-5.4",
     "gpt-5.3-codex",
@@ -44,7 +63,7 @@ DEFAULT_CODEX_MODELS: List[str] = [
 ]
 
 _FORWARD_COMPAT_TEMPLATE_MODELS: List[tuple[str, tuple[str, ...]]] = [
-    ("gpt-5.5", ("gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex")),
+    # gpt-5.5 template removed — silent-hang family, filtered on resolution.
     ("gpt-5.4-mini", ("gpt-5.3-codex",)),
     ("gpt-5.4", ("gpt-5.3-codex",)),
     # Surface Spark whenever any compatible Codex template is present so
@@ -76,7 +95,9 @@ def _add_forward_compat_models(model_ids: List[str]) -> List[str]:
             ordered.append(synthetic_model)
             seen.add(synthetic_model)
 
-    return ordered
+    # Drop silent-hang slugs (gpt-5.5 family) from every Codex source — live
+    # discovery, static fallback, and the curated picker all exit through here.
+    return [m for m in ordered if not _is_silent_hang_codex_model(m)]
 
 
 def _fetch_models_from_api(access_token: str) -> List[str]:
