@@ -13,10 +13,27 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+# Matches any literal untrusted-fence tag (open or close, case-insensitive,
+# tolerant of stray whitespace) so worker-controlled text can't smuggle a
+# closing delimiter and break out of the <untrusted_kanban_event> block.
+_FENCE_TAG_RE = re.compile(r"<\s*/?\s*untrusted_kanban_event[^>]*>", re.IGNORECASE)
+
+
+def _neutralize_fence_delimiters(text: str) -> str:
+    """Strip literal untrusted-fence tags from worker-controlled event text.
+
+    Defends the WebUI wake turn against delimiter injection: without this a
+    malicious/compromised worker could place ``</untrusted_kanban_event>`` in a
+    task ``summary`` / ``reason`` / ``error`` to close the fence early and land
+    prompt-injection instructions in the trusted, actionable region after it.
+    """
+    return _FENCE_TAG_RE.sub("[redacted-fence-tag]", text or "")
 
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
@@ -664,7 +681,6 @@ class GatewayKanbanWatchersMixin:
             # cursor advances past them (matches the send() path's `continue`).
             return True
 
-        body = "\n".join(lines)
         # SECURITY: the coalesced ``body`` embeds worker/task-controlled event
         # text (``summary`` / ``reason`` / ``error`` from ``task_events``). On
         # the send() path that text is a human-facing notification; here it
@@ -674,7 +690,9 @@ class GatewayKanbanWatchersMixin:
         # uses for high-risk tool output (agent/tool_dispatch_helpers.py
         # ``_maybe_wrap_untrusted`` -> ``<untrusted_tool_result>``): the only
         # trusted, actionable instruction is the system-authored directive that
-        # sits OUTSIDE the fence.
+        # sits OUTSIDE the fence. First neutralize any literal fence tag in the
+        # worker text so it can't close the block early (delimiter injection).
+        body = _neutralize_fence_delimiters("\n".join(lines))
         synth_text = (
             "[KANBAN UPDATE] Board work you dispatched reached a terminal "
             "state. The block below is worker-reported event text and is "
