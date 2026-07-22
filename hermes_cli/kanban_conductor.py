@@ -384,6 +384,18 @@ def drive_board_from_cli(
         finally:
             _close(c)
 
+    # The conductor process cwd IS the board workspace (set by _spawn_conductor),
+    # but — unlike a worker — the conductor sets no HERMES_KANBAN_TASK, so the
+    # kanban worker system prompt's "cd $HERMES_KANBAN_WORKSPACE" guidance never
+    # fires and the agent's terminal tool would otherwise default to $HOME. State
+    # the absolute working directory explicitly so all file work lands here.
+    workdir = _os.getcwd()
+    workdir_directive = (
+        f"Your working directory is: {workdir}\n"
+        f"Run `cd {workdir}` first and do ALL file work there (relative paths). "
+        f"Do not create or modify files outside this directory.\n\n"
+    )
+
     def _build_prompt(card: Dict[str, Any]) -> str:
         c = _connect()
         try:
@@ -392,7 +404,7 @@ def drive_board_from_cli(
             ctx = f"{card.get('title', '')}\n\n{card.get('body', '')}".strip()
         finally:
             _close(c)
-        return CONDUCTOR_CARD_PROMPT + "\n\n" + (ctx or "")
+        return workdir_directive + CONDUCTOR_CARD_PROMPT + "\n\n" + (ctx or "")
 
     # Enable in-session idle recheck by default so a conductor picks up cards
     # unblocked mid-session (e.g. children of a just-completed parent) without a

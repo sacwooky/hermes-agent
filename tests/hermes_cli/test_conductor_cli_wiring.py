@@ -97,3 +97,30 @@ def test_conductor_on_empty_board_is_a_clean_noop(kanban_home):
     res = drive_board_from_cli(fake, board="default", author="conductor", idle_max_seconds=0)
     assert fake.agent.calls == 0  # no cards → agent never invoked
     assert res["completed"] == [] and res["blocked"] == []
+
+
+def test_conductor_prompt_states_absolute_working_directory(kanban_home, tmp_path, monkeypatch):
+    """The per-card prompt must state the absolute working directory, since the
+    conductor sets no HERMES_KANBAN_TASK and so misses the worker prompt's
+    'cd $HERMES_KANBAN_WORKSPACE' guidance."""
+    with kb.connect() as c:
+        kb.create_task(c, title="X", body="do x", assignee="builder")
+    monkeypatch.chdir(tmp_path)  # simulate the conductor's cwd = the workspace
+    seen = {}
+
+    class _A:
+        session_id = "s"
+
+        def run_conversation(self, *, user_message, conversation_history):
+            seen["msg"] = user_message
+            return {"final_response": "DONE: ok"}
+
+    class _C:
+        session_id = "s"
+        conversation_history = []
+        agent = _A()
+
+    drive_board_from_cli(_C(), board="default",
+                         judge=lambda g, r: ("done", "ok", False, None), idle_max_seconds=0)
+    assert str(tmp_path) in seen["msg"], "prompt must name the absolute working directory"
+    assert "working directory" in seen["msg"].lower()
