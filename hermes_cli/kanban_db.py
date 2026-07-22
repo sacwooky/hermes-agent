@@ -9353,6 +9353,225 @@ def _default_spawn(
 
 
 # ---------------------------------------------------------------------------
+# Continuous conductor (opt-in, off by default)
+# ---------------------------------------------------------------------------
+#
+# Conductor mode replaces the per-card fire-and-forget worker relay with ONE
+# long-lived session per board that works the board's cards in-process (plan →
+# build with synchronous subagents → mark cards done → hand to review). It is
+# selected per board via ``kanban.boards.<slug>.conductor.enabled`` (or the
+# global ``kanban.conductor.default_enabled``); when unset the dispatcher's
+# existing ``dispatch_once`` path runs byte-for-byte unchanged.
+#
+# Slice 1 (this change) delivers only the ROUTING + one-conductor-per-board
+# guard: ``ensure_conductor`` spawns a single conductor process per board and
+# refuses to spawn a second while the first is alive. The conductor session's
+# actual multi-card driving behaviour (the ``HERMES_KANBAN_CONDUCTOR`` quiet-mode
+# entrypoint) is wired in a following slice; until then a board must not be
+# opted in outside a throwaway proving board.
+
+CONDUCTOR_PID_MARKER = "__conductor__"
+
+
+def conductor_enabled_for(kanban_cfg: Optional[dict], slug: str) -> bool:
+    """Whether ``slug`` runs in conductor mode, per config precedence.
+
+    Per-board ``kanban.boards.<slug>.conductor.enabled`` wins when present;
+    otherwise the global ``kanban.conductor.default_enabled`` (default False).
+    Pure function of config so the routing decision is unit-testable.
+    """
+    kanban_cfg = kanban_cfg if isinstance(kanban_cfg, dict) else {}
+    conductor_global = kanban_cfg.get("conductor")
+    if not isinstance(conductor_global, dict):
+        conductor_global = {}
+    boards = kanban_cfg.get("boards")
+    board_cfg = boards.get(slug) if isinstance(boards, dict) else None
+    ov = board_cfg.get("conductor") if isinstance(board_cfg, dict) else None
+    if isinstance(ov, dict) and "enabled" in ov:
+        return bool(ov["enabled"])
+    return bool(conductor_global.get("default_enabled", False))
+
+
+def conductor_profile_for(
+    kanban_cfg: Optional[dict], slug: str, *, fallback: str = "default"
+) -> str:
+    """Resolve the profile a board's conductor runs as.
+
+    Precedence: per-board ``conductor.profile`` → global ``conductor.profile``
+    → ``kanban.orchestrator_profile`` → ``fallback``.
+    """
+    kanban_cfg = kanban_cfg if isinstance(kanban_cfg, dict) else {}
+    conductor_global = kanban_cfg.get("conductor")
+    if not isinstance(conductor_global, dict):
+        conductor_global = {}
+    boards = kanban_cfg.get("boards")
+    board_cfg = boards.get(slug) if isinstance(boards, dict) else None
+    ov = board_cfg.get("conductor") if isinstance(board_cfg, dict) else None
+    if isinstance(ov, dict) and ov.get("profile"):
+        return str(ov["profile"])
+    if conductor_global.get("profile"):
+        return str(conductor_global["profile"])
+    if kanban_cfg.get("orchestrator_profile"):
+        return str(kanban_cfg["orchestrator_profile"])
+    return str(fallback)
+
+
+def _conductor_pid_path(db_path: Path) -> Path:
+    """Sibling ``.conductor.pid`` file next to a board's ``kanban.db``.
+
+    Mirrors how ``.dispatch.lock`` / ``.dispatcher.lock`` live beside the DB —
+    zero schema change, board-scoped, survives restarts.
+    """
+    return db_path.with_name(db_path.name + ".conductor.pid")
+
+
+def _read_conductor_pid(db_path: Path) -> Optional[int]:
+    try:
+        raw = _conductor_pid_path(db_path).read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _write_conductor_pid(db_path: Path, pid: Optional[int]) -> None:
+    path = _conductor_pid_path(db_path)
+    try:
+        if pid is None:
+            path.unlink(missing_ok=True)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(int(pid)), encoding="utf-8")
+    except OSError:
+        _log.debug("could not persist conductor pid for %s", db_path, exc_info=True)
+
+
+def _spawn_conductor(
+    board: Optional[str],
+    workspace: str,
+    *,
+    profile: str,
+) -> Optional[int]:
+    """Fire-and-forget ``hermes -p <profile> chat -q 'conduct kanban board …'``.
+
+    Board-pinned exactly like ``_default_spawn`` (same ``HERMES_KANBAN_DB`` /
+    ``WORKSPACES_ROOT`` / ``BOARD`` env, same ``start_new_session=True`` Popen
+    with an abandoned handle so init reaps it). Differs from a worker spawn in
+    that it carries NO per-task env (``HERMES_KANBAN_TASK`` / ``WORKSPACE`` /
+    ``CLAIM_LOCK``) and sets ``HERMES_KANBAN_CONDUCTOR=1`` so the quiet-mode
+    entrypoint runs the board-scoped conductor loop instead of a single-card
+    worker.
+    """
+    import subprocess
+
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+    profile_arg = normalize_profile_name(profile)
+    resolved_board = _normalize_board_slug(board) or get_current_board()
+    prompt = f"conduct kanban board {resolved_board}"
+
+    env = dict(os.environ)
+    try:
+        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+    except FileNotFoundError:
+        pass
+    env["HERMES_KANBAN_CONDUCTOR"] = "1"
+    env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
+    env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
+    env["HERMES_KANBAN_BOARD"] = resolved_board
+    env["HERMES_PROFILE"] = profile_arg
+    env.setdefault("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))
+
+    cmd = [*_resolve_hermes_argv(), "-p", profile_arg, "--accept-hooks"]
+    if _kanban_worker_skill_available(env.get("HERMES_HOME")):
+        cmd.extend(["--skills", "kanban-worker"])
+    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    if worker_toolsets:
+        cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+    cmd.extend(["chat", "-q", prompt])
+
+    log_dir = worker_logs_dir(board=board)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{CONDUCTOR_PID_MARKER}.log"
+    rotate_bytes, backup_count = worker_log_rotation_config()
+    _rotate_worker_log(log_path, rotate_bytes, backup_count)
+    log_f = open(log_path, "ab")
+    try:
+        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
+            cmd,
+            cwd=workspace if os.path.isdir(workspace) else None,
+            stdin=subprocess.DEVNULL,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+        )
+    except FileNotFoundError:
+        log_f.close()
+        raise RuntimeError(
+            "`hermes` executable not found on PATH. "
+            "Install Hermes Agent or activate its venv before running the kanban dispatcher."
+        )
+    return proc.pid
+
+
+def ensure_conductor(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    profile: str = "default",
+    workspace: Optional[str] = None,
+    spawn_fn=None,
+) -> "DispatchResult":
+    """Ensure exactly one live conductor process for ``board``; spawn if absent.
+
+    Returns a ``DispatchResult`` so the dispatcher tick loop can read
+    ``.spawned`` for telemetry identically to the worker path. A no-op tick
+    (conductor already alive) returns an empty result. Guarded by the same
+    per-board ``_dispatch_tick_lock`` the worker path uses, so two racing
+    gateways can never both spawn a conductor for the same board.
+    """
+    db_path = None
+    try:
+        for _seq, _name, _file in conn.execute("PRAGMA database_list").fetchall():
+            if _name == "main" and _file:
+                db_path = Path(_file)
+                break
+    except Exception:
+        db_path = None
+    if db_path is None:
+        try:
+            db_path = kanban_db_path(board=board)
+        except Exception:
+            # No resolvable path (in-memory tests without an override): run the
+            # guard unlocked against the board path best-effort.
+            db_path = None
+
+    def _do() -> "DispatchResult":
+        existing = _read_conductor_pid(db_path) if db_path is not None else None
+        if _pid_alive(existing):
+            return DispatchResult()
+        ws = workspace or str(workspaces_root(board=board))
+        _spawn = spawn_fn if spawn_fn is not None else _spawn_conductor
+        pid = _spawn(board, ws, profile=profile)
+        if pid and db_path is not None:
+            _write_conductor_pid(db_path, int(pid))
+        return DispatchResult(
+            spawned=[(CONDUCTOR_PID_MARKER, profile, ws)] if pid else []
+        )
+
+    if db_path is None:
+        return _do()
+    with _dispatch_tick_lock(db_path) as held:
+        if not held:
+            return DispatchResult(skipped_locked=True)
+        return _do()
+
+
+# ---------------------------------------------------------------------------
 # Long-lived dispatcher daemon
 # ---------------------------------------------------------------------------
 

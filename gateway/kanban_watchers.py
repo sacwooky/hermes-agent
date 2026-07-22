@@ -1099,6 +1099,17 @@ class GatewayKanbanWatchersMixin:
                         merged[k] = v
             return merged or None
 
+        # Continuous-conductor opt-in (off by default). Precedence logic lives
+        # in pure helpers on kanban_db so it is unit-testable; these thin
+        # closures bind the already-loaded kanban_cfg.
+        def _board_conductor_enabled(slug: str) -> bool:
+            return _kb.conductor_enabled_for(kanban_cfg, slug)
+
+        def _conductor_profile(slug: str) -> str:
+            return _kb.conductor_profile_for(
+                kanban_cfg, slug, fallback=(default_assignee or "default")
+            )
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -1183,6 +1194,16 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
+                if _board_conductor_enabled(slug):
+                    # Conductor mode: ensure ONE long-lived conductor session
+                    # per board instead of spawning a worker per ready card.
+                    # Off by default; the existing dispatch_once path below is
+                    # byte-for-byte unchanged for every non-opted-in board.
+                    return _kb.ensure_conductor(
+                        conn,
+                        board=slug,
+                        profile=_conductor_profile(slug),
+                    )
                 return _kb.dispatch_once(
                     conn,
                     board=slug,
