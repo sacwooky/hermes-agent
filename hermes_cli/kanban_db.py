@@ -9470,7 +9470,19 @@ def _spawn_conductor(
 
     profile_arg = normalize_profile_name(profile)
     resolved_board = _normalize_board_slug(board) or get_current_board()
-    prompt = f"conduct kanban board {resolved_board}"
+    # Neutral first-turn prompt. The conductor's real work is driven per-card by
+    # the in-process loop (cli._run_kanban_conductor_q); this first turn must NOT
+    # invite the agent to manage the board itself — Python owns card lifecycle.
+    # A capable agent handed "conduct the board" will otherwise freelance
+    # (claim/complete/comment via the kanban CLI) and double-drive it.
+    prompt = (
+        f"You are a build-conductor session for board '{resolved_board}'. You "
+        "will receive one specific build task at a time as follow-up messages; "
+        "do exactly that work in the current working tree and report. Do NOT run "
+        "kanban commands, claim/complete/comment on tasks, or manage the board — "
+        "task bookkeeping is handled for you. Reply 'ready' and take no other "
+        "action now."
+    )
 
     env = dict(os.environ)
     try:
@@ -9484,9 +9496,11 @@ def _spawn_conductor(
     env["HERMES_PROFILE"] = profile_arg
     env.setdefault("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))
 
+    # Deliberately DO NOT load the kanban-worker skill: that skill teaches an
+    # agent to drive card lifecycle (claim/complete/block) itself, which is
+    # exactly what the conductor must not do — Python owns lifecycle. The
+    # conductor only needs its profile's build toolset (terminal/edit/delegate).
     cmd = [*_resolve_hermes_argv(), "-p", profile_arg, "--accept-hooks"]
-    if _kanban_worker_skill_available(env.get("HERMES_HOME")):
-        cmd.extend(["--skills", "kanban-worker"])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])

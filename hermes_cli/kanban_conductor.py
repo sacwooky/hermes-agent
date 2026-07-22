@@ -293,7 +293,7 @@ def drive_board_from_cli(
         return resp or ""
 
     def _list_workable() -> List[Dict[str, Any]]:
-        c = kb.connect()
+        c = kb.connect(board=board)
         try:
             # Promote todo->ready where dependencies are met, then take the
             # ready+assigned cards. A ready card is, by construction, not gated
@@ -313,35 +313,35 @@ def drive_board_from_cli(
             _close(c)
 
     def _claim(card_id: str) -> bool:
-        c = kb.connect()
+        c = kb.connect(board=board)
         try:
             return kb.claim_task(c, card_id) is not None
         finally:
             _close(c)
 
     def _complete(card_id: str, summary: str) -> None:
-        c = kb.connect()
+        c = kb.connect(board=board)
         try:
             kb.complete_task(c, card_id, summary=summary, board=board)
         finally:
             _close(c)
 
     def _block(card_id: str, reason: str) -> None:
-        c = kb.connect()
+        c = kb.connect(board=board)
         try:
             kb.block_task(c, card_id, reason=reason)
         finally:
             _close(c)
 
     def _checkpoint(card_id: str, note: str) -> None:
-        c = kb.connect()
+        c = kb.connect(board=board)
         try:
             kb.add_comment(c, card_id, author, note)
         finally:
             _close(c)
 
     def _build_prompt(card: Dict[str, Any]) -> str:
-        c = kb.connect()
+        c = kb.connect(board=board)
         try:
             ctx = kb.build_worker_context(c, card["id"])
         except Exception:
