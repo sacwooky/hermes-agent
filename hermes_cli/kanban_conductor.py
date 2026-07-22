@@ -400,9 +400,10 @@ def drive_board_from_cli(
         same resolve_workspace the dispatcher uses) and directs the agent to
         `cd` there for that card. This is what lets the conductor drive boards
         whose cards use per-task worktrees/scratch, not just single-repo boards.
-        The resolved path is validated (fleet-internal, but treat as untrusted)
-        before it is interpolated into the prompt; on any failure fall back to
-        the board workdir.
+        Returns a VALIDATED absolute path (``_is_safe_conductor_workdir``) chosen
+        from resolved-workspace → process-cwd → kanban-home scratch, or ``None``
+        if none validate (the caller then blocks the card rather than interpolate
+        an unvalidated path into the prompt). Treat every candidate as untrusted.
         """
         c = _connect()
         try:
@@ -411,27 +412,28 @@ def drive_board_from_cli(
             task = None
         finally:
             _close(c)
-        resolved = None
+        # Build the candidate list in preference order, then return the FIRST that
+        # passes validation. EVERY path that can reach the prompt is validated the
+        # same way — resolved per-card workspace, the process cwd, and the
+        # kanban-home scratch last-resort. If none validate, return None and the
+        # caller blocks the card rather than interpolate an unvalidated path.
+        candidates: List[str] = []
         if task is not None:
             try:
-                resolved = str(kb.resolve_workspace(task, board=board))
+                candidates.append(str(kb.resolve_workspace(task, board=board)))
             except Exception:
-                resolved = None
-        if resolved and kb._is_safe_conductor_workdir(resolved):
-            return resolved
-        # The FALLBACK path also reaches the prompt, so it must be validated too
-        # (not just the resolved path). Prefer the (already-validated at spawn)
-        # process cwd; if even that fails validation, use a guaranteed-safe
-        # scratch dir under the kanban home so a validated absolute path — free
-        # of shell metacharacters / newlines — is always what gets interpolated.
-        if kb._is_safe_conductor_workdir(board_workdir):
-            return board_workdir
-        safe = str(kb.workspaces_root(board=board))
+                pass
+        candidates.append(board_workdir)
+        scratch = str(kb.workspaces_root(board=board))
         try:
-            _Path(safe).mkdir(parents=True, exist_ok=True)
+            _Path(scratch).mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
-        return safe
+        candidates.append(scratch)
+        for cand in candidates:
+            if cand and kb._is_safe_conductor_workdir(cand):
+                return cand
+        return None
 
     def _fence_untrusted(text: str) -> str:
         # Neutralize the fence delimiter so card content cannot break out of the
@@ -447,6 +449,15 @@ def drive_board_from_cli(
         finally:
             _close(c)
         workdir = _card_workdir(card["id"])
+        if workdir is None:
+            # No workspace could be VALIDATED — never interpolate an unvalidated
+            # path into the prompt. Instruct a clean block instead.
+            return (
+                "BLOCKED: the conductor could not resolve a safe, validated "
+                "working directory for this task. A board admin must configure a "
+                "valid default_workdir. End your message with a line starting "
+                "'BLOCKED:' and this reason."
+            )
         workdir_directive = (
             f"Your working directory for THIS task is: {workdir}\n"
             f"Run `cd {_shlex.quote(workdir)}` FIRST and do ALL file work there "

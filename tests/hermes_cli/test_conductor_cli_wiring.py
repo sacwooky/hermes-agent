@@ -211,3 +211,47 @@ def test_conductor_unsafe_resolved_workspace_never_reaches_prompt(kanban_home, t
                          judge=lambda g, r: ("done", "ok", False, None), idle_max_seconds=0)
     assert "/etc" not in seen["msg"], "unsafe resolved workspace must not reach the prompt"
     assert str(tmp_path) in seen["msg"]  # fell back to the validated process cwd
+
+
+def _fakecli(seen):
+    class _A:
+        session_id = "s"
+        def run_conversation(self, *, user_message, conversation_history):
+            seen["msg"] = user_message
+            return {"final_response": "DONE: ok"}
+    class _C:
+        session_id = "s"; conversation_history = []; agent = _A()
+    return _C()
+
+
+def test_conductor_last_resort_workspace_is_validated_and_used(kanban_home, monkeypatch):
+    """When the resolved workspace AND the process cwd are unsafe, the validated
+    kanban-home scratch last-resort is used — no unsafe path reaches the prompt."""
+    import os as _os2, pathlib
+    with kb.connect() as c:
+        kb.create_task(c, title="x", body="b", assignee="builder")
+    monkeypatch.setattr(kb, "resolve_workspace", lambda task, board=None: pathlib.Path("/etc"))
+    monkeypatch.setattr(_os2, "getcwd", lambda: "/root")
+    seen = {}
+    drive_board_from_cli(_fakecli(seen), board="default",
+                         judge=lambda g, r: ("done", "ok", False, None), idle_max_seconds=0)
+    msg = seen["msg"]
+    assert "/etc" not in msg and "/root" not in msg
+    assert str(kb.workspaces_root(board="default")) in msg  # validated last-resort
+
+
+def test_conductor_blocks_when_no_workspace_validates(kanban_home, monkeypatch):
+    """If NO candidate validates, the prompt is a clean BLOCK — never an
+    unvalidated path."""
+    import os as _os2, pathlib
+    with kb.connect() as c:
+        kb.create_task(c, title="x", body="b", assignee="builder")
+    monkeypatch.setattr(kb, "resolve_workspace", lambda task, board=None: pathlib.Path("/etc"))
+    monkeypatch.setattr(_os2, "getcwd", lambda: "/root")
+    monkeypatch.setattr(kb, "workspaces_root", lambda board=None: pathlib.Path("/sys"))
+    seen = {}
+    drive_board_from_cli(_fakecli(seen), board="default",
+                         judge=lambda g, r: ("done", "ok", False, None), idle_max_seconds=0)
+    msg = seen["msg"]
+    assert "/etc" not in msg and "/root" not in msg and "/sys" not in msg
+    assert "BLOCKED" in msg
