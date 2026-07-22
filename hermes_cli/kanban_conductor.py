@@ -271,6 +271,33 @@ def drive_board_from_cli(
     if kb is None:
         from hermes_cli import kanban_db as kb  # local import; heavy module
 
+    # Pin to the EXACT board DB the dispatcher/spawn resolved, via
+    # HERMES_KANBAN_DB — the same way worker subprocesses are pinned. Resolving
+    # by board slug re-runs kanban_home(), which `hermes -p <profile>` activation
+    # can shift to the profile's home, silently connecting to a different
+    # (empty) DB. Prefer the explicit path; fall back to the board slug.
+    import os as _os
+    from pathlib import Path as _Path
+
+    _db_env = (_os.environ.get("HERMES_KANBAN_DB") or "").strip()
+    _db_path = _Path(_db_env) if _db_env else None
+
+    def _connect():
+        if _db_path is not None:
+            return kb.connect(db_path=_db_path)
+        return kb.connect(board=board)
+
+    if _os.environ.get("HERMES_CONDUCTOR_TRACE") == "1":
+        try:
+            _probe = kb.list_tasks(_connect(), status="ready")
+            print(
+                f"[conductor-trace] drive board={board!r} db_path={_db_path} "
+                f"ready_cards={[getattr(t, 'id', '?') for t in _probe]}",
+                file=__import__('sys').stderr,
+            )
+        except Exception as _e:
+            print(f"[conductor-trace] probe failed: {_e!r}", file=__import__('sys').stderr)
+
     def _close(c) -> None:
         try:
             c.close()
@@ -293,7 +320,7 @@ def drive_board_from_cli(
         return resp or ""
 
     def _list_workable() -> List[Dict[str, Any]]:
-        c = kb.connect(board=board)
+        c = _connect()
         try:
             # Promote todo->ready where dependencies are met, then take the
             # ready+assigned cards. A ready card is, by construction, not gated
@@ -313,35 +340,35 @@ def drive_board_from_cli(
             _close(c)
 
     def _claim(card_id: str) -> bool:
-        c = kb.connect(board=board)
+        c = _connect()
         try:
             return kb.claim_task(c, card_id) is not None
         finally:
             _close(c)
 
     def _complete(card_id: str, summary: str) -> None:
-        c = kb.connect(board=board)
+        c = _connect()
         try:
             kb.complete_task(c, card_id, summary=summary, board=board)
         finally:
             _close(c)
 
     def _block(card_id: str, reason: str) -> None:
-        c = kb.connect(board=board)
+        c = _connect()
         try:
             kb.block_task(c, card_id, reason=reason)
         finally:
             _close(c)
 
     def _checkpoint(card_id: str, note: str) -> None:
-        c = kb.connect(board=board)
+        c = _connect()
         try:
             kb.add_comment(c, card_id, author, note)
         finally:
             _close(c)
 
     def _build_prompt(card: Dict[str, Any]) -> str:
-        c = kb.connect(board=board)
+        c = _connect()
         try:
             ctx = kb.build_worker_context(c, card["id"])
         except Exception:

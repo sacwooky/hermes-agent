@@ -9504,7 +9504,11 @@ def _spawn_conductor(
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend(["chat", "-q", prompt])
+    # -Q (quiet mode) explicitly: the conductor drive loop hooks the quiet-path
+    # single-query handler. Workers reach it via non-TTY (DEVNULL stdin)
+    # auto-detection, but pinning -Q makes the conductor independent of stdin
+    # detection so the drive loop is never silently skipped.
+    cmd.extend(["chat", "-Q", "-q", prompt])
 
     log_dir = worker_logs_dir(board=board)
     log_dir.mkdir(parents=True, exist_ok=True)
