@@ -276,3 +276,39 @@ def test_ensure_conductor_spawns_in_board_workspace(conn, tmp_path, monkeypatch)
     spawn, calls = _spy_spawn()
     kb.ensure_conductor(conn, board="default", profile="orch", spawn_fn=spawn)
     assert calls and calls[0]["workspace"] == str(wd), "conductor must run in the board default_workdir"
+
+
+# --------------------------------------------------------------------------
+# Security (Robin BLOCK): validate board default_workdir; never mkdir arbitrary
+# --------------------------------------------------------------------------
+
+def test_is_safe_conductor_workdir_accepts_real_dir(tmp_path):
+    d = tmp_path / "repo"
+    d.mkdir()
+    assert kb._is_safe_conductor_workdir(str(d)) is True
+
+
+def test_is_safe_conductor_workdir_rejects_dangerous_values(tmp_path):
+    assert kb._is_safe_conductor_workdir("/etc") is False           # sensitive
+    assert kb._is_safe_conductor_workdir("/") is False              # root
+    assert kb._is_safe_conductor_workdir("relative/path") is False  # not absolute
+    assert kb._is_safe_conductor_workdir(str(tmp_path / "nope")) is False  # nonexistent
+    assert kb._is_safe_conductor_workdir("/tmp/x; rm -rf /") is False      # metachars
+    assert kb._is_safe_conductor_workdir("/usr/lib") is False       # under sensitive root
+    # symlink to a real dir is refused
+    real = tmp_path / "real"; real.mkdir()
+    link = tmp_path / "link"; link.symlink_to(real)
+    assert kb._is_safe_conductor_workdir(str(link)) is False
+
+
+def test_conductor_workspace_rejects_unsafe_default_and_never_mkdirs_it(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb, "read_board_metadata", lambda slug: {"default_workdir": "/etc/hermes-attack"})
+    ws = kb._conductor_workspace("default")
+    assert ws == str(kb.workspaces_root(board="default"))  # fell back, did not use /etc
+    assert not os.path.exists("/etc/hermes-attack")         # never created an arbitrary dir
+
+
+def test_conductor_workspace_uses_safe_default_workdir(kanban_home, tmp_path, monkeypatch):
+    d = tmp_path / "project"; d.mkdir()
+    monkeypatch.setattr(kb, "read_board_metadata", lambda slug: {"default_workdir": str(d)})
+    assert kb._conductor_workspace("default") == str(d)

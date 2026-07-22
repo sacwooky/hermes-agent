@@ -9430,32 +9430,72 @@ def _conductor_lock_path(db_path: Path) -> Path:
     return db_path.with_name(db_path.name + ".conductor.lock")
 
 
+_SENSITIVE_WORKDIR_ROOTS = (
+    "/", "/etc", "/root", "/boot", "/bin", "/sbin", "/usr", "/lib", "/lib64",
+    "/sys", "/proc", "/dev", "/var", "/run",
+)
+
+
+def _is_safe_conductor_workdir(path: object) -> bool:
+    """Whether an operator-configured ``default_workdir`` is safe to run in.
+
+    The value comes from board metadata; treat it as untrusted. Honor it ONLY
+    when it is an absolute path with no shell/traversal metacharacters, pointing
+    at an ALREADY-EXISTING real directory (not a symlink), and not a sensitive
+    system directory. We never ``mkdir`` an arbitrary metadata path — only a
+    pre-existing operator checkout is used; anything else falls back to the
+    kanban-home scratch root. Closes the "point the conductor at /etc" and
+    "shell metacharacters in the cd path" findings.
+    """
+    try:
+        p = str(path or "")
+        if not p or not os.path.isabs(p):
+            return False
+        # Reject shell metacharacters / whitespace / traversal that would be
+        # unsafe when the path is interpolated into prompts or `cd` guidance.
+        if any(ch in p for ch in "\n\r\t \x00;|&$`<>*?()!\\\"'"):
+            return False
+        if os.path.islink(p):
+            return False
+        real = os.path.realpath(p)
+        if not os.path.isdir(real):
+            return False
+        if real in _SENSITIVE_WORKDIR_ROOTS or any(
+            real == s or real.startswith(s.rstrip("/") + "/")
+            for s in _SENSITIVE_WORKDIR_ROOTS
+            if s != "/"
+        ):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _conductor_workspace(board: Optional[str]) -> str:
     """Resolve the directory the conductor works in.
 
-    Prefer the board's ``default_workdir`` (a persistent project checkout — the
-    same source the worker path uses via ``resolve_workspace``) so the conductor
-    edits files in the real repo, not the gateway's cwd. Fall back to the board
-    scratch ``workspaces_root``. Always ensure the directory exists so the spawn
-    never falls back to the gateway's home dir (which silently wrote build
-    output to ``$HOME`` in the pilot).
+    Prefer the board's operator-configured ``default_workdir`` (a persistent
+    project checkout — the same source the worker path uses) when it passes
+    ``_is_safe_conductor_workdir``. Otherwise fall back to the board scratch
+    ``workspaces_root`` under the kanban home, which is created if absent. The
+    metadata path is never created — only a pre-existing safe directory is
+    honored — so a hostile ``default_workdir`` can neither create arbitrary dirs
+    nor point the conductor at sensitive locations; it just falls back.
     """
+    fallback = str(workspaces_root(board=board))
     slug = _normalize_board_slug(board) or get_current_board()
-    chosen: Optional[str] = None
     try:
         meta = read_board_metadata(slug)
         default_workdir = meta.get("default_workdir") if isinstance(meta, dict) else None
-        if default_workdir:
-            chosen = str(default_workdir)
     except Exception:
-        chosen = None
-    if not chosen:
-        chosen = str(workspaces_root(board=board))
+        default_workdir = None
+    if default_workdir and _is_safe_conductor_workdir(default_workdir):
+        return str(default_workdir)
     try:
-        Path(chosen).mkdir(parents=True, exist_ok=True)
+        Path(fallback).mkdir(parents=True, exist_ok=True)  # kanban-home scratch, safe
     except OSError:
-        _log.debug("could not ensure conductor workspace dir %s", chosen, exc_info=True)
-    return chosen
+        _log.debug("could not ensure conductor scratch workspace %s", fallback, exc_info=True)
+    return fallback
 
 
 def _spawn_conductor(
