@@ -315,17 +315,6 @@ def drive_board_from_cli(
             return kb.connect(db_path=_db_path)
         return kb.connect(board=board)
 
-    if _os.environ.get("HERMES_CONDUCTOR_TRACE") == "1":
-        try:
-            _probe = kb.list_tasks(_connect(), status="ready")
-            print(
-                f"[conductor-trace] drive board={board!r} db_path={_db_path} "
-                f"ready_cards={[getattr(t, 'id', '?') for t in _probe]}",
-                file=__import__('sys').stderr,
-            )
-        except Exception as _e:
-            print(f"[conductor-trace] probe failed: {_e!r}", file=__import__('sys').stderr)
-
     def _close(c) -> None:
         try:
             c.close()

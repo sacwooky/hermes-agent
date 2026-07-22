@@ -15028,13 +15028,6 @@ def _run_kanban_conductor_q(cli: "HermesCLI", first_response: str) -> None:
     """
     import os as _os
 
-    if _os.environ.get("HERMES_CONDUCTOR_TRACE") == "1":
-        print(
-            f"[conductor-trace] entrypoint fired; board_env="
-            f"{_os.environ.get('HERMES_KANBAN_BOARD')!r} db_env="
-            f"{_os.environ.get('HERMES_KANBAN_DB')!r}",
-            file=sys.stderr,
-        )
     board = (_os.environ.get("HERMES_KANBAN_BOARD") or "").strip()
     if not board:
         return
@@ -15488,12 +15481,6 @@ def main(
                         # runs out. Gated on HERMES_KANBAN_CONDUCTOR (set only by
                         # kanban_db._spawn_conductor); a no-op for every worker and
                         # every non-conductor `-q` run.
-                        if os.environ.get("HERMES_CONDUCTOR_TRACE") == "1":
-                            print(
-                                f"[cond-branch] reached; CONDUCTOR="
-                                f"{os.environ.get('HERMES_KANBAN_CONDUCTOR')!r}",
-                                file=sys.stderr,
-                            )
                         if os.environ.get("HERMES_KANBAN_CONDUCTOR") == "1":
                             try:
                                 _run_kanban_conductor_q(cli, response)
