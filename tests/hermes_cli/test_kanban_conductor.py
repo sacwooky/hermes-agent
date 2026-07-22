@@ -141,3 +141,51 @@ def test_conductor_pid_roundtrip(tmp_path):
     assert kb._read_conductor_pid(db_path) == 1234
     kb._write_conductor_pid(db_path, None)  # clear
     assert kb._read_conductor_pid(db_path) is None
+
+
+# --------------------------------------------------------------------------
+# Robin BLOCK fixes: PID-file symlink clobber + no board-management on spawn
+# --------------------------------------------------------------------------
+
+def test_write_conductor_pid_refuses_symlink_clobber(tmp_path):
+    """A symlink pre-placed at the predictable pid path must NOT be followed —
+    the write must fail closed instead of clobbering the symlink's target."""
+    db_path = tmp_path / "kanban.db"
+    victim = tmp_path / "victim.txt"
+    victim.write_text("do-not-clobber", encoding="utf-8")
+    pid_path = kb._conductor_pid_path(db_path)  # kanban.db.conductor.pid
+    pid_path.symlink_to(victim)  # attacker pre-places the symlink
+
+    kb._write_conductor_pid(db_path, 1234)  # must NOT write through the symlink
+
+    assert victim.read_text(encoding="utf-8") == "do-not-clobber"  # target untouched
+    assert kb._read_conductor_pid(db_path) is None  # read refuses to follow it too
+
+
+def test_spawn_conductor_has_no_board_management(kanban_home, tmp_path, monkeypatch):
+    """The conductor spawn must not load the kanban-worker skill and must not set
+    HERMES_KANBAN_TASK — so the single-card kanban lifecycle tools never attach
+    and the agent cannot manage the board itself (Python owns lifecycle)."""
+    import subprocess
+
+    captured = {}
+
+    class _FakeProc:
+        pid = 4321
+
+    def _fake_popen(cmd, **kw):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kw.get("env") or {})
+        return _FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    pid = kb._spawn_conductor("default", str(ws), profile="default")
+
+    assert pid == 4321
+    assert "kanban-worker" not in captured["cmd"], "conductor must not load the kanban-worker skill"
+    assert "-Q" in captured["cmd"], "conductor must pin quiet mode so the drive loop runs"
+    assert captured["env"].get("HERMES_KANBAN_CONDUCTOR") == "1"
+    assert "HERMES_KANBAN_TASK" not in captured["env"], "no task id -> single-card kanban tools do not attach"

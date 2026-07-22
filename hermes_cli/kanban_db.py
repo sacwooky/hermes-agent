@@ -9426,10 +9426,24 @@ def _conductor_pid_path(db_path: Path) -> Path:
 
 
 def _read_conductor_pid(db_path: Path) -> Optional[int]:
+    # Read with O_NOFOLLOW so a symlink pre-placed at the pid path is refused
+    # rather than silently followed to another file (defense-in-depth alongside
+    # the write guard below).
+    path = _conductor_pid_path(db_path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        raw = _conductor_pid_path(db_path).read_text(encoding="utf-8").strip()
-    except (OSError, ValueError):
+        fd = os.open(path, flags)
+    except OSError:
         return None
+    try:
+        raw = os.read(fd, 64).decode("utf-8", "replace").strip()
+    except OSError:
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
     try:
         return int(raw)
     except (TypeError, ValueError):
@@ -9440,10 +9454,22 @@ def _write_conductor_pid(db_path: Path, pid: Optional[int]) -> None:
     path = _conductor_pid_path(db_path)
     try:
         if pid is None:
+            # unlink() removes the link itself (never the symlink target), so a
+            # pre-placed symlink is simply deleted, not its target — safe.
             path.unlink(missing_ok=True)
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(str(int(pid)), encoding="utf-8")
+        # O_NOFOLLOW: if an attacker pre-places a symlink at this predictable
+        # path, the open fails (ELOOP) instead of clobbering the symlink's
+        # target with our pid text. O_CREAT|O_TRUNC + 0o600, owner-only.
+        flags = (
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        )
+        fd = os.open(path, flags, 0o600)
+        try:
+            os.write(fd, str(int(pid)).encode("ascii"))
+        finally:
+            os.close(fd)
     except OSError:
         _log.debug("could not persist conductor pid for %s", db_path, exc_info=True)
 
