@@ -9717,6 +9717,11 @@ def ensure_conductor(
         """
         try:
             recompute_ready(conn)
+            # NOTE on scoping: each board is a SEPARATE kanban.db and ``conn`` is
+            # THIS board's connection — the ``tasks`` table has no ``board``
+            # column, so a query on ``conn`` sees only this board's tasks. This
+            # is the same per-board-conn scoping ``recompute_ready`` and
+            # ``dispatch_once`` already rely on; there is no cross-board table.
             row = conn.execute(
                 "SELECT 1 FROM tasks WHERE status = 'ready' AND assignee IS NOT NULL "
                 "AND claim_lock IS NULL LIMIT 1"
