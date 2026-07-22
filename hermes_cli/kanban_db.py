@@ -9416,91 +9416,18 @@ def conductor_profile_for(
     return str(fallback)
 
 
-def _conductor_pid_path(db_path: Path) -> Path:
-    """Sibling ``.conductor.pid`` file next to a board's ``kanban.db``.
+def _conductor_lock_path(db_path: Path) -> Path:
+    """Sibling ``.conductor.lock`` file next to a board's ``kanban.db``.
 
-    Mirrors how ``.dispatch.lock`` / ``.dispatcher.lock`` live beside the DB —
-    zero schema change, board-scoped, survives restarts.
+    An exclusive advisory lock (flock) on this file is the board's
+    one-conductor-per-board guarantee: the live conductor process HOLDS it for
+    its whole lifetime (by inheriting the already-locked fd from the spawn), and
+    the kernel releases it automatically when the conductor exits. This replaces
+    a pid FILE — which is inherently racy at a shared-directory trust boundary
+    (TOCTOU / symlink swap between check and write). Mirrors how ``.dispatch.lock``
+    already lives beside the DB.
     """
-    return db_path.with_name(db_path.name + ".conductor.pid")
-
-
-def _read_conductor_pid(db_path: Path) -> Optional[int]:
-    # Read with O_NOFOLLOW so a symlink pre-placed at the pid path is refused
-    # rather than silently followed to another file (defense-in-depth alongside
-    # the write guard below).
-    path = _conductor_pid_path(db_path)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(path, flags)
-    except OSError:
-        return None
-    try:
-        raw = os.read(fd, 64).decode("utf-8", "replace").strip()
-    except OSError:
-        return None
-    finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return None
-
-
-def _write_conductor_pid(db_path: Path, pid: Optional[int]) -> bool:
-    """Persist the conductor pid; return True on success, False on failure.
-
-    Callers use the return value to refuse spawning when the pid can't be
-    tracked — otherwise a hostile/unwritable pid path would make every tick
-    see no pid and spawn another conductor (one-per-board bypass).
-    """
-    path = _conductor_pid_path(db_path)
-    try:
-        if pid is None:
-            # unlink() removes the link itself (never the symlink target), so a
-            # pre-placed symlink is simply deleted, not its target — safe.
-            path.unlink(missing_ok=True)
-            return True
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # O_NOFOLLOW: if an attacker pre-places a symlink at this predictable
-        # path, the open fails (ELOOP) instead of clobbering the symlink's
-        # target with our pid text. O_CREAT|O_TRUNC + 0o600, owner-only.
-        flags = (
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-        )
-        fd = os.open(path, flags, 0o600)
-        try:
-            os.write(fd, str(int(pid)).encode("ascii"))
-        finally:
-            os.close(fd)
-        return True
-    except OSError:
-        _log.debug("could not persist conductor pid for %s", db_path, exc_info=True)
-        return False
-
-
-def _conductor_pid_writable(db_path: Path) -> bool:
-    """Pre-flight: can we securely create/write the pid file at all?
-
-    Returns False if the path is a symlink (O_NOFOLLOW fails) or otherwise
-    unwritable. Used to refuse spawning an UNTRACKABLE conductor rather than
-    spawn-and-loop. Creates the file empty on success (overwritten with the real
-    pid after spawn); does not truncate an existing tracked pid — callers only
-    pre-flight when no live conductor is recorded.
-    """
-    path = _conductor_pid_path(db_path)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(path, flags, 0o600)
-        os.close(fd)
-        return True
-    except OSError:
-        _log.debug("conductor pid path not securely writable: %s", db_path, exc_info=True)
-        return False
+    return db_path.with_name(db_path.name + ".conductor.lock")
 
 
 def _spawn_conductor(
@@ -9508,8 +9435,15 @@ def _spawn_conductor(
     workspace: str,
     *,
     profile: str,
+    inherit_fd: Optional[int] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q 'conduct kanban board …'``.
+
+    ``inherit_fd`` (the board's held conductor lock fd) is passed to the child
+    via ``pass_fds`` so the child inherits — and thus holds — the lock for its
+    lifetime; this is the one-conductor-per-board guarantee (see
+    ``ensure_conductor``). The child never touches the fd; keeping it open is
+    enough to hold the flock.
 
     Board-pinned exactly like ``_default_spawn`` (same ``HERMES_KANBAN_DB`` /
     ``WORKSPACES_ROOT`` / ``BOARD`` env, same ``start_new_session=True`` Popen
@@ -9597,6 +9531,9 @@ def _spawn_conductor(
             stderr=subprocess.STDOUT,
             env=env,
             start_new_session=True,
+            # Inherit the board conductor lock fd (kept inheritable by pass_fds)
+            # so the child holds the lifetime lock; empty tuple = inherit nothing.
+            pass_fds=(inherit_fd,) if inherit_fd is not None else (),
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
         )
     except FileNotFoundError:
@@ -9636,38 +9573,63 @@ def ensure_conductor(
         try:
             db_path = kanban_db_path(board=board)
         except Exception:
-            # No resolvable path (in-memory tests without an override): run the
-            # guard unlocked against the board path best-effort.
             db_path = None
 
-    def _do() -> "DispatchResult":
-        existing = _read_conductor_pid(db_path) if db_path is not None else None
-        if _pid_alive(existing):
-            return DispatchResult()
-        # Refuse to spawn a conductor we cannot TRACK: if the pid path is not
-        # securely writable (symlink / unwritable), spawning would leave an
-        # untracked conductor and every subsequent tick would spawn another
-        # (one-per-board bypass + resource exhaustion). Fail closed instead.
-        if db_path is not None and not _conductor_pid_writable(db_path):
-            _log.warning(
-                "conductor for board %s not spawned: pid path not securely writable "
-                "(symlink or permissions) — refusing to spawn an untrackable conductor",
-                board,
-            )
-            return DispatchResult()
-        ws = workspace or str(workspaces_root(board=board))
-        _spawn = spawn_fn if spawn_fn is not None else _spawn_conductor
-        pid = _spawn(board, ws, profile=profile)
-        if pid and db_path is not None and not _write_conductor_pid(db_path, int(pid)):
-            _log.error(
-                "conductor for board %s spawned (pid %s) but its pid could not be "
-                "persisted; the one-per-board guard is degraded for this board",
-                board,
-                pid,
-            )
+    ws = workspace or str(workspaces_root(board=board))
+    _spawn = spawn_fn if spawn_fn is not None else _spawn_conductor
+
+    try:
+        import fcntl  # POSIX only
+    except ImportError:
+        fcntl = None
+
+    def _spawn_result(inherit_fd: Optional[int]) -> "DispatchResult":
+        pid = _spawn(board, ws, profile=profile, inherit_fd=inherit_fd)
         return DispatchResult(
             spawned=[(CONDUCTOR_PID_MARKER, profile, ws)] if pid else []
         )
+
+    def _do() -> "DispatchResult":
+        # No lockable path (in-memory tests) or non-POSIX: fall back to a plain
+        # spawn under the outer _dispatch_tick_lock (best-effort single-writer).
+        if db_path is None or fcntl is None:
+            return _spawn_result(None)
+
+        # One-conductor-per-board via a LIFETIME lock. Open the lock file
+        # (O_NOFOLLOW so a pre-placed symlink is refused) and try to take an
+        # exclusive advisory lock. If it's held, a conductor is alive → no-op.
+        # If we take it, spawn the conductor INHERITING the locked fd: the lock
+        # is never released between this check and the spawn (TOCTOU-free), the
+        # child holds it for its whole lifetime, and the kernel frees it on exit
+        # (crash-safe). The parent always drops its own fd copy in `finally`;
+        # once a child has inherited it the open file description — and thus the
+        # lock — survives.
+        lock_path = _conductor_lock_path(db_path)
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_fd = os.open(
+                lock_path,
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+        except OSError:
+            _log.warning(
+                "conductor for board %s not spawned: lock path not safe to open "
+                "(symlink or permissions)",
+                board,
+            )
+            return DispatchResult()
+        try:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, OSError):
+                return DispatchResult()  # a live conductor holds the lock
+            return _spawn_result(lock_fd)
+        finally:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
 
     if db_path is None:
         return _do()

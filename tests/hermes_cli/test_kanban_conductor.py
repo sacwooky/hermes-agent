@@ -1,19 +1,22 @@
 """Slice 1 — continuous-conductor routing + one-conductor-per-board guard.
 
 Covers the additive, off-by-default conductor path: the pure config-precedence
-helpers (``conductor_enabled_for`` / ``conductor_profile_for``) and
-``ensure_conductor`` (spawn-once, no-double-spawn while alive, respawn when
-dead). The dispatcher's existing ``dispatch_once`` path is untouched when a
-board is not opted in.
+helpers, and ensure_conductor's LIFETIME-LOCK guard (spawn when the board's
+.conductor.lock is free, no-op while a conductor holds it, respawn once
+released, refuse a symlinked lock path). The dispatcher's existing dispatch_once
+path is untouched when a board is not opted in.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+
+fcntl = pytest.importorskip("fcntl")  # the guard is POSIX flock-based
 
 
 @pytest.fixture
@@ -52,120 +55,107 @@ def test_conductor_global_default_enables_all_boards():
 
 
 def test_per_board_override_beats_global():
-    # Global on, one board opts OUT.
     cfg = {"conductor": {"default_enabled": True},
            "boards": {"legacy": {"conductor": {"enabled": False}}}}
     assert kb.conductor_enabled_for(cfg, "legacy") is False
     assert kb.conductor_enabled_for(cfg, "other") is True
 
-    # Global off, one board opts IN.
     cfg2 = {"boards": {"pilot": {"conductor": {"enabled": True}}}}
     assert kb.conductor_enabled_for(cfg2, "pilot") is True
     assert kb.conductor_enabled_for(cfg2, "other") is False
 
 
 def test_conductor_profile_precedence():
-    # per-board profile wins
     cfg = {"conductor": {"profile": "glob"},
            "orchestrator_profile": "orch",
            "boards": {"b": {"conductor": {"profile": "boardp"}}}}
     assert kb.conductor_profile_for(cfg, "b", fallback="fb") == "boardp"
-    # global profile next
     assert kb.conductor_profile_for(cfg, "other", fallback="fb") == "glob"
-    # orchestrator_profile next
     cfg2 = {"orchestrator_profile": "orch"}
     assert kb.conductor_profile_for(cfg2, "x", fallback="fb") == "orch"
-    # fallback last
     assert kb.conductor_profile_for({}, "x", fallback="fb") == "fb"
 
 
 # --------------------------------------------------------------------------
-# ensure_conductor — spawn-once / no-double-spawn / respawn
+# ensure_conductor — lifetime-lock guard
 # --------------------------------------------------------------------------
 
-def _fake_spawn_factory(pid):
+def _spy_spawn(pid=4242):
     calls = []
 
-    def _spawn(board, workspace, *, profile):
-        calls.append((board, workspace, profile))
+    def _spawn(board, workspace, *, profile, inherit_fd=None):
+        # A real conductor would hold inherit_fd for life; the spy just records
+        # the call and returns a pid (its "conductor" does not survive, so the
+        # parent closing its fd copy releases the lock — correct for a spy).
+        calls.append({"board": board, "workspace": workspace, "profile": profile,
+                      "inherit_fd": inherit_fd})
         return pid
 
     return _spawn, calls
 
 
-def test_ensure_conductor_spawns_when_none_alive(conn, monkeypatch):
-    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
-    spawn, calls = _fake_spawn_factory(4242)
-
+def test_ensure_conductor_spawns_when_lock_free(conn):
+    spawn, calls = _spy_spawn()
     res = kb.ensure_conductor(conn, board="default", profile="orch", spawn_fn=spawn)
+    assert len(calls) == 1, "should spawn when no conductor holds the lock"
+    assert calls[0]["profile"] == "orch"
+    assert calls[0]["inherit_fd"] is not None, "must pass the held lock fd to inherit"
+    assert res.spawned == [(kb.CONDUCTOR_PID_MARKER, "orch", calls[0]["workspace"])]
 
-    assert len(calls) == 1, "should spawn exactly one conductor"
-    assert calls[0][2] == "orch"
-    assert res.spawned == [(kb.CONDUCTOR_PID_MARKER, "orch", calls[0][1])]
+
+def test_ensure_conductor_no_spawn_while_lock_held(conn):
+    # Simulate a live conductor by holding the board's conductor lock ourselves.
     db_path = kb.kanban_db_path(board="default")
-    assert kb._read_conductor_pid(db_path) == 4242
+    lock_path = kb._conductor_lock_path(db_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    held = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        spawn, calls = _spy_spawn()
+        res = kb.ensure_conductor(conn, board="default", profile="orch", spawn_fn=spawn)
+        assert calls == [], "must NOT spawn while a conductor holds the lock"
+        assert res.spawned == []
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
 
 
-def test_ensure_conductor_no_double_spawn_while_alive(conn, monkeypatch):
-    # First tick spawns and records pid 4242.
-    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
-    spawn, calls = _fake_spawn_factory(4242)
-    kb.ensure_conductor(conn, board="default", profile="orch", spawn_fn=spawn)
-    assert len(calls) == 1
-
-    # Now that conductor is "alive" — a second tick must NOT spawn again.
-    monkeypatch.setattr(kb, "_pid_alive", lambda pid: pid == 4242)
-    res2 = kb.ensure_conductor(conn, board="default", profile="orch", spawn_fn=spawn)
-    assert len(calls) == 1, "must not spawn a second conductor while the first is alive"
-    assert res2.spawned == []
-
-
-def test_ensure_conductor_respawns_when_dead(conn, monkeypatch):
-    # Seed a stale pid on disk.
+def test_ensure_conductor_respawns_after_lock_released(conn):
     db_path = kb.kanban_db_path(board="default")
-    kb._write_conductor_pid(db_path, 9999)
-    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)  # 9999 is dead
-    spawn, calls = _fake_spawn_factory(5555)
-
+    lock_path = kb._conductor_lock_path(db_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    held = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    spawn, calls = _spy_spawn()
+    assert kb.ensure_conductor(conn, board="default", profile="orch", spawn_fn=spawn).spawned == []
+    fcntl.flock(held, fcntl.LOCK_UN)
+    os.close(held)  # conductor "exited" → lock free
     res = kb.ensure_conductor(conn, board="default", profile="orch", spawn_fn=spawn)
-
-    assert len(calls) == 1, "a dead conductor pid must be respawned"
-    assert res.spawned == [(kb.CONDUCTOR_PID_MARKER, "orch", calls[0][1])]
-    assert kb._read_conductor_pid(db_path) == 5555
+    assert len(calls) == 1, "must respawn once the lock is free again"
+    assert res.spawned
 
 
-def test_conductor_pid_roundtrip(tmp_path):
-    db_path = tmp_path / "kanban.db"
-    assert kb._read_conductor_pid(db_path) is None
-    kb._write_conductor_pid(db_path, 1234)
-    assert kb._read_conductor_pid(db_path) == 1234
-    kb._write_conductor_pid(db_path, None)  # clear
-    assert kb._read_conductor_pid(db_path) is None
+def test_ensure_conductor_refuses_symlinked_lock_path(conn, tmp_path):
+    db_path = kb.kanban_db_path(board="default")
+    lock_path = kb._conductor_lock_path(db_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    victim = tmp_path / "victim"
+    victim.write_text("keep", encoding="utf-8")
+    lock_path.symlink_to(victim)
+    spawn, calls = _spy_spawn()
+    res = kb.ensure_conductor(conn, board="default", profile="orch", spawn_fn=spawn)
+    assert calls == [], "must refuse a symlinked lock path (O_NOFOLLOW)"
+    assert res.spawned == []
+    assert victim.read_text(encoding="utf-8") == "keep"
 
 
 # --------------------------------------------------------------------------
-# Robin BLOCK fixes: PID-file symlink clobber + no board-management on spawn
+# _spawn_conductor — no board management, log symlink-hardened
 # --------------------------------------------------------------------------
-
-def test_write_conductor_pid_refuses_symlink_clobber(tmp_path):
-    """A symlink pre-placed at the predictable pid path must NOT be followed —
-    the write must fail closed instead of clobbering the symlink's target."""
-    db_path = tmp_path / "kanban.db"
-    victim = tmp_path / "victim.txt"
-    victim.write_text("do-not-clobber", encoding="utf-8")
-    pid_path = kb._conductor_pid_path(db_path)  # kanban.db.conductor.pid
-    pid_path.symlink_to(victim)  # attacker pre-places the symlink
-
-    kb._write_conductor_pid(db_path, 1234)  # must NOT write through the symlink
-
-    assert victim.read_text(encoding="utf-8") == "do-not-clobber"  # target untouched
-    assert kb._read_conductor_pid(db_path) is None  # read refuses to follow it too
-
 
 def test_spawn_conductor_has_no_board_management(kanban_home, tmp_path, monkeypatch):
-    """The conductor spawn must not load the kanban-worker skill and must not set
-    HERMES_KANBAN_TASK — so the single-card kanban lifecycle tools never attach
-    and the agent cannot manage the board itself (Python owns lifecycle)."""
+    """No kanban-worker skill, no HERMES_KANBAN_TASK → the single-card kanban
+    lifecycle tools never attach and the agent cannot manage the board."""
     import subprocess
 
     captured = {}
@@ -176,6 +166,7 @@ def test_spawn_conductor_has_no_board_management(kanban_home, tmp_path, monkeypa
     def _fake_popen(cmd, **kw):
         captured["cmd"] = list(cmd)
         captured["env"] = dict(kw.get("env") or {})
+        captured["pass_fds"] = kw.get("pass_fds")
         return _FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", _fake_popen)
@@ -185,15 +176,33 @@ def test_spawn_conductor_has_no_board_management(kanban_home, tmp_path, monkeypa
     pid = kb._spawn_conductor("default", str(ws), profile="default")
 
     assert pid == 4321
-    assert "kanban-worker" not in captured["cmd"], "conductor must not load the kanban-worker skill"
-    assert "-Q" in captured["cmd"], "conductor must pin quiet mode so the drive loop runs"
+    assert "kanban-worker" not in captured["cmd"]
+    assert "-Q" in captured["cmd"]
     assert captured["env"].get("HERMES_KANBAN_CONDUCTOR") == "1"
-    assert "HERMES_KANBAN_TASK" not in captured["env"], "no task id -> single-card kanban tools do not attach"
+    assert "HERMES_KANBAN_TASK" not in captured["env"]
+    assert captured["pass_fds"] == ()  # no inherit fd → nothing inherited
+
+
+def test_spawn_conductor_passes_inherit_fd(kanban_home, tmp_path, monkeypatch):
+    import subprocess
+
+    captured = {}
+
+    class _FakeProc:
+        pid = 88
+
+    monkeypatch.setattr(
+        subprocess, "Popen",
+        lambda cmd, **kw: (captured.update(pass_fds=kw.get("pass_fds")) or _FakeProc()),
+    )
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    kb._spawn_conductor("default", str(ws), profile="default", inherit_fd=7)
+    assert captured["pass_fds"] == (7,)  # the lock fd is inherited by the child
 
 
 def test_spawn_conductor_log_refuses_symlink(kanban_home, tmp_path, monkeypatch):
-    """A symlink pre-placed at the predictable __conductor__.log path must not
-    redirect the conductor's stdout into an attacker-chosen file."""
+    """A symlink at __conductor__.log must not redirect conductor stdout."""
     import subprocess
 
     class _FakeProc:
@@ -205,31 +214,12 @@ def test_spawn_conductor_log_refuses_symlink(kanban_home, tmp_path, monkeypatch)
     log_dir = kb.worker_logs_dir(board="default")
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{kb.CONDUCTOR_PID_MARKER}.log"
-    log_path.symlink_to(victim)  # attacker pre-places the symlink
+    log_path.symlink_to(victim)
     ws = tmp_path / "ws"
     ws.mkdir()
 
     pid = kb._spawn_conductor("default", str(ws), profile="default")
 
-    assert pid == 777  # fell back to devnull, did not crash
-    assert log_path.is_symlink()  # symlink was NOT followed/replaced
-    assert victim.read_text(encoding="utf-8") == "keep-me"  # target untouched
-
-
-def test_ensure_conductor_refuses_untrackable_pid(conn, tmp_path, monkeypatch):
-    """If the pid path is not securely writable (hostile symlink), ensure_conductor
-    must NOT spawn — otherwise every tick would spawn another untracked conductor."""
-    db_path = kb.kanban_db_path(board="default")
-    victim = tmp_path / "pid_victim.txt"
-    victim.write_text("v", encoding="utf-8")
-    pid_path = kb._conductor_pid_path(db_path)
-    pid_path.parent.mkdir(parents=True, exist_ok=True)
-    pid_path.symlink_to(victim)
-    monkeypatch.setattr(kb, "_pid_alive", lambda p: False)
-    spawn, calls = _fake_spawn_factory(1111)
-
-    res = kb.ensure_conductor(conn, board="default", profile="orch", spawn_fn=spawn)
-
-    assert calls == [], "must refuse to spawn an untrackable conductor"
-    assert res.spawned == []
-    assert victim.read_text(encoding="utf-8") == "v"  # not clobbered
+    assert pid == 777
+    assert log_path.is_symlink()
+    assert victim.read_text(encoding="utf-8") == "keep-me"
