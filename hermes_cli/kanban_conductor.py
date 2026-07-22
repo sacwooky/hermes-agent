@@ -235,3 +235,131 @@ def _completion_summary(response: str, *, limit: int = 600) -> str:
             return s[len("DONE:"):].strip()[:limit] or "completed"
     tail = (response or "").strip()
     return (tail[-limit:] if tail else "completed").strip() or "completed"
+
+
+CONDUCTOR_CARD_PROMPT = (
+    "You are the board conductor working ONE card to completion in the current "
+    "working tree. Do the real work: read the code, edit files, run the relevant "
+    "tests/build, and delegate independent sub-parts if it saves wall-clock. Do "
+    "NOT git commit/push/merge, deploy, read or change credentials, or delete "
+    "destructively — leave changes uncommitted for the reviewer. When the card "
+    "genuinely meets its acceptance criteria, end your message with a line "
+    "starting 'DONE:' summarizing what changed and how you verified it. If only a "
+    "human can unblock you, end with a line starting 'BLOCKED:' and the reason."
+)
+
+
+def drive_board_from_cli(
+    cli: Any,
+    *,
+    board: str,
+    author: str = "conductor",
+    kb: Any = None,
+    judge: Optional[Callable] = None,
+    log: Optional[Callable[[str], None]] = None,
+    **budget: Any,
+) -> Dict[str, Any]:
+    """Wire a live ``HermesCLI`` session + the kanban DB into the conductor loop.
+
+    Extracted from ``cli._run_kanban_conductor_q`` so the wiring is testable
+    without importing the heavyweight ``cli`` module: pass a fake ``cli`` (an
+    object with ``.agent.run_conversation(user_message, conversation_history)``,
+    ``.conversation_history``, ``.session_id``) and inject ``kb`` (defaults to
+    ``hermes_cli.kanban_db``). Card lifecycle is driven directly on ``kb``; the
+    agent only does the build work per card.
+    """
+    if kb is None:
+        from hermes_cli import kanban_db as kb  # local import; heavy module
+
+    def _close(c) -> None:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+    def _run_turn(prompt: str) -> str:
+        result = cli.agent.run_conversation(
+            user_message=prompt,
+            conversation_history=cli.conversation_history,
+        )
+        if (
+            getattr(cli.agent, "session_id", None)
+            and cli.agent.session_id != cli.session_id
+        ):
+            cli.session_id = cli.agent.session_id
+        resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
+        if resp:
+            print(resp)
+        return resp or ""
+
+    def _list_workable() -> List[Dict[str, Any]]:
+        c = kb.connect()
+        try:
+            # Promote todo->ready where dependencies are met, then take the
+            # ready+assigned cards. A ready card is, by construction, not gated
+            # (a clarify gate parks a card in blocked/scheduled). Gate answering
+            # + wake resumption lands in slice 4.
+            try:
+                kb.recompute_ready(c)
+            except Exception:
+                pass
+            rows = kb.list_tasks(c, status="ready")
+            return [
+                {"id": t.id, "title": t.title, "body": t.body}
+                for t in rows
+                if getattr(t, "assignee", None)
+            ]
+        finally:
+            _close(c)
+
+    def _claim(card_id: str) -> bool:
+        c = kb.connect()
+        try:
+            return kb.claim_task(c, card_id) is not None
+        finally:
+            _close(c)
+
+    def _complete(card_id: str, summary: str) -> None:
+        c = kb.connect()
+        try:
+            kb.complete_task(c, card_id, summary=summary, board=board)
+        finally:
+            _close(c)
+
+    def _block(card_id: str, reason: str) -> None:
+        c = kb.connect()
+        try:
+            kb.block_task(c, card_id, reason=reason)
+        finally:
+            _close(c)
+
+    def _checkpoint(card_id: str, note: str) -> None:
+        c = kb.connect()
+        try:
+            kb.add_comment(c, card_id, author, note)
+        finally:
+            _close(c)
+
+    def _build_prompt(card: Dict[str, Any]) -> str:
+        c = kb.connect()
+        try:
+            ctx = kb.build_worker_context(c, card["id"])
+        except Exception:
+            ctx = f"{card.get('title', '')}\n\n{card.get('body', '')}".strip()
+        finally:
+            _close(c)
+        return CONDUCTOR_CARD_PROMPT + "\n\n" + (ctx or "")
+
+    return run_board_conductor(
+        board=board,
+        run_turn=_run_turn,
+        list_workable=_list_workable,
+        claim=_claim,
+        complete=_complete,
+        block=_block,
+        checkpoint=_checkpoint,
+        build_prompt=_build_prompt,
+        judge=judge,
+        log=log,
+        **budget,
+    )
