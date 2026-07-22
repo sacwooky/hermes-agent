@@ -223,3 +223,29 @@ def test_spawn_conductor_log_refuses_symlink(kanban_home, tmp_path, monkeypatch)
     assert pid == 777
     assert log_path.is_symlink()
     assert victim.read_text(encoding="utf-8") == "keep-me"
+
+
+def test_spawn_conductor_log_rotation_skips_symlink(kanban_home, tmp_path, monkeypatch):
+    """Rotation must not run on a symlinked log path (stat/rename surface). With a
+    1-byte rotation threshold the target far exceeds it, so rotation WOULD trigger
+    if the path were not symlink-guarded."""
+    import subprocess
+
+    class _FakeProc:
+        pid = 5
+
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: _FakeProc())
+    monkeypatch.setattr(kb, "worker_log_rotation_config", lambda: (1, 1))  # rotate at 1 byte
+    victim = tmp_path / "big_victim.txt"
+    victim.write_text("x" * 4096, encoding="utf-8")  # well over the threshold
+    log_dir = kb.worker_logs_dir(board="default")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{kb.CONDUCTOR_PID_MARKER}.log"
+    log_path.symlink_to(victim)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    kb._spawn_conductor("default", str(ws), profile="default")
+
+    assert log_path.is_symlink(), "symlinked log path must NOT be rotated (renamed) away"
+    assert victim.read_text(encoding="utf-8") == "x" * 4096, "rotation must not touch the target"

@@ -9502,26 +9502,39 @@ def _spawn_conductor(
     log_dir = worker_logs_dir(board=board)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{CONDUCTOR_PID_MARKER}.log"
-    rotate_bytes, backup_count = worker_log_rotation_config()
-    _rotate_worker_log(log_path, rotate_bytes, backup_count)
-    # O_NOFOLLOW on the log open: a symlink pre-placed at the predictable
-    # __conductor__.log path must not redirect the conductor's stdout/stderr
-    # into an attacker-chosen file (clobber / log poisoning). If the open is
-    # refused, fall back to DEVNULL — drop logs rather than write through a
-    # symlink.
-    log_flags = (
-        os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
-    )
-    try:
-        _log_fd = os.open(log_path, log_flags, 0o600)
-        log_f = os.fdopen(_log_fd, "ab")
-    except OSError:
+    # If the predictable __conductor__.log path is a symlink (hostile at a
+    # shared-directory trust boundary), do NOT touch it at all — no rotation
+    # (which stat()s and rename()s the path), no open — and drop logs to
+    # DEVNULL. `is_symlink()` uses lstat and does not follow the link. This
+    # closes the rotation-follows-symlink surface; the O_NOFOLLOW open below is
+    # the belt to this lstat-guard's braces (covers a symlink swapped in after
+    # the check — rename/unlink act on the link not its target, open is refused).
+    if log_path.is_symlink():
         _log.warning(
-            "conductor log path %s not safe to open (symlink/permissions); "
+            "conductor log path %s is a symlink; not rotating/opening it — "
             "dropping conductor logs for this run",
             log_path,
         )
         log_f = open(os.devnull, "ab")
+    else:
+        rotate_bytes, backup_count = worker_log_rotation_config()
+        _rotate_worker_log(log_path, rotate_bytes, backup_count)
+        # O_NOFOLLOW on the open: even if a symlink is swapped in after the
+        # lstat guard, the open is refused rather than redirecting conductor
+        # stdout/stderr into an attacker-chosen file.
+        log_flags = (
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            _log_fd = os.open(log_path, log_flags, 0o600)
+            log_f = os.fdopen(_log_fd, "ab")
+        except OSError:
+            _log.warning(
+                "conductor log path %s not safe to open (symlink/permissions); "
+                "dropping conductor logs for this run",
+                log_path,
+            )
+            log_f = open(os.devnull, "ab")
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
