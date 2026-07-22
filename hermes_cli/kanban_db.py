@@ -8906,6 +8906,34 @@ def _rotate_worker_log(
         pass
 
 
+def _open_spawn_log_safely(log_path: Path, rotate_bytes: int, backup_count: int):
+    """Open a spawn log file with symlink hardening; shared by worker + conductor.
+
+    A predictable log path in a shared directory is a symlink-follow surface. If
+    the path is a symlink, do NOT rotate it (rotation stat/renames the path) and
+    do NOT open it — drop logs to DEVNULL. Otherwise rotate, then open with
+    O_NOFOLLOW (covers a symlink swapped in after the lstat) so the spawn's
+    stdout/stderr can never be redirected into an attacker-chosen file. Returns
+    an append-mode binary file object suitable for ``subprocess.Popen(stdout=)``.
+    """
+    if log_path.is_symlink():
+        _log.warning(
+            "spawn log path %s is a symlink; not rotating/opening it — dropping logs",
+            log_path,
+        )
+        return open(os.devnull, "ab")
+    _rotate_worker_log(log_path, rotate_bytes, backup_count)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        return os.fdopen(os.open(log_path, flags, 0o600), "ab")
+    except OSError:
+        _log.warning(
+            "spawn log path %s not safe to open (symlink/permissions); dropping logs",
+            log_path,
+        )
+        return open(os.devnull, "ab")
+
+
 def _module_hermes_argv() -> list[str]:
     """Return the interpreter-bound Hermes CLI invocation."""
     # ``hermes_cli.main`` is the console-script target declared in
@@ -9323,10 +9351,10 @@ def _default_spawn(
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{task.id}.log"
     rotate_bytes, backup_count = worker_log_rotation_config()
-    _rotate_worker_log(log_path, rotate_bytes, backup_count)
-
-    # Use 'a' so a re-run on unblock appends rather than overwrites.
-    log_f = open(log_path, "ab")
+    # Symlink-hardened (shared with the conductor): a symlink pre-placed at the
+    # predictable per-task log path must not redirect the worker's stdout/stderr
+    # into an attacker-chosen file, and rotation must not stat/rename through it.
+    log_f = _open_spawn_log_safely(log_path, rotate_bytes, backup_count)
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
@@ -9577,39 +9605,11 @@ def _spawn_conductor(
     log_dir = worker_logs_dir(board=board)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{CONDUCTOR_PID_MARKER}.log"
-    # If the predictable __conductor__.log path is a symlink (hostile at a
-    # shared-directory trust boundary), do NOT touch it at all — no rotation
-    # (which stat()s and rename()s the path), no open — and drop logs to
-    # DEVNULL. `is_symlink()` uses lstat and does not follow the link. This
-    # closes the rotation-follows-symlink surface; the O_NOFOLLOW open below is
-    # the belt to this lstat-guard's braces (covers a symlink swapped in after
-    # the check — rename/unlink act on the link not its target, open is refused).
-    if log_path.is_symlink():
-        _log.warning(
-            "conductor log path %s is a symlink; not rotating/opening it — "
-            "dropping conductor logs for this run",
-            log_path,
-        )
-        log_f = open(os.devnull, "ab")
-    else:
-        rotate_bytes, backup_count = worker_log_rotation_config()
-        _rotate_worker_log(log_path, rotate_bytes, backup_count)
-        # O_NOFOLLOW on the open: even if a symlink is swapped in after the
-        # lstat guard, the open is refused rather than redirecting conductor
-        # stdout/stderr into an attacker-chosen file.
-        log_flags = (
-            os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
-        )
-        try:
-            _log_fd = os.open(log_path, log_flags, 0o600)
-            log_f = os.fdopen(_log_fd, "ab")
-        except OSError:
-            _log.warning(
-                "conductor log path %s not safe to open (symlink/permissions); "
-                "dropping conductor logs for this run",
-                log_path,
-            )
-            log_f = open(os.devnull, "ab")
+    rotate_bytes, backup_count = worker_log_rotation_config()
+    # Shared symlink-hardened open (see _open_spawn_log_safely): a symlink at the
+    # predictable log path is neither rotated nor opened; O_NOFOLLOW covers a
+    # post-lstat swap; on refusal logs drop to DEVNULL.
+    log_f = _open_spawn_log_safely(log_path, rotate_bytes, backup_count)
     # TOCTOU-safe cwd. A validated workspace path could be swapped for a symlink
     # between validation and use. Open the dir with O_NOFOLLOW|O_DIRECTORY (which
     # refuses a symlink and pins the inode), inherit that fd to the child, and

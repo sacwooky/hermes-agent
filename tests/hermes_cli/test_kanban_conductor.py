@@ -342,3 +342,34 @@ def test_ensure_conductor_no_spawn_when_board_has_no_workable_cards(conn):
     res = kb.ensure_conductor(conn, board="default", profile="orch", spawn_fn=spawn)
     assert calls == [], "must not spawn on a board with no ready+assigned cards"
     assert res.spawned == []
+
+
+# --------------------------------------------------------------------------
+# Follow-up: shared symlink-hardened spawn-log open (worker + conductor)
+# --------------------------------------------------------------------------
+
+def test_open_spawn_log_safely_refuses_symlink(tmp_path):
+    victim = tmp_path / "victim"
+    victim.write_text("keep", encoding="utf-8")
+    logp = tmp_path / "spawn.log"
+    logp.symlink_to(victim)
+    f = kb._open_spawn_log_safely(logp, 1_000_000, 1)
+    try:
+        f.write(b"conductor output that must NOT reach the victim\n")
+        f.flush()
+    finally:
+        f.close()
+    assert victim.read_text(encoding="utf-8") == "keep"  # target untouched (wrote to devnull)
+    assert logp.is_symlink()  # symlink not replaced/rotated
+
+
+def test_open_spawn_log_safely_opens_regular_file(tmp_path):
+    logp = tmp_path / "spawn.log"
+    f = kb._open_spawn_log_safely(logp, 1_000_000, 1)
+    try:
+        f.write(b"hello\n")
+        f.flush()
+    finally:
+        f.close()
+    assert logp.is_file() and not logp.is_symlink()
+    assert b"hello" in logp.read_bytes()

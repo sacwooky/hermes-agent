@@ -430,6 +430,32 @@ class GatewayKanbanWatchersMixin:
                                     "task": task,
                                     "board": slug,
                                 })
+                            # Event-responsive conductor wake. This 5s notifier tick
+                            # already enumerates every board with an open conn, so it
+                            # is the cheapest place to keep a conductor-enabled board's
+                            # conductor running: ensure_conductor resumes a drained
+                            # conductor within ~5s of new work (e.g. a gate answer
+                            # unblocking a card) instead of waiting for the 60s
+                            # dispatcher tick. It is idempotent — the flock lifetime
+                            # lock prevents a double-spawn and the workable-work gate
+                            # prevents spawning on an empty board — so running it here
+                            # AND in the dispatcher is safe.
+                            try:
+                                if _kb.conductor_enabled_for(kanban_cfg, slug):
+                                    _kb.ensure_conductor(
+                                        conn,
+                                        board=slug,
+                                        profile=_kb.conductor_profile_for(
+                                            kanban_cfg,
+                                            slug,
+                                            fallback=(kanban_cfg.get("default_assignee") or "default"),
+                                        ),
+                                    )
+                            except Exception as _cond_wake_exc:
+                                logger.debug(
+                                    "kanban notifier: conductor wake for board %s failed: %s",
+                                    slug, _cond_wake_exc,
+                                )
                         finally:
                             conn.close()
                     return deliveries
