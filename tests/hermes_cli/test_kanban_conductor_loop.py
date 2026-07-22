@@ -168,3 +168,53 @@ def test_no_workable_cards_is_a_clean_noop():
         complete=lambda *a: None, block=lambda *a: None, build_prompt=lambda c: "go",
     )
     assert res == {"completed": [], "blocked": [], "turns_used": 0, "cards_seen": 0}
+
+
+# --------------------------------------------------------------------------
+# Slice 4 — in-session idle recheck (event-driven resume without re-spawn)
+# --------------------------------------------------------------------------
+
+def test_idle_recheck_picks_up_late_card_in_same_session():
+    # Board starts empty of workable cards; a card appears after 2 rechecks
+    # (simulating a child unblocked mid-session). The conductor must pick it up
+    # WITHOUT exiting, then complete it — all in one session.
+    clock = {"t": 0.0}
+    appear_after = 2
+    calls = {"list": 0}
+    state = {"completed": []}
+
+    def list_workable():
+        calls["list"] += 1
+        if calls["list"] > appear_after and "late" not in state["completed"]:
+            return [{"id": "late", "title": "L", "body": ""}]
+        return []
+
+    def fake_sleep(s):
+        clock["t"] += s
+
+    res = run_board_conductor(
+        board="t", run_turn=lambda p: "DONE: ok", judge=_judge("done"),
+        list_workable=list_workable, claim=lambda c: True,
+        complete=lambda cid, s: state["completed"].append(cid),
+        block=lambda *a: None, build_prompt=lambda c: "go",
+        idle_max_seconds=60, idle_recheck_seconds=5,
+        sleep=fake_sleep, monotonic=lambda: clock["t"],
+    )
+    assert res["completed"] == ["late"]
+
+
+def test_idle_recheck_exits_after_timeout_when_no_work_appears():
+    clock = {"t": 0.0}
+
+    def fake_sleep(s):
+        clock["t"] += s
+
+    res = run_board_conductor(
+        board="t", run_turn=lambda p: "x", judge=_judge("done"),
+        list_workable=lambda: [], claim=lambda c: True,
+        complete=lambda *a: None, block=lambda *a: None, build_prompt=lambda c: "go",
+        idle_max_seconds=30, idle_recheck_seconds=5,
+        sleep=fake_sleep, monotonic=lambda: clock["t"],
+    )
+    assert res == {"completed": [], "blocked": [], "turns_used": 0, "cards_seen": 0}
+    assert clock["t"] >= 30  # waited out the idle window before exiting

@@ -62,7 +62,7 @@ def test_conductor_entrypoint_drives_real_cards_to_done(kanban_home, monkeypatch
     monkeypatch.setenv("HERMES_KANBAN_CONDUCTOR", "1")
 
     fake = _FakeCli(response="DONE: built it, tests pass")
-    drive_board_from_cli(fake, board="default", author="conductor", judge=_judge("done"))
+    drive_board_from_cli(fake, board="default", author="conductor", judge=_judge("done"), idle_max_seconds=0)
 
     with kb.connect() as c:
         rows = kb.list_tasks(c, include_archived=False)
@@ -84,7 +84,7 @@ def test_conductor_entrypoint_blocks_when_agent_cannot_finish(kanban_home, monke
     # the loop coerces to continue and blocks the card on budget rather than
     # falsely completing it.
     fake = _FakeCli(response="still working, no signal yet")
-    drive_board_from_cli(fake, board="default", author="conductor", judge=_judge("continue"), max_turns_per_card=2, max_total_turns=2)
+    drive_board_from_cli(fake, board="default", author="conductor", judge=_judge("continue"), max_turns_per_card=2, max_total_turns=2, idle_max_seconds=0)
 
     with kb.connect() as c:
         rows = kb.list_tasks(c, include_archived=False)
@@ -94,6 +94,6 @@ def test_conductor_entrypoint_blocks_when_agent_cannot_finish(kanban_home, monke
 
 def test_conductor_on_empty_board_is_a_clean_noop(kanban_home):
     fake = _FakeCli()
-    res = drive_board_from_cli(fake, board="default", author="conductor")
+    res = drive_board_from_cli(fake, board="default", author="conductor", idle_max_seconds=0)
     assert fake.agent.calls == 0  # no cards → agent never invoked
     assert res["completed"] == [] and res["blocked"] == []

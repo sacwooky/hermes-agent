@@ -87,6 +87,10 @@ def run_board_conductor(
     judge: Optional[Callable] = None,
     max_total_turns: int = DEFAULT_MAX_TURNS,
     max_turns_per_card: int = DEFAULT_MAX_TURNS_PER_CARD,
+    idle_recheck_seconds: float = 5.0,
+    idle_max_seconds: float = 0.0,
+    sleep: Optional[Callable[[float], None]] = None,
+    monotonic: Optional[Callable[[], float]] = None,
     log: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """Drive ``board``'s buildable cards to completion in one session.
@@ -115,6 +119,12 @@ def run_board_conductor(
                 pass
 
     judge = judge or judge_goal
+    if sleep is None:
+        import time as _t
+        sleep = _t.sleep
+    if monotonic is None:
+        import time as _t2
+        monotonic = _t2.monotonic
     max_total_turns = int(max_total_turns or DEFAULT_MAX_TURNS)
     if max_total_turns < 1:
         max_total_turns = DEFAULT_MAX_TURNS
@@ -126,6 +136,7 @@ def run_board_conductor(
     blocked: List[str] = []
     seen: set[str] = set()
     turns_used = 0
+    idle_started: Optional[float] = None  # monotonic ts of first empty pass
 
     while turns_used < max_total_turns:
         try:
@@ -134,8 +145,25 @@ def run_board_conductor(
             _log(f"conductor {board}: list_workable failed ({exc}); stopping")
             break
         if not cards:
-            _log(f"conductor {board}: no workable cards remain; board drained")
-            break
+            # In-session idle recheck: instead of exiting the moment the board
+            # has no buildable work, briefly wait and re-query so cards that
+            # become workable WITHIN this session (e.g. a child unblocked by a
+            # just-completed parent) are picked up instantly, keeping context.
+            # A previously-blocked card that a HUMAN GATE later unblocks keeps
+            # its id in `seen` and is resumed by the dispatcher tick's
+            # ensure_conductor re-spawn (fresh session), not here.
+            if idle_max_seconds <= 0:
+                _log(f"conductor {board}: no workable cards remain; board drained")
+                break
+            now = monotonic()
+            if idle_started is None:
+                idle_started = now
+            if (now - idle_started) >= idle_max_seconds:
+                _log(f"conductor {board}: idle {idle_max_seconds:.0f}s with no new work; exiting")
+                break
+            sleep(max(0.1, idle_recheck_seconds))
+            continue
+        idle_started = None  # work found — reset the idle timer
 
         progressed = False
         for card in cards:
@@ -377,6 +405,10 @@ def drive_board_from_cli(
             _close(c)
         return CONDUCTOR_CARD_PROMPT + "\n\n" + (ctx or "")
 
+    # Enable in-session idle recheck by default so a conductor picks up cards
+    # unblocked mid-session (e.g. children of a just-completed parent) without a
+    # re-spawn. Override via budget for tests / tuning.
+    budget.setdefault("idle_max_seconds", 120.0)
     return run_board_conductor(
         board=board,
         run_turn=_run_turn,
