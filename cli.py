@@ -15011,6 +15011,135 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     )
 
 
+def _run_kanban_conductor_q(cli: "HermesCLI", first_response: str) -> None:
+    """Drive a whole board's buildable cards in ONE session (conductor mode).
+
+    Called from the quiet single-query path when ``HERMES_KANBAN_CONDUCTOR`` is
+    set (dispatcher-spawned conductor, see ``kanban_db._spawn_conductor``). Wires
+    the session agent's ``run_conversation`` and the kanban DB into
+    ``kanban_conductor.run_board_conductor``: the agent does the build work per
+    card while Python drives card lifecycle (claim/complete/block) directly —
+    the conductor carries no ``HERMES_KANBAN_TASK`` so the single-card kanban
+    tools never bind it to one card.
+
+    All errors are swallowed by the caller — a broken conductor must never wedge
+    the gateway; the one-conductor-per-board PID guard and crash detection are
+    the backstop.
+    """
+    import os as _os
+
+    board = (_os.environ.get("HERMES_KANBAN_BOARD") or "").strip()
+    if not board:
+        return
+
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli.kanban_conductor import run_board_conductor as _run_conductor
+
+    author = (_os.environ.get("HERMES_PROFILE") or "").strip() or "conductor"
+
+    def _close(c) -> None:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+    def _run_turn(prompt: str) -> str:
+        result = cli.agent.run_conversation(
+            user_message=prompt,
+            conversation_history=cli.conversation_history,
+        )
+        if (
+            getattr(cli.agent, "session_id", None)
+            and cli.agent.session_id != cli.session_id
+        ):
+            cli.session_id = cli.agent.session_id
+        resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
+        if resp:
+            print(resp)
+        return resp or ""
+
+    def _list_workable():
+        c = _kb.connect()
+        try:
+            # Promote todo->ready where dependencies are met, then take the
+            # ready+assigned cards. Ready cards are, by construction, not gated
+            # (a clarify gate parks a card in blocked/scheduled). Gate answering
+            # + wake resumption lands in slice 4.
+            try:
+                _kb.recompute_ready(c)
+            except Exception:
+                pass
+            rows = _kb.list_tasks(c, status="ready")
+            return [
+                {"id": t.id, "title": t.title, "body": t.body}
+                for t in rows
+                if getattr(t, "assignee", None)
+            ]
+        finally:
+            _close(c)
+
+    def _claim(card_id: str) -> bool:
+        c = _kb.connect()
+        try:
+            return _kb.claim_task(c, card_id) is not None
+        finally:
+            _close(c)
+
+    def _complete(card_id: str, summary: str) -> None:
+        c = _kb.connect()
+        try:
+            _kb.complete_task(c, card_id, summary=summary, board=board)
+        finally:
+            _close(c)
+
+    def _block(card_id: str, reason: str) -> None:
+        c = _kb.connect()
+        try:
+            _kb.block_task(c, card_id, reason=reason)
+        finally:
+            _close(c)
+
+    def _checkpoint(card_id: str, note: str) -> None:
+        c = _kb.connect()
+        try:
+            _kb.add_comment(c, card_id, author, note)
+        finally:
+            _close(c)
+
+    def _build_prompt(card) -> str:
+        c = _kb.connect()
+        try:
+            ctx = _kb.build_worker_context(c, card["id"])
+        except Exception:
+            ctx = f"{card.get('title', '')}\n\n{card.get('body', '')}".strip()
+        finally:
+            _close(c)
+        return (
+            "You are the board conductor working ONE card to completion in the "
+            "current working tree. Do the real work: read the code, edit files, "
+            "run the relevant tests/build, and delegate independent sub-parts if "
+            "it saves wall-clock. Do NOT git commit/push/merge, deploy, read or "
+            "change credentials, or delete destructively — leave changes "
+            "uncommitted for the reviewer. When the card genuinely meets its "
+            "acceptance criteria, end your message with a line starting 'DONE:' "
+            "summarizing what changed and how you verified it. If only a human "
+            "can unblock you, end with a line starting 'BLOCKED:' and the "
+            "reason.\n\n" + (ctx or "")
+        )
+
+    _run_conductor(
+        board=board,
+        run_turn=_run_turn,
+        list_workable=_list_workable,
+        claim=_claim,
+        complete=_complete,
+        block=_block,
+        checkpoint=_checkpoint,
+        build_prompt=_build_prompt,
+        log=lambda m: logger.info("%s", m),
+    )
+
+
 def main(
     query: str = None,
     q: str = None,
@@ -15446,6 +15575,19 @@ def main(
                                 _run_kanban_goal_loop_q(cli, response)
                             except Exception as _goal_exc:
                                 logger.debug("kanban goal loop failed: %s", _goal_exc)
+
+                        # Conductor mode: a session spawned to conduct a whole
+                        # board keeps working its buildable cards in THIS session
+                        # (claim → build → complete/block, card lifecycle driven
+                        # in Python) until the board is drained or the turn budget
+                        # runs out. Gated on HERMES_KANBAN_CONDUCTOR (set only by
+                        # kanban_db._spawn_conductor); a no-op for every worker and
+                        # every non-conductor `-q` run.
+                        if os.environ.get("HERMES_KANBAN_CONDUCTOR") == "1":
+                            try:
+                                _run_kanban_conductor_q(cli, response)
+                            except Exception as _cond_exc:
+                                logger.debug("kanban conductor loop failed: %s", _cond_exc)
 
                         # Session ID goes to stderr so piped stdout is clean.
                         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
