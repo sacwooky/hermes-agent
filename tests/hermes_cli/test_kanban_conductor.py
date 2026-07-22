@@ -312,3 +312,19 @@ def test_conductor_workspace_uses_safe_default_workdir(kanban_home, tmp_path, mo
     d = tmp_path / "project"; d.mkdir()
     monkeypatch.setattr(kb, "read_board_metadata", lambda slug: {"default_workdir": str(d)})
     assert kb._conductor_workspace("default") == str(d)
+
+
+def test_is_safe_conductor_workdir_rejects_traversal_and_symlinked_parent(tmp_path):
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    # `..` traversal component, even though the resolved dir exists
+    assert kb._is_safe_conductor_workdir(str(tmp_path / "sub" / ".." / "sub")) is False
+    # symlinked PARENT component (the path itself is not a symlink)
+    realp = tmp_path / "realparent"
+    realp.mkdir()
+    (realp / "proj").mkdir()
+    linkp = tmp_path / "linkparent"
+    linkp.symlink_to(realp)
+    assert kb._is_safe_conductor_workdir(str(linkp / "proj")) is False
+    # a fully-canonical real dir still passes
+    assert kb._is_safe_conductor_workdir(str(realp / "proj")) is True

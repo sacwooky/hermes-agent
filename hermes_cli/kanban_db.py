@@ -9451,13 +9451,20 @@ def _is_safe_conductor_workdir(path: object) -> bool:
         p = str(path or "")
         if not p or not os.path.isabs(p):
             return False
-        # Reject shell metacharacters / whitespace / traversal that would be
-        # unsafe when the path is interpolated into prompts or `cd` guidance.
+        # Reject shell metacharacters / whitespace that would be unsafe when the
+        # path is interpolated into prompts or `cd` guidance.
         if any(ch in p for ch in "\n\r\t \x00;|&$`<>*?()!\\\"'"):
             return False
-        if os.path.islink(p):
+        # Reject traversal components (``..``) outright.
+        if ".." in p.split(os.sep):
             return False
+        # Reject a symlink ANYWHERE in the chain (not just the final component):
+        # if resolving symlinks changes the normalized path, some parent was a
+        # symlink. A fully-canonical real directory has realpath == normpath.
+        norm = os.path.normpath(p)
         real = os.path.realpath(p)
+        if real != norm:
+            return False
         if not os.path.isdir(real):
             return False
         if real in _SENSITIVE_WORKDIR_ROOTS or any(
