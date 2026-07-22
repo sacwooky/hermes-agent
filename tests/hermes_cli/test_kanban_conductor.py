@@ -95,6 +95,7 @@ def _spy_spawn(pid=4242):
 
 
 def test_ensure_conductor_spawns_when_lock_free(conn):
+    kb.create_task(conn, title='w', assignee='builder')  # workable card so the conductor spawns
     spawn, calls = _spy_spawn()
     res = kb.ensure_conductor(conn, board="default", profile="orch", spawn_fn=spawn)
     assert len(calls) == 1, "should spawn when no conductor holds the lock"
@@ -121,6 +122,7 @@ def test_ensure_conductor_no_spawn_while_lock_held(conn):
 
 
 def test_ensure_conductor_respawns_after_lock_released(conn):
+    kb.create_task(conn, title='w', assignee='builder')  # workable card so the conductor spawns
     db_path = kb.kanban_db_path(board="default")
     lock_path = kb._conductor_lock_path(db_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -272,6 +274,7 @@ def test_conductor_workspace_falls_back_and_creates_dir(kanban_home, monkeypatch
 
 
 def test_ensure_conductor_spawns_in_board_workspace(conn, tmp_path, monkeypatch):
+    kb.create_task(conn, title='w', assignee='builder')  # workable card so the conductor spawns
     wd = tmp_path / "repo"
     wd.mkdir()
     monkeypatch.setattr(kb, "read_board_metadata", lambda slug: {"default_workdir": str(wd)})
@@ -330,3 +333,12 @@ def test_is_safe_conductor_workdir_rejects_traversal_and_symlinked_parent(tmp_pa
     assert kb._is_safe_conductor_workdir(str(linkp / "proj")) is False
     # a fully-canonical real dir still passes
     assert kb._is_safe_conductor_workdir(str(realp / "proj")) is True
+
+
+def test_ensure_conductor_no_spawn_when_board_has_no_workable_cards(conn):
+    """The workable-work gate: an opted-in but empty board must NOT spawn a
+    conductor (avoids the empty-board spawn/idle/respawn storm)."""
+    spawn, calls = _spy_spawn()
+    res = kb.ensure_conductor(conn, board="default", profile="orch", spawn_fn=spawn)
+    assert calls == [], "must not spawn on a board with no ready+assigned cards"
+    assert res.spawned == []

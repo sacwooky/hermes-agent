@@ -9705,6 +9705,27 @@ def ensure_conductor(
     except ImportError:
         fcntl = None
 
+    def _has_workable_cards() -> bool:
+        """Whether the board has at least one ready, assigned, unclaimed card.
+
+        Gates conductor spawning: with the global default enabled, most boards
+        are empty/done — spawning a full hermes session per empty board per tick
+        (each an LLM call, then idle-exit, then respawn) is a needless spawn/cost
+        storm. Only spawn a conductor when there is buildable work. Promotes
+        todo->ready first (the dispatch_once path we bypass would otherwise do
+        it). Fail CLOSED (no spawn) on error — a transient miss retries next tick.
+        """
+        try:
+            recompute_ready(conn)
+            row = conn.execute(
+                "SELECT 1 FROM tasks WHERE status = 'ready' AND assignee IS NOT NULL "
+                "AND claim_lock IS NULL LIMIT 1"
+            ).fetchone()
+            return row is not None
+        except Exception:
+            _log.debug("conductor workable-card check failed for board %s", board, exc_info=True)
+            return False
+
     def _spawn_result(inherit_fd: Optional[int]) -> "DispatchResult":
         pid = _spawn(board, ws, profile=profile, inherit_fd=inherit_fd)
         return DispatchResult(
@@ -9712,6 +9733,10 @@ def ensure_conductor(
         )
 
     def _do() -> "DispatchResult":
+        # Only run a conductor when the board has buildable work — otherwise an
+        # opted-in but empty board would spawn+idle+exit+respawn every tick.
+        if not _has_workable_cards():
+            return DispatchResult()
         # No lockable path (in-memory tests) or non-POSIX: fall back to a plain
         # spawn under the outer _dispatch_tick_lock (best-effort single-writer).
         if db_path is None or fcntl is None:
