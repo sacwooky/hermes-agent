@@ -384,19 +384,42 @@ def drive_board_from_cli(
         finally:
             _close(c)
 
-    # The conductor process cwd IS the board workspace (set by _spawn_conductor),
-    # but — unlike a worker — the conductor sets no HERMES_KANBAN_TASK, so the
-    # kanban worker system prompt's "cd $HERMES_KANBAN_WORKSPACE" guidance never
-    # fires and the agent's terminal tool would otherwise default to $HOME. State
-    # the absolute working directory explicitly so all file work lands here.
     import shlex as _shlex
 
-    workdir = _os.getcwd()
-    workdir_directive = (
-        f"Your working directory is: {workdir}\n"
-        f"Run `cd {_shlex.quote(workdir)}` first and do ALL file work there "
-        f"(relative paths).\n\n"
-    )
+    # Fallback working directory (the conductor process cwd) when a card has no
+    # resolvable per-task workspace.
+    board_workdir = _os.getcwd()
+
+    def _card_workdir(card_id: str) -> str:
+        """Resolve THIS card's own workspace the way the worker path does.
+
+        Boards give each card its own workspace — a fresh scratch dir or an
+        isolated git worktree — not one shared board dir. The conductor is a
+        single session, so it can't set its process cwd per card; instead it
+        resolves each card's workspace (creating scratch/dir as needed via the
+        same resolve_workspace the dispatcher uses) and directs the agent to
+        `cd` there for that card. This is what lets the conductor drive boards
+        whose cards use per-task worktrees/scratch, not just single-repo boards.
+        The resolved path is validated (fleet-internal, but treat as untrusted)
+        before it is interpolated into the prompt; on any failure fall back to
+        the board workdir.
+        """
+        c = _connect()
+        try:
+            task = kb.get_task(c, card_id)
+        except Exception:
+            task = None
+        finally:
+            _close(c)
+        if task is None:
+            return board_workdir
+        try:
+            resolved = str(kb.resolve_workspace(task, board=board))
+        except Exception:
+            return board_workdir
+        if resolved and kb._is_safe_conductor_workdir(resolved):
+            return resolved
+        return board_workdir
 
     def _fence_untrusted(text: str) -> str:
         # Neutralize the fence delimiter so card content cannot break out of the
@@ -411,11 +434,17 @@ def drive_board_from_cli(
             ctx = f"{card.get('title', '')}\n\n{card.get('body', '')}".strip()
         finally:
             _close(c)
+        workdir = _card_workdir(card["id"])
+        workdir_directive = (
+            f"Your working directory for THIS task is: {workdir}\n"
+            f"Run `cd {_shlex.quote(workdir)}` FIRST and do ALL file work there "
+            f"(relative paths).\n\n"
+        )
         # Trusted directives/rules OUTSIDE the fence; the card description is
-        # untrusted DATA inside it. This is defense-in-depth prompt hygiene, not
-        # an enforceable sandbox — hard filesystem confinement of an agent with a
-        # local terminal requires terminal.backend=docker (a separate fleet-wide
-        # setting); the conductor's trust model matches the existing worker path.
+        # untrusted DATA inside it. Defense-in-depth prompt hygiene, not an
+        # enforceable sandbox — hard filesystem confinement of an agent with a
+        # local terminal requires terminal.backend=docker (a fleet-wide setting);
+        # the conductor's trust model matches the existing worker path.
         return (
             workdir_directive
             + CONDUCTOR_CARD_PROMPT

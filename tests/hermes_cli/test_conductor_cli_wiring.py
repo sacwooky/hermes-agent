@@ -155,3 +155,31 @@ def test_conductor_prompt_fences_untrusted_card_content(kanban_home, tmp_path, m
     assert msg.index("working directory") < msg.index("<untrusted_task>")
     # the card's injected closing delimiter was neutralized (can't break out)
     assert "</ untrusted_task>" in msg
+
+
+def test_conductor_resolves_per_card_workspace(kanban_home, tmp_path, monkeypatch):
+    """Each card is driven in its OWN resolved workspace (dir/scratch/worktree),
+    not one shared board dir — so boards with per-task worktrees/scratch work."""
+    repo = tmp_path / "cardrepo"
+    repo.mkdir()
+    with kb.connect() as c:
+        kb.create_task(c, title="dircard", body="build here", assignee="builder",
+                       workspace_kind="dir", workspace_path=str(repo))
+    seen = {}
+
+    class _A:
+        session_id = "s"
+
+        def run_conversation(self, *, user_message, conversation_history):
+            seen["msg"] = user_message
+            return {"final_response": "DONE: ok"}
+
+    class _C:
+        session_id = "s"
+        conversation_history = []
+        agent = _A()
+
+    drive_board_from_cli(_C(), board="default",
+                         judge=lambda g, r: ("done", "ok", False, None), idle_max_seconds=0)
+    assert str(repo) in seen["msg"], "prompt must direct the agent to THIS card's resolved workspace"
+    assert "working directory for this task" in seen["msg"].lower()
