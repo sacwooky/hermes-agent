@@ -189,3 +189,47 @@ def test_spawn_conductor_has_no_board_management(kanban_home, tmp_path, monkeypa
     assert "-Q" in captured["cmd"], "conductor must pin quiet mode so the drive loop runs"
     assert captured["env"].get("HERMES_KANBAN_CONDUCTOR") == "1"
     assert "HERMES_KANBAN_TASK" not in captured["env"], "no task id -> single-card kanban tools do not attach"
+
+
+def test_spawn_conductor_log_refuses_symlink(kanban_home, tmp_path, monkeypatch):
+    """A symlink pre-placed at the predictable __conductor__.log path must not
+    redirect the conductor's stdout into an attacker-chosen file."""
+    import subprocess
+
+    class _FakeProc:
+        pid = 777
+
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: _FakeProc())
+    victim = tmp_path / "log_victim.txt"
+    victim.write_text("keep-me", encoding="utf-8")
+    log_dir = kb.worker_logs_dir(board="default")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{kb.CONDUCTOR_PID_MARKER}.log"
+    log_path.symlink_to(victim)  # attacker pre-places the symlink
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    pid = kb._spawn_conductor("default", str(ws), profile="default")
+
+    assert pid == 777  # fell back to devnull, did not crash
+    assert log_path.is_symlink()  # symlink was NOT followed/replaced
+    assert victim.read_text(encoding="utf-8") == "keep-me"  # target untouched
+
+
+def test_ensure_conductor_refuses_untrackable_pid(conn, tmp_path, monkeypatch):
+    """If the pid path is not securely writable (hostile symlink), ensure_conductor
+    must NOT spawn — otherwise every tick would spawn another untracked conductor."""
+    db_path = kb.kanban_db_path(board="default")
+    victim = tmp_path / "pid_victim.txt"
+    victim.write_text("v", encoding="utf-8")
+    pid_path = kb._conductor_pid_path(db_path)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.symlink_to(victim)
+    monkeypatch.setattr(kb, "_pid_alive", lambda p: False)
+    spawn, calls = _fake_spawn_factory(1111)
+
+    res = kb.ensure_conductor(conn, board="default", profile="orch", spawn_fn=spawn)
+
+    assert calls == [], "must refuse to spawn an untrackable conductor"
+    assert res.spawned == []
+    assert victim.read_text(encoding="utf-8") == "v"  # not clobbered

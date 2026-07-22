@@ -9450,14 +9450,20 @@ def _read_conductor_pid(db_path: Path) -> Optional[int]:
         return None
 
 
-def _write_conductor_pid(db_path: Path, pid: Optional[int]) -> None:
+def _write_conductor_pid(db_path: Path, pid: Optional[int]) -> bool:
+    """Persist the conductor pid; return True on success, False on failure.
+
+    Callers use the return value to refuse spawning when the pid can't be
+    tracked — otherwise a hostile/unwritable pid path would make every tick
+    see no pid and spawn another conductor (one-per-board bypass).
+    """
     path = _conductor_pid_path(db_path)
     try:
         if pid is None:
             # unlink() removes the link itself (never the symlink target), so a
             # pre-placed symlink is simply deleted, not its target — safe.
             path.unlink(missing_ok=True)
-            return
+            return True
         path.parent.mkdir(parents=True, exist_ok=True)
         # O_NOFOLLOW: if an attacker pre-places a symlink at this predictable
         # path, the open fails (ELOOP) instead of clobbering the symlink's
@@ -9470,8 +9476,31 @@ def _write_conductor_pid(db_path: Path, pid: Optional[int]) -> None:
             os.write(fd, str(int(pid)).encode("ascii"))
         finally:
             os.close(fd)
+        return True
     except OSError:
         _log.debug("could not persist conductor pid for %s", db_path, exc_info=True)
+        return False
+
+
+def _conductor_pid_writable(db_path: Path) -> bool:
+    """Pre-flight: can we securely create/write the pid file at all?
+
+    Returns False if the path is a symlink (O_NOFOLLOW fails) or otherwise
+    unwritable. Used to refuse spawning an UNTRACKABLE conductor rather than
+    spawn-and-loop. Creates the file empty on success (overwritten with the real
+    pid after spawn); does not truncate an existing tracked pid — callers only
+    pre-flight when no live conductor is recorded.
+    """
+    path = _conductor_pid_path(db_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags, 0o600)
+        os.close(fd)
+        return True
+    except OSError:
+        _log.debug("conductor pid path not securely writable: %s", db_path, exc_info=True)
+        return False
 
 
 def _spawn_conductor(
@@ -9541,7 +9570,24 @@ def _spawn_conductor(
     log_path = log_dir / f"{CONDUCTOR_PID_MARKER}.log"
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
-    log_f = open(log_path, "ab")
+    # O_NOFOLLOW on the log open: a symlink pre-placed at the predictable
+    # __conductor__.log path must not redirect the conductor's stdout/stderr
+    # into an attacker-chosen file (clobber / log poisoning). If the open is
+    # refused, fall back to DEVNULL — drop logs rather than write through a
+    # symlink.
+    log_flags = (
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        _log_fd = os.open(log_path, log_flags, 0o600)
+        log_f = os.fdopen(_log_fd, "ab")
+    except OSError:
+        _log.warning(
+            "conductor log path %s not safe to open (symlink/permissions); "
+            "dropping conductor logs for this run",
+            log_path,
+        )
+        log_f = open(os.devnull, "ab")
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
@@ -9598,11 +9644,27 @@ def ensure_conductor(
         existing = _read_conductor_pid(db_path) if db_path is not None else None
         if _pid_alive(existing):
             return DispatchResult()
+        # Refuse to spawn a conductor we cannot TRACK: if the pid path is not
+        # securely writable (symlink / unwritable), spawning would leave an
+        # untracked conductor and every subsequent tick would spawn another
+        # (one-per-board bypass + resource exhaustion). Fail closed instead.
+        if db_path is not None and not _conductor_pid_writable(db_path):
+            _log.warning(
+                "conductor for board %s not spawned: pid path not securely writable "
+                "(symlink or permissions) — refusing to spawn an untrackable conductor",
+                board,
+            )
+            return DispatchResult()
         ws = workspace or str(workspaces_root(board=board))
         _spawn = spawn_fn if spawn_fn is not None else _spawn_conductor
         pid = _spawn(board, ws, profile=profile)
-        if pid and db_path is not None:
-            _write_conductor_pid(db_path, int(pid))
+        if pid and db_path is not None and not _write_conductor_pid(db_path, int(pid)):
+            _log.error(
+                "conductor for board %s spawned (pid %s) but its pid could not be "
+                "persisted; the one-per-board guard is degraded for this board",
+                board,
+                pid,
+            )
         return DispatchResult(
             spawned=[(CONDUCTOR_PID_MARKER, profile, ws)] if pid else []
         )
