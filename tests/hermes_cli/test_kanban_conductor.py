@@ -249,3 +249,30 @@ def test_spawn_conductor_log_rotation_skips_symlink(kanban_home, tmp_path, monke
 
     assert log_path.is_symlink(), "symlinked log path must NOT be rotated (renamed) away"
     assert victim.read_text(encoding="utf-8") == "x" * 4096, "rotation must not touch the target"
+
+
+# --------------------------------------------------------------------------
+# Pilot finding: conductor must work in the board's default_workdir, not $HOME
+# --------------------------------------------------------------------------
+
+def test_conductor_workspace_prefers_board_default_workdir(kanban_home, tmp_path, monkeypatch):
+    wd = tmp_path / "project"
+    wd.mkdir()
+    monkeypatch.setattr(kb, "read_board_metadata", lambda slug: {"default_workdir": str(wd)})
+    assert kb._conductor_workspace("default") == str(wd)
+
+
+def test_conductor_workspace_falls_back_and_creates_dir(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb, "read_board_metadata", lambda slug: {})
+    ws = kb._conductor_workspace("default")
+    assert ws == str(kb.workspaces_root(board="default"))
+    assert os.path.isdir(ws)  # created so cwd never falls back to $HOME
+
+
+def test_ensure_conductor_spawns_in_board_workspace(conn, tmp_path, monkeypatch):
+    wd = tmp_path / "repo"
+    wd.mkdir()
+    monkeypatch.setattr(kb, "read_board_metadata", lambda slug: {"default_workdir": str(wd)})
+    spawn, calls = _spy_spawn()
+    kb.ensure_conductor(conn, board="default", profile="orch", spawn_fn=spawn)
+    assert calls and calls[0]["workspace"] == str(wd), "conductor must run in the board default_workdir"

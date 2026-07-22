@@ -9430,6 +9430,34 @@ def _conductor_lock_path(db_path: Path) -> Path:
     return db_path.with_name(db_path.name + ".conductor.lock")
 
 
+def _conductor_workspace(board: Optional[str]) -> str:
+    """Resolve the directory the conductor works in.
+
+    Prefer the board's ``default_workdir`` (a persistent project checkout — the
+    same source the worker path uses via ``resolve_workspace``) so the conductor
+    edits files in the real repo, not the gateway's cwd. Fall back to the board
+    scratch ``workspaces_root``. Always ensure the directory exists so the spawn
+    never falls back to the gateway's home dir (which silently wrote build
+    output to ``$HOME`` in the pilot).
+    """
+    slug = _normalize_board_slug(board) or get_current_board()
+    chosen: Optional[str] = None
+    try:
+        meta = read_board_metadata(slug)
+        default_workdir = meta.get("default_workdir") if isinstance(meta, dict) else None
+        if default_workdir:
+            chosen = str(default_workdir)
+    except Exception:
+        chosen = None
+    if not chosen:
+        chosen = str(workspaces_root(board=board))
+    try:
+        Path(chosen).mkdir(parents=True, exist_ok=True)
+    except OSError:
+        _log.debug("could not ensure conductor workspace dir %s", chosen, exc_info=True)
+    return chosen
+
+
 def _spawn_conductor(
     board: Optional[str],
     workspace: str,
@@ -9588,7 +9616,7 @@ def ensure_conductor(
         except Exception:
             db_path = None
 
-    ws = workspace or str(workspaces_root(board=board))
+    ws = workspace or _conductor_workspace(board)
     _spawn = spawn_fn if spawn_fn is not None else _spawn_conductor
 
     try:
