@@ -9610,26 +9610,60 @@ def _spawn_conductor(
                 log_path,
             )
             log_f = open(os.devnull, "ab")
+    # TOCTOU-safe cwd. A validated workspace path could be swapped for a symlink
+    # between validation and use. Open the dir with O_NOFOLLOW|O_DIRECTORY (which
+    # refuses a symlink and pins the inode), inherit that fd to the child, and
+    # chdir via /proc/self/fd on Linux so the PINNED INODE — not the possibly-
+    # swapped path — becomes the cwd. Non-Linux: best-effort realpath.
+    cwd_arg = None
+    ws_fd = None
+    if workspace and os.path.isdir(workspace):
+        try:
+            ws_fd = os.open(
+                workspace,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except OSError:
+            ws_fd = None
+        if ws_fd is not None and os.path.isdir("/proc/self/fd"):
+            os.set_inheritable(ws_fd, True)
+            cwd_arg = f"/proc/self/fd/{ws_fd}"  # resolved in the child (fd inherited)
+        elif ws_fd is not None:
+            cwd_arg = os.path.realpath(workspace)  # non-Linux best-effort
+    _pass = tuple(fd for fd in (inherit_fd, ws_fd) if fd is not None)
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
+            cwd=cwd_arg,
             stdin=subprocess.DEVNULL,
             stdout=log_f,
             stderr=subprocess.STDOUT,
             env=env,
             start_new_session=True,
-            # Inherit the board conductor lock fd (kept inheritable by pass_fds)
-            # so the child holds the lifetime lock; empty tuple = inherit nothing.
-            pass_fds=(inherit_fd,) if inherit_fd is not None else (),
+            # Inherit the conductor lock fd (lifetime lock) and the workspace dir
+            # fd (so /proc/self/fd cwd resolves in the child). pass_fds keeps them
+            # inheritable through exec.
+            pass_fds=_pass,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
         )
     except FileNotFoundError:
         log_f.close()
+        if ws_fd is not None:
+            try:
+                os.close(ws_fd)
+            except OSError:
+                pass
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
+    # Parent drops its workspace-dir fd copy; the child already chdir'd via its
+    # inherited copy, so its cwd is pinned to the validated inode regardless.
+    if ws_fd is not None:
+        try:
+            os.close(ws_fd)
+        except OSError:
+            pass
     return proc.pid
 
 

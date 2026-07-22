@@ -167,6 +167,7 @@ def test_spawn_conductor_has_no_board_management(kanban_home, tmp_path, monkeypa
         captured["cmd"] = list(cmd)
         captured["env"] = dict(kw.get("env") or {})
         captured["pass_fds"] = kw.get("pass_fds")
+        captured["cwd"] = kw.get("cwd")
         return _FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", _fake_popen)
@@ -180,7 +181,8 @@ def test_spawn_conductor_has_no_board_management(kanban_home, tmp_path, monkeypa
     assert "-Q" in captured["cmd"]
     assert captured["env"].get("HERMES_KANBAN_CONDUCTOR") == "1"
     assert "HERMES_KANBAN_TASK" not in captured["env"]
-    assert captured["pass_fds"] == ()  # no inherit fd → nothing inherited
+    assert captured["cwd"] is not None  # conductor cwd pinned to the workspace (fd/realpath)
+    assert 7 not in (captured["pass_fds"] or ())  # no lock fd here (inherit_fd was None)
 
 
 def test_spawn_conductor_passes_inherit_fd(kanban_home, tmp_path, monkeypatch):
@@ -198,7 +200,7 @@ def test_spawn_conductor_passes_inherit_fd(kanban_home, tmp_path, monkeypatch):
     ws = tmp_path / "ws"
     ws.mkdir()
     kb._spawn_conductor("default", str(ws), profile="default", inherit_fd=7)
-    assert captured["pass_fds"] == (7,)  # the lock fd is inherited by the child
+    assert 7 in captured["pass_fds"]  # the lock fd is inherited by the child (ws dir fd may also be present)
 
 
 def test_spawn_conductor_log_refuses_symlink(kanban_home, tmp_path, monkeypatch):
