@@ -183,3 +183,31 @@ def test_conductor_resolves_per_card_workspace(kanban_home, tmp_path, monkeypatc
                          judge=lambda g, r: ("done", "ok", False, None), idle_max_seconds=0)
     assert str(repo) in seen["msg"], "prompt must direct the agent to THIS card's resolved workspace"
     assert "working directory for this task" in seen["msg"].lower()
+
+
+def test_conductor_unsafe_resolved_workspace_never_reaches_prompt(kanban_home, tmp_path, monkeypatch):
+    """A resolved workspace that fails validation (e.g. /etc) must NOT be
+    interpolated into the prompt — fall back to a validated path."""
+    import pathlib
+    with kb.connect() as c:
+        kb.create_task(c, title="x", body="b", assignee="builder")
+    monkeypatch.chdir(tmp_path)  # a safe, validated fallback cwd
+    monkeypatch.setattr(kb, "resolve_workspace", lambda task, board=None: pathlib.Path("/etc"))
+    seen = {}
+
+    class _A:
+        session_id = "s"
+
+        def run_conversation(self, *, user_message, conversation_history):
+            seen["msg"] = user_message
+            return {"final_response": "DONE: ok"}
+
+    class _C:
+        session_id = "s"
+        conversation_history = []
+        agent = _A()
+
+    drive_board_from_cli(_C(), board="default",
+                         judge=lambda g, r: ("done", "ok", False, None), idle_max_seconds=0)
+    assert "/etc" not in seen["msg"], "unsafe resolved workspace must not reach the prompt"
+    assert str(tmp_path) in seen["msg"]  # fell back to the validated process cwd

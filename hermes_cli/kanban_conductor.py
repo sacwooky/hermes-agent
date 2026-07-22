@@ -411,15 +411,27 @@ def drive_board_from_cli(
             task = None
         finally:
             _close(c)
-        if task is None:
-            return board_workdir
-        try:
-            resolved = str(kb.resolve_workspace(task, board=board))
-        except Exception:
-            return board_workdir
+        resolved = None
+        if task is not None:
+            try:
+                resolved = str(kb.resolve_workspace(task, board=board))
+            except Exception:
+                resolved = None
         if resolved and kb._is_safe_conductor_workdir(resolved):
             return resolved
-        return board_workdir
+        # The FALLBACK path also reaches the prompt, so it must be validated too
+        # (not just the resolved path). Prefer the (already-validated at spawn)
+        # process cwd; if even that fails validation, use a guaranteed-safe
+        # scratch dir under the kanban home so a validated absolute path — free
+        # of shell metacharacters / newlines — is always what gets interpolated.
+        if kb._is_safe_conductor_workdir(board_workdir):
+            return board_workdir
+        safe = str(kb.workspaces_root(board=board))
+        try:
+            _Path(safe).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        return safe
 
     def _fence_untrusted(text: str) -> str:
         # Neutralize the fence delimiter so card content cannot break out of the
