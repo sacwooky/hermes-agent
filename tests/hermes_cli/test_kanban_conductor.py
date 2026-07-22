@@ -373,3 +373,19 @@ def test_open_spawn_log_safely_opens_regular_file(tmp_path):
         f.close()
     assert logp.is_file() and not logp.is_symlink()
     assert b"hello" in logp.read_bytes()
+
+
+def test_open_spawn_log_safely_refuses_hardlink(tmp_path):
+    """O_NOFOLLOW catches symlinks but not HARD links — a hard-linked log path
+    (nlink>1) must be refused so appends can't land in a victim's inode."""
+    victim = tmp_path / "victim"
+    victim.write_text("keep", encoding="utf-8")
+    logp = tmp_path / "spawn.log"
+    os.link(victim, logp)  # hard link, not a symlink
+    f = kb._open_spawn_log_safely(logp, 1_000_000, 1)
+    try:
+        f.write(b"must not reach the victim inode\n")
+        f.flush()
+    finally:
+        f.close()
+    assert victim.read_text(encoding="utf-8") == "keep"  # refused → wrote to devnull

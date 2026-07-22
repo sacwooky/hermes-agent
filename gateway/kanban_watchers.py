@@ -332,6 +332,21 @@ class GatewayKanbanWatchersMixin:
             notifier_profile = self._active_profile_name()
             self._kanban_notifier_profile = notifier_profile
 
+        # Conductor-wake rate limit. The notifier ticks every 5s, but we must NOT
+        # call ensure_conductor for every conductor board every tick: wake a given
+        # board at most every CONDUCTOR_WAKE_INTERVAL seconds, and back off further
+        # on repeated failure, so a hostile/expensive board state cannot be hammered
+        # from the notifier path. The dispatcher's own 60s ensure_conductor remains
+        # the backstop. State persists across ticks on ``self`` (same pattern as
+        # ``_kanban_sub_fail_counts``).
+        import time as _wake_time
+        CONDUCTOR_WAKE_INTERVAL = 15.0
+        CONDUCTOR_WAKE_FAIL_BACKOFF = 120.0
+        conductor_wake_next: dict[str, float] = getattr(
+            self, "_kanban_conductor_wake_next", {}
+        )
+        self._kanban_conductor_wake_next = conductor_wake_next
+
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
 
@@ -440,22 +455,33 @@ class GatewayKanbanWatchersMixin:
                             # lock prevents a double-spawn and the workable-work gate
                             # prevents spawning on an empty board — so running it here
                             # AND in the dispatcher is safe.
-                            try:
-                                if _kb.conductor_enabled_for(kanban_cfg, slug):
-                                    _kb.ensure_conductor(
-                                        conn,
-                                        board=slug,
-                                        profile=_kb.conductor_profile_for(
-                                            kanban_cfg,
-                                            slug,
-                                            fallback=(kanban_cfg.get("default_assignee") or "default"),
-                                        ),
-                                    )
-                            except Exception as _cond_wake_exc:
-                                logger.debug(
-                                    "kanban notifier: conductor wake for board %s failed: %s",
-                                    slug, _cond_wake_exc,
-                                )
+                            if _kb.conductor_enabled_for(kanban_cfg, slug):
+                                _now = _wake_time.monotonic()
+                                if _now >= conductor_wake_next.get(slug, 0.0):
+                                    # Rate-limit BEFORE the call so a failing/expensive
+                                    # board is not retried until the interval elapses.
+                                    conductor_wake_next[slug] = _now + CONDUCTOR_WAKE_INTERVAL
+                                    try:
+                                        _kb.ensure_conductor(
+                                            conn,
+                                            board=slug,
+                                            profile=_kb.conductor_profile_for(
+                                                kanban_cfg,
+                                                slug,
+                                                fallback=(kanban_cfg.get("default_assignee") or "default"),
+                                            ),
+                                        )
+                                    except Exception as _cond_wake_exc:
+                                        # Back off further on failure so a hostile
+                                        # board can't be hammered from the notifier.
+                                        conductor_wake_next[slug] = (
+                                            _wake_time.monotonic() + CONDUCTOR_WAKE_FAIL_BACKOFF
+                                        )
+                                        logger.warning(
+                                            "kanban notifier: conductor wake for board %s failed "
+                                            "(backing off %.0fs): %s",
+                                            slug, CONDUCTOR_WAKE_FAIL_BACKOFF, _cond_wake_exc,
+                                        )
                         finally:
                             conn.close()
                     return deliveries

@@ -8925,13 +8925,32 @@ def _open_spawn_log_safely(log_path: Path, rotate_bytes: int, backup_count: int)
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
     try:
-        return os.fdopen(os.open(log_path, flags, 0o600), "ab")
+        fd = os.open(log_path, flags, 0o600)
     except OSError:
         _log.warning(
             "spawn log path %s not safe to open (symlink/permissions); dropping logs",
             log_path,
         )
         return open(os.devnull, "ab")
+    # O_NOFOLLOW rejects symlinks but NOT hard links: an attacker who pre-placed a
+    # HARD LINK from this predictable path to a victim file would otherwise have
+    # our appends land in the victim's inode. Reject a link count > 1 (a freshly
+    # O_CREAT'd or normally-rotated log has exactly one link).
+    try:
+        if os.fstat(fd).st_nlink > 1:
+            os.close(fd)
+            _log.warning(
+                "spawn log path %s has >1 hard link; refusing to append — dropping logs",
+                log_path,
+            )
+            return open(os.devnull, "ab")
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return open(os.devnull, "ab")
+    return os.fdopen(fd, "ab")
 
 
 def _module_hermes_argv() -> list[str]:
