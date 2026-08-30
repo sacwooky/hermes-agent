@@ -502,10 +502,15 @@ def _validate_completion_calibration(metadata) -> Optional[str]:
             f"{list(_CAL_VERDICTS)}, got {pv!r}"
         )
     conf = cal.get("confidence")
+    # Bound-check WITHOUT float() coercion -- float(huge_int) can raise OverflowError,
+    # which would crash the completion instead of failing back (round 1, openai/spec).
+    # A probability is a plain finite number in (0, 1]; bools and NaN are not.
+    import math as _math
     if not isinstance(conf, (int, float)) or isinstance(conf, bool) \
-            or not (0.0 < float(conf) <= 1.0):
+            or (isinstance(conf, float) and not _math.isfinite(conf)) \
+            or not (0.0 < conf <= 1.0):
         return (
-            "metadata.calibration.confidence must be a number in (0, 1], "
+            "metadata.calibration.confidence must be a finite number in (0, 1], "
             f"got {conf!r}"
         )
     rounds = cal.get("predicted_rounds")
@@ -568,23 +573,54 @@ def _emit_completion_atoms(tid: str, metadata) -> None:
     dep = metadata.get("deposit")
     if not (isinstance(cal, dict) or isinstance(dep, dict)):
         return
-    try:
-        import sys as _sys
-        _scripts = os.path.expanduser("~/.hermes/scripts")
-        if _scripts not in _sys.path:
-            _sys.path.insert(0, _scripts)
-        from atom_client import emit as _emit  # type: ignore
-    except Exception:  # noqa: BLE001 -- emission is best-effort by contract
-        return
+    # Reduce untrusted metadata to a CLOSED, typed key set before it becomes atom
+    # payload -- never forward the caller's dict verbatim (round 1, xai/security:
+    # extra keys could collide with producer_role/event_type or smuggle content).
+    def _clean_cal(c: dict) -> dict:
+        out: dict = {}
+        pv = c.get("predicted_verdict")
+        if pv in _CAL_VERDICTS:
+            out["predicted_verdict"] = pv
+        conf = c.get("confidence")
+        if isinstance(conf, (int, float)) and not isinstance(conf, bool):
+            out["confidence"] = conf
+        r = c.get("predicted_rounds")
+        if isinstance(r, int) and not isinstance(r, bool):
+            out["predicted_rounds"] = r
+        a = c.get("riskiest_assumption")
+        if isinstance(a, str):
+            out["riskiest_assumption"] = a[:500]
+        return out
+
+    def _clean_dep(d: dict) -> dict:
+        out = {}
+        for k in ("decided", "surprised"):
+            v = d.get(k)
+            if isinstance(v, str):
+                out[k] = v[:2000]
+        return out
+
     fields: dict = {"summary": f"completion deposit for {tid}"[:200]}
     if isinstance(cal, dict):
-        fields["calibration"] = cal
+        fields["calibration"] = _clean_cal(cal)
     if isinstance(dep, dict):
-        fields["deposit"] = dep
+        fields["deposit"] = _clean_dep(dep)
+    # Import atom_client by FILE LOCATION -- never mutate sys.path, which would make
+    # any writable atom_client.py on an inserted path execute in-process on a
+    # completion (round 1, xai/security). BaseException (SystemExit from a hostile
+    # module's top-level, etc.) is caught too: emission must NEVER fail a completion
+    # (round 1, openai/security -- except Exception missed BaseException).
     try:
-        _emit("decision", task_id=tid, producer_role="builder",
-              harness="hermes", **fields)
-    except Exception:  # noqa: BLE001
+        import importlib.util as _ilu
+        _mod_path = os.path.expanduser("~/.hermes/scripts/atom_client.py")
+        _spec = _ilu.spec_from_file_location("_hermes_atom_client", _mod_path)
+        if _spec is None or _spec.loader is None:
+            return
+        _ac = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_ac)
+        _ac.emit("decision", task_id=tid, producer_role="builder",
+                 harness="hermes", **fields)
+    except BaseException:  # noqa: BLE001 -- emission is best-effort; never fail completion
         return
 
 
