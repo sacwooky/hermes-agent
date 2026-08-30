@@ -634,7 +634,12 @@ def _emit_completion_atoms(tid: str, metadata) -> None:
             fields["deposit"] = _clean_dep(dep)
         _sock_path = os.environ.get(
             "ATOMSD_SOCKET", os.path.expanduser("~/.hermes/atoms/atomsd.sock"))
-        _payload = json.dumps(fields, ensure_ascii=False).encode("utf-8")
+        # Terminate the frame with a newline. atomsd today reads one recv(), so the
+        # delimiter is not strictly required -- but the reference client contract is a
+        # JSON LINE, and a line terminator is correct-by-construction if atomsd ever
+        # becomes line-oriented (round 4, openai/spec). Harmless to a single-recv
+        # server, which strips surrounding whitespace before json.loads.
+        _payload = json.dumps(fields, ensure_ascii=False).encode("utf-8") + b"\n"
         if len(_payload) > 60 * 1024:   # atomsd rejects >64K; do not even send it
             return
         _s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
