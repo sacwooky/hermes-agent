@@ -610,39 +610,41 @@ def _emit_completion_atoms(tid: str, metadata) -> None:
                 out[k] = v[:2000]
         return out
 
-    # EVERYTHING below -- payload construction AND import/emit -- is inside one guard,
-    # so no step can escape into the completion (round 2, openai/spec: cleaning ran
-    # before the try). BaseException catches SystemExit from a hostile module too.
+    # EVERYTHING below is inside one guard, so no step can escape into the completion
+    # (round 2, openai/spec). BaseException catches even SystemExit.
+    #
+    # Round 3 (all three security lanes): DO NOT execute any helper file in-process.
+    # The atom stream reaches atomsd over a unix socket carrying one JSON line -- the
+    # whole protocol -- so we speak it DIRECTLY here. There is no dynamic import, no
+    # trusted-file assumption, nothing on disk for a group member to swap and have run
+    # inside the Hermes process. atomsd remains the sole authority that validates and
+    # appends; the socket path is taken from the environment, exactly as atom_client did.
     try:
-        fields: dict = {"summary": f"completion deposit for {tid}"[:200]}
+        import socket as _socket
+        fields: dict = {
+            "event_type": "decision",
+            "task_id": tid,
+            "producer_role": "builder",
+            "harness": "hermes",
+            "summary": f"completion deposit for {tid}"[:200],
+        }
         if isinstance(cal, dict):
             fields["calibration"] = _clean_cal(cal)
         if isinstance(dep, dict):
             fields["deposit"] = _clean_dep(dep)
-        # Import atom_client by FILE LOCATION -- never mutate sys.path (round 1,
-        # xai/security). Before executing it in-process, require it to be owned by
-        # THIS user and not WORLD-writable (round 2, openai/security). Group-writable
-        # is NOT rejected: on this single-user fleet every helper is mode 0664 with
-        # the owning group == the user's own group (verified: atomsd.py, atom_client.py,
-        # the schema all 0664 fluxlabs:fluxlabs). Rejecting group-write would reject
-        # every file on the host and silently disable emission for everyone -- a check
-        # that never passes is not a security control, it is a broken feature. The real
-        # escalation surfaces the lane named -- path shadowing and world-write -- are
-        # both closed. If atom_client is ever moved to a shared-group location, tighten
-        # this to also reject S_IWGRP.
-        import importlib.util as _ilu
-        import stat as _stat
-        _mod_path = os.path.realpath(os.path.expanduser("~/.hermes/scripts/atom_client.py"))
-        _stt = os.stat(_mod_path)
-        if _stt.st_uid != os.getuid() or (_stt.st_mode & _stat.S_IWOTH):
+        _sock_path = os.environ.get(
+            "ATOMSD_SOCKET", os.path.expanduser("~/.hermes/atoms/atomsd.sock"))
+        _payload = json.dumps(fields, ensure_ascii=False).encode("utf-8")
+        if len(_payload) > 60 * 1024:   # atomsd rejects >64K; do not even send it
             return
-        _spec = _ilu.spec_from_file_location("_hermes_atom_client", _mod_path)
-        if _spec is None or _spec.loader is None:
-            return
-        _ac = _ilu.module_from_spec(_spec)
-        _spec.loader.exec_module(_ac)
-        _ac.emit("decision", task_id=tid, producer_role="builder",
-                 harness="hermes", **fields)
+        _s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        _s.settimeout(3.0)
+        try:
+            _s.connect(str(_sock_path))
+            _s.sendall(_payload)
+            _s.recv(4096)               # drain the ack; result is advisory only
+        finally:
+            _s.close()
     except BaseException:  # noqa: BLE001 -- emission is best-effort; never fail completion
         return
 
