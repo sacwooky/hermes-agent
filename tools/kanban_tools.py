@@ -475,6 +475,119 @@ def _handle_list(args: dict, **kw) -> str:
         return tool_error(f"kanban_list: {e}")
 
 
+_CAL_VERDICTS = ("pass", "block")
+
+
+def _validate_completion_calibration(metadata) -> Optional[str]:
+    """Validate an optional ``calibration`` bet in completion metadata.
+
+    Returns an error string to fail back to the agent, or None if valid/absent.
+    A malformed bet is REJECTED rather than dropped -- silent starvation (the
+    caller thinks it bet; nothing recorded) is exactly the failure this closes.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    cal = metadata.get("calibration")
+    if cal is None:
+        return None
+    if not isinstance(cal, dict):
+        return (
+            "metadata.calibration must be an object "
+            f"{{predicted_verdict, confidence, ...}}, got {type(cal).__name__}"
+        )
+    pv = cal.get("predicted_verdict")
+    if pv not in _CAL_VERDICTS:
+        return (
+            "metadata.calibration.predicted_verdict must be one of "
+            f"{list(_CAL_VERDICTS)}, got {pv!r}"
+        )
+    conf = cal.get("confidence")
+    if not isinstance(conf, (int, float)) or isinstance(conf, bool) \
+            or not (0.0 < float(conf) <= 1.0):
+        return (
+            "metadata.calibration.confidence must be a number in (0, 1], "
+            f"got {conf!r}"
+        )
+    rounds = cal.get("predicted_rounds")
+    if rounds is not None and (not isinstance(rounds, int)
+                               or isinstance(rounds, bool) or rounds < 0):
+        return (
+            "metadata.calibration.predicted_rounds must be a non-negative "
+            f"integer when present, got {rounds!r}"
+        )
+    assumption = cal.get("riskiest_assumption")
+    if assumption is not None and not isinstance(assumption, str):
+        return (
+            "metadata.calibration.riskiest_assumption must be a string when "
+            f"present, got {type(assumption).__name__}"
+        )
+    if isinstance(assumption, str) and len(assumption) > 500:
+        return "metadata.calibration.riskiest_assumption must be <= 500 chars"
+    return None
+
+
+def _validate_completion_deposit(metadata) -> Optional[str]:
+    """Validate an optional ``deposit`` sub-object (S1). Fail-back, not drop."""
+    if not isinstance(metadata, dict):
+        return None
+    dep = metadata.get("deposit")
+    if dep is None:
+        return None
+    if not isinstance(dep, dict):
+        return (
+            "metadata.deposit must be an object "
+            f"{{decided, surprised, ...}}, got {type(dep).__name__}"
+        )
+    for field in ("decided", "surprised"):
+        val = dep.get(field)
+        if val is None:
+            return (
+                f"metadata.deposit.{field} is required when a deposit is "
+                "present (a deposit records what was decided and what "
+                "surprised you)"
+            )
+        if not isinstance(val, str) or not val.strip():
+            return f"metadata.deposit.{field} must be a non-empty string"
+        if len(val) > 2000:
+            return f"metadata.deposit.{field} must be <= 2000 chars"
+    return None
+
+
+def _emit_completion_atoms(tid: str, metadata) -> None:
+    """Emit a decision atom for a valid calibration bet / deposit BEFORE the
+    completion returns, so a bet provably precedes any review verdict.
+
+    Emission NEVER blocks or fails a completion -- the atom stream is a learning
+    channel, not a gate on getting work done. atom_client.emit already swallows
+    its own transport errors; this adds a hard isolation layer so an import or
+    unexpected error can never turn a completed task into a failed one.
+    """
+    if not isinstance(metadata, dict):
+        return
+    cal = metadata.get("calibration")
+    dep = metadata.get("deposit")
+    if not (isinstance(cal, dict) or isinstance(dep, dict)):
+        return
+    try:
+        import sys as _sys
+        _scripts = os.path.expanduser("~/.hermes/scripts")
+        if _scripts not in _sys.path:
+            _sys.path.insert(0, _scripts)
+        from atom_client import emit as _emit  # type: ignore
+    except Exception:  # noqa: BLE001 -- emission is best-effort by contract
+        return
+    fields: dict = {"summary": f"completion deposit for {tid}"[:200]}
+    if isinstance(cal, dict):
+        fields["calibration"] = cal
+    if isinstance(dep, dict):
+        fields["deposit"] = dep
+    try:
+        _emit("decision", task_id=tid, producer_role="builder",
+              harness="hermes", **fields)
+    except Exception:  # noqa: BLE001
+        return
+
+
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
     tid = _default_task_id(args.get("task_id"))
@@ -561,7 +674,18 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
+    # G5/S1 runtime halves: validate an optional calibration bet and deposit in
+    # completion metadata, FAIL BACK on malformed input (silent starvation is the
+    # defect class this closes), and emit a decision atom BEFORE the completion
+    # returns so the bet provably precedes any review verdict. See task t_3fdbed5b.
+    cal_err = _validate_completion_calibration(metadata)
+    if cal_err:
+        return tool_error(cal_err)
+    dep_err = _validate_completion_deposit(metadata)
+    if dep_err:
+        return tool_error(dep_err)
     metadata = _stamp_worker_session_metadata(tid, metadata)
+    _emit_completion_atoms(tid, metadata)
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
