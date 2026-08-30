@@ -487,9 +487,14 @@ def _validate_completion_calibration(metadata) -> Optional[str]:
     """
     if not isinstance(metadata, dict):
         return None
+    if "calibration" not in metadata:
+        return None
     cal = metadata.get("calibration")
     if cal is None:
-        return None
+        return (
+            "metadata.calibration must be an object when present; got null "
+            "(omit the key entirely to record no bet)"
+        )
     if not isinstance(cal, dict):
         return (
             "metadata.calibration must be an object "
@@ -535,9 +540,14 @@ def _validate_completion_deposit(metadata) -> Optional[str]:
     """Validate an optional ``deposit`` sub-object (S1). Fail-back, not drop."""
     if not isinstance(metadata, dict):
         return None
+    if "deposit" not in metadata:
+        return None
     dep = metadata.get("deposit")
     if dep is None:
-        return None
+        return (
+            "metadata.deposit must be an object when present; got null "
+            "(omit the key entirely to record no deposit)"
+        )
     if not isinstance(dep, dict):
         return (
             "metadata.deposit must be an object "
@@ -600,19 +610,32 @@ def _emit_completion_atoms(tid: str, metadata) -> None:
                 out[k] = v[:2000]
         return out
 
-    fields: dict = {"summary": f"completion deposit for {tid}"[:200]}
-    if isinstance(cal, dict):
-        fields["calibration"] = _clean_cal(cal)
-    if isinstance(dep, dict):
-        fields["deposit"] = _clean_dep(dep)
-    # Import atom_client by FILE LOCATION -- never mutate sys.path, which would make
-    # any writable atom_client.py on an inserted path execute in-process on a
-    # completion (round 1, xai/security). BaseException (SystemExit from a hostile
-    # module's top-level, etc.) is caught too: emission must NEVER fail a completion
-    # (round 1, openai/security -- except Exception missed BaseException).
+    # EVERYTHING below -- payload construction AND import/emit -- is inside one guard,
+    # so no step can escape into the completion (round 2, openai/spec: cleaning ran
+    # before the try). BaseException catches SystemExit from a hostile module too.
     try:
+        fields: dict = {"summary": f"completion deposit for {tid}"[:200]}
+        if isinstance(cal, dict):
+            fields["calibration"] = _clean_cal(cal)
+        if isinstance(dep, dict):
+            fields["deposit"] = _clean_dep(dep)
+        # Import atom_client by FILE LOCATION -- never mutate sys.path (round 1,
+        # xai/security). Before executing it in-process, require it to be owned by
+        # THIS user and not WORLD-writable (round 2, openai/security). Group-writable
+        # is NOT rejected: on this single-user fleet every helper is mode 0664 with
+        # the owning group == the user's own group (verified: atomsd.py, atom_client.py,
+        # the schema all 0664 fluxlabs:fluxlabs). Rejecting group-write would reject
+        # every file on the host and silently disable emission for everyone -- a check
+        # that never passes is not a security control, it is a broken feature. The real
+        # escalation surfaces the lane named -- path shadowing and world-write -- are
+        # both closed. If atom_client is ever moved to a shared-group location, tighten
+        # this to also reject S_IWGRP.
         import importlib.util as _ilu
-        _mod_path = os.path.expanduser("~/.hermes/scripts/atom_client.py")
+        import stat as _stat
+        _mod_path = os.path.realpath(os.path.expanduser("~/.hermes/scripts/atom_client.py"))
+        _stt = os.stat(_mod_path)
+        if _stt.st_uid != os.getuid() or (_stt.st_mode & _stat.S_IWOTH):
+            return
         _spec = _ilu.spec_from_file_location("_hermes_atom_client", _mod_path)
         if _spec is None or _spec.loader is None:
             return
