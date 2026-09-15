@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""Grok review lane (independent, non-GPT provider) for the deterministic review path.
+
+Stateless reviewer: calls Robin's local 9router lab (127.0.0.1:20128,
+OpenAI-compatible) with an xAI Grok model and prints the review text to stdout.
+Mirrors `gemini-review` exactly (same `-p <prompt> --model <id>` interface, same
+diff-inlining) but targets 9router instead of the Vertex proxy, and authenticates
+with NINEROUTER_KEY.
+
+Why not the Claude Code (`claude`) harness for Grok? Grok emits xAI reasoning
+blocks that break 9router's Anthropic (/v1/messages) translation, so the Claude
+Code harness hangs. The OpenAI (/v1/chat/completions) shape works cleanly — the
+assistant content lands in choices[0].message.content regardless of reasoning.
+
+Grok is an INDEPENDENT provider (xAI) — distinct from the author (GPT/OpenAI),
+Gemini (Google), and Opus (Anthropic). Part of the 3-provider unanimous panel.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+BASE = "http://127.0.0.1:20128/v1/chat/completions"
+HTTP_TIMEOUT = 600
+MAX_DIFF_CHARS = 400_000
+
+
+def _key():
+    env = os.environ.get("NINEROUTER_KEY")
+    if env:
+        return env
+    envf = Path.home() / ".hermes" / ".env"
+    if envf.is_file():
+        for line in envf.read_text(errors="ignore").splitlines():
+            m = re.match(r"\s*NINEROUTER_KEY\s*=\s*[\"']?([^\"'\s]+)", line)
+            if m:
+                return m.group(1)
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("-p", "--prompt", required=True)
+    ap.add_argument("--model", default="openrouter/x-ai/grok-4.5")
+    args, _ = ap.parse_known_args()
+
+    key = _key()
+    if not key:
+        sys.stderr.write("grok-review: NINEROUTER_KEY not found (env or ~/.hermes/.env)\n")
+        sys.exit(3)
+
+    content = args.prompt
+    # Grok has no filesystem access — inline the diff from the packet cwd (same as gemini-review).
+    cwd = Path.cwd()
+    diff_file = None
+    if (cwd / "diff.patch").is_file():
+        diff_file = cwd / "diff.patch"
+    else:
+        patches = sorted(cwd.glob("*.patch"))
+        if patches:
+            diff_file = patches[0]
+    if diff_file:
+        diff_text = diff_file.read_text(errors="ignore")[:MAX_DIFF_CHARS]
+        truncated = "\n[diff truncated]\n" if diff_file.stat().st_size > MAX_DIFF_CHARS else ""
+        content += f"\n\n--- BEGIN DIFF ({diff_file.name}) ---\n{diff_text}{truncated}--- END DIFF ---\n"
+    else:
+        content += "\n\n(NOTE: no diff file found in packet dir; review based on instructions only.)\n"
+
+    body = json.dumps({
+        "model": args.model,
+        "messages": [{"role": "user", "content": content}],
+        "temperature": 0.2,
+        "stream": False,
+    }).encode()
+    req = urllib.request.Request(
+        BASE, data=body,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            raw = r.read().decode("utf-8")
+    except UnicodeDecodeError:
+        sys.stderr.write("grok-review: invalid UTF-8 response\n")
+        sys.exit(6)
+    except urllib.error.HTTPError as e:
+        sys.stderr.write(f"grok-review: HTTP {e.code}: {e.read()[:400].decode(errors='ignore')}\n")
+        sys.exit(4)
+    except Exception as e:  # network/timeout
+        sys.stderr.write(f"grok-review: {type(e).__name__}: {e}\n")
+        sys.exit(5)
+
+    text, complete = _extract_response(raw)
+    if text is None:
+        sys.stderr.write(f"grok-review: unexpected response shape: {raw[:400]}\n")
+        sys.exit(6)
+    if not text.strip():
+        sys.stderr.write("grok-review: empty content from model\n")
+        sys.exit(7)
+    if not complete:
+        sys.stdout.write(text)
+        sys.stderr.write("grok-review: response did not report normal completion\n")
+        sys.exit(8)
+    sys.stdout.write(text)
+
+
+_STREAM_DONE = object()
+
+
+def _decode_chunk(chunk):
+    dec = json.JSONDecoder()
+    idx = 0
+    while idx < len(chunk):
+        remaining = chunk[idx:].lstrip()
+        if not remaining:
+            break
+        idx += len(chunk[idx:]) - len(remaining)
+        try:
+            obj, end = dec.raw_decode(remaining)
+        except ValueError as exc:
+            raise ValueError("Malformed review response") from exc
+        yield obj
+        idx += end
+
+
+def _iter_json_objects(raw):
+    """Decode incrementally so a malformed tail cannot erase earlier findings.
+
+    Accept the existing JSON/concatenated-JSON and SSE response formats. SSE
+    comments are keepalives; [DONE] is an explicit transport terminal marker.
+    """
+    lines = raw.splitlines()
+    sse = any(line.startswith(("data:", ":")) for line in lines)
+    if not sse:
+        yield from _decode_chunk(raw)
+        return
+    buffered = []
+    for line in lines:
+        if line == "":
+            yield from _decode_chunk("\n".join(buffered))
+            buffered = []
+        elif line.startswith(":") or line.startswith(("event:", "id:", "retry:")):
+            continue
+        elif line.startswith("data:"):
+            data = line[5:]
+            if data.startswith(" "):
+                data = data[1:]
+            if data.strip() == "[DONE]":
+                yield from _decode_chunk("\n".join(buffered))
+                buffered = []
+                yield _STREAM_DONE
+            else:
+                buffered.append(data)
+        else:
+            yield from _decode_chunk("\n".join(buffered))
+            raise ValueError("Malformed SSE review response")
+    yield from _decode_chunk("\n".join(buffered))
+
+
+def _extract_response(raw):
+    """Retain received text and require an explicit normal completion signal.
+
+    A stream's [DONE] sentinel alone does not establish normal model completion.
+    Multiple response identities, choices or text after completion are ambiguous.
+    """
+    full_msg = None
+    delta_parts = []
+    identity = None
+    complete = False
+    invalid = False
+    done = False
+    objects = iter(_iter_json_objects(raw))
+    while True:
+        try:
+            obj = next(objects)
+        except StopIteration:
+            break
+        except ValueError:
+            invalid = True
+            break
+        if obj is _STREAM_DONE:
+            if done:
+                invalid = True
+            done = True
+            continue
+        if done:
+            invalid = True
+        if not isinstance(obj, dict) or "error" in obj:
+            invalid = True
+            continue
+        if obj.get("id"):
+            if identity is not None and obj["id"] != identity:
+                invalid = True
+            identity = obj["id"]
+        try:
+            if len(obj["choices"]) != 1:
+                # A terminal usage-only chunk may have an empty choices list.
+                if obj["choices"] == [] and complete and "usage" in obj:
+                    continue
+                invalid = True
+                continue
+            choice = obj["choices"][0]
+        except (KeyError, IndexError, TypeError):
+            invalid = True
+            continue
+        if not isinstance(choice, dict) or choice.get("index", 0) != 0:
+            invalid = True
+            continue
+        if complete:
+            invalid = True
+        msg = choice.get("message")
+        if msg is not None and (not isinstance(msg, dict) or (msg.get("content") is not None and not isinstance(msg.get("content"), str))):
+            invalid = True
+        if isinstance(msg, dict) and isinstance(msg.get("content"), str) and msg["content"]:
+            if full_msg is not None or delta_parts:
+                invalid = True
+            full_msg = msg["content"]
+        delta = choice.get("delta")
+        if delta is not None and (not isinstance(delta, dict) or (delta.get("content") is not None and not isinstance(delta.get("content"), str))):
+            invalid = True
+        if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+            if full_msg is not None:
+                invalid = True
+            delta_parts.append(delta["content"])
+        finish = choice.get("finish_reason")
+        if finish is not None:
+            if finish != "stop":
+                invalid = True
+            else:
+                complete = True
+    if full_msg is not None:
+        return full_msg, complete and not invalid
+    if delta_parts:
+        return "".join(delta_parts), complete and not invalid
+    return None, False
+
+
+def _extract_content(raw):
+    """Compatibility helper: only a normally completed response is usable."""
+    text, complete = _extract_response(raw)
+    return text if complete else None
+
+
+if __name__ == "__main__":
+    main()
