@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Gemini review lane (non-PRC, independent) for the deterministic review path.
+
+Stateless reviewer: calls Robin's local OpenAI-compatible Vertex proxy
+(127.0.0.1:8786) with a Gemini model and prints the review text to stdout.
+
+Unlike the agentic Claude/MiniMax lanes (Claude Code harness, filesystem
+access), this is a single API call with no tools, so it INLINES the diff from
+the packet cwd into the prompt. Invoked by review-deterministic.py via the same
+`-p <prompt> --model <id>` interface the other lanes use (extra flags like
+--output-format are ignored).
+
+Reuses the already-authenticated proxy (ADC-backed); NO credential handling
+here. Policy: decision-fleet-model-review-toolchain-policy-v1 (PRC review lanes
+retired 2026-06; Gemini is the binding independent lane).
+"""
+import argparse
+import json
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+PROXY = "http://127.0.0.1:8786/v1/chat/completions"
+HTTP_TIMEOUT = 600
+MAX_DIFF_CHARS = 400_000
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("-p", "--prompt", required=True)
+    ap.add_argument("--model", default="gemini-2.5-pro")
+    args, _ = ap.parse_known_args()
+
+    content = args.prompt
+    # Gemini has no filesystem access — inline the diff from the packet cwd.
+    cwd = Path.cwd()
+    diff_file = None
+    if (cwd / "diff.patch").is_file():
+        diff_file = cwd / "diff.patch"
+    else:
+        patches = sorted(cwd.glob("*.patch"))
+        if patches:
+            diff_file = patches[0]
+    if diff_file:
+        diff_text = diff_file.read_text(errors="ignore")[:MAX_DIFF_CHARS]
+        truncated = "\n[diff truncated]\n" if diff_file.stat().st_size > MAX_DIFF_CHARS else ""
+        content += f"\n\n--- BEGIN DIFF ({diff_file.name}) ---\n{diff_text}{truncated}--- END DIFF ---\n"
+    else:
+        content += "\n\n(NOTE: no diff file found in packet dir; review based on instructions only.)\n"
+
+    body = json.dumps({
+        "model": args.model,
+        "messages": [{"role": "user", "content": content}],
+        "temperature": 0.2,
+    }).encode()
+    req = urllib.request.Request(PROXY, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            data = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        sys.stderr.write(f"gemini-review: HTTP {e.code}: {e.read()[:400].decode(errors='ignore')}\n")
+        sys.exit(4)
+    except Exception as e:  # network/timeout/json
+        sys.stderr.write(f"gemini-review: {type(e).__name__}: {e}\n")
+        sys.exit(5)
+    try:
+        text = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        sys.stderr.write(f"gemini-review: unexpected response shape: {json.dumps(data)[:400]}\n")
+        sys.exit(6)
+    if not (text or "").strip():
+        sys.stderr.write("gemini-review: empty content from model\n")
+        sys.exit(7)
+    sys.stdout.write(text)
+
+
+if __name__ == "__main__":
+    main()

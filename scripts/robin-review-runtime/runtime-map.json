@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "scope": "Hermes Ops source records for the existing Robin review runtime. Four script locations in this repository are new tracked source copies.",
+  "owner_repository": "sacwooky/hermes-agent",
+  "owner_board": "hermes-ops",
+  "source_artifact_sha256": "cd1d41a706156cf5bf8b6349b96fb30cc1a9174cd389a37130e07e4b895b812e",
+  "provenance": "Copied from the frozen September 2026 repair candidate. No previous canonical repository location or automatic synchronization is claimed for the four external scripts.",
+  "runtime_scope": "The wrappers retain the existing Robin-host paths and configured dependencies; they are not installed or registered as general profile-aware Hermes library features.",
+  "installation_boundary": "This map is descriptive data, not an installer. Source integration does not alter live files. Separately gated installation verifies target preimages, resolved regular files and actual ownership, preserves verified backups, holds new reviews through per-file atomic replacement, and retains rollback.",
+  "review_boundary": "The full reconciled branch, test wiring and this provenance map require their own exact independent review. A previous artifact review is not branch acceptance or installation authorization.",
+  "files": [
+    {
+      "source": "hermes_cli/review_loop/sc_review.py",
+      "candidate_sha256": "dfcceab6707d275e8296e4bcf0d3b4d42b54a01919ca3b879317f4559e23978f",
+      "required_live_preimage_sha256": "f4f57a2dbe90ace76fbfff60150e2c11e3dd6158394cddcd8df0fd4fa8e983ee",
+      "live_path": "/srv/fluxlabs/repos/hermes-agent/hermes_cli/review_loop/sc_review.py",
+      "git_mode": "100644",
+      "live_mode": "0644"
+    },
+    {
+      "source": "scripts/robin-review-runtime/review-deterministic.py",
+      "candidate_sha256": "0c8804915d0c82f37fdcbeb9eee8f57da81d64fbfdc4f114159316c991896fd5",
+      "required_live_preimage_sha256": "d21f226787d432f2e177718dd8b49a56c8b6304df498900a193fba8b8e8fcfee",
+      "live_path": "/home/fluxlabs/.hermes/scripts/review-deterministic.py",
+      "git_mode": "100755",
+      "live_mode": "0755"
+    },
+    {
+      "source": "scripts/robin-review-runtime/gemini-review",
+      "candidate_sha256": "5e7d4726aeee1f04f218e0db910f26f4d60e3c36c1102c3aa99228eb4b2d95f1",
+      "required_live_preimage_sha256": "151df28ef97f34df332b39800bf72d75fc59c21ef586d033f93dc5ec79dce73b",
+      "live_path": "/home/fluxlabs/.local/bin/gemini-review",
+      "git_mode": "100755",
+      "live_mode": "0755"
+    },
+    {
+      "source": "scripts/robin-review-runtime/grok-review",
+      "candidate_sha256": "e04167df7e95c66e9588c2ff06b4551e4931fa5a898ebb77864406e393c93a4c",
+      "required_live_preimage_sha256": "3efa87b79f65d4a94eadc383a7e3da43c01e1420a7eedebba59506cae6786206",
+      "live_path": "/home/fluxlabs/.local/bin/grok-review",
+      "git_mode": "100755",
+      "live_mode": "0755"
+    },
+    {
+      "source": "scripts/robin-review-runtime/send-review.sh",
+      "candidate_sha256": "ae5bb80952f667b6a5ac69b11a2cb3cdf87aae40d0cdd95f846fa1e8f9aa396f",
+      "required_live_preimage_sha256": "6f3b3fdb93117ae696a35d8b08943ce081592e9d159823651b998261da3b5eef",
+      "live_path": "/home/fluxlabs/.hermes/scripts/send-review.sh",
+      "git_mode": "100755",
+      "live_mode": "0755"
+    }
+  ],
+  "fixtures": "Files below tests/hermes_cli/fixtures/robin_review_runtime are historical comparison and isolated proxy-function test inputs only; they are never installation targets."
+}

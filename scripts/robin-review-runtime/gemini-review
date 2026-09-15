@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Gemini review lane (non-PRC, independent) for the deterministic review path.
+
+Stateless reviewer: calls Robin's local OpenAI-compatible Vertex proxy
+(127.0.0.1:8786) with a Gemini model and prints the review text to stdout.
+
+Unlike the agentic Claude/MiniMax lanes (Claude Code harness, filesystem
+access), this is a single API call with no tools, so it INLINES the diff from
+the packet cwd into the prompt. Invoked by review-deterministic.py via the same
+`-p <prompt> --model <id>` interface the other lanes use (extra flags like
+--output-format are ignored). The optional --messages-file/--messages-sha256
+input preserves validated inline PNG parts without putting image bytes in argv.
+
+Reuses the already-authenticated proxy (ADC-backed); NO credential handling
+here. Policy: decision-fleet-model-review-toolchain-policy-v1 (PRC review lanes
+retired 2026-06; Gemini is the binding independent lane).
+"""
+import argparse
+import base64
+import hashlib
+import json
+import re
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+PROXY = "http://127.0.0.1:8786/v1/chat/completions"
+HTTP_TIMEOUT = 600
+MAX_DIFF_CHARS = 400_000
+MAX_MESSAGES_BYTES = 40 * 1024 * 1024
+
+
+def load_messages_file(filename, expected_sha256):
+    """Read private runner IPC; data URLs only, never fetch a supplied URL."""
+    if not expected_sha256 or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise ValueError("Structured message hash is required")
+    path = Path(filename)
+    if path.is_symlink() or not path.is_file() or not 0 < path.stat().st_size <= MAX_MESSAGES_BYTES:
+        raise ValueError("Invalid structured message file")
+    with path.open("rb") as handle:
+        raw = handle.read(MAX_MESSAGES_BYTES + 1)
+    if len(raw) > MAX_MESSAGES_BYTES or hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ValueError("Structured message integrity failure")
+    messages = json.loads(raw)
+    if (not isinstance(messages, list) or len(messages) != 2
+            or not isinstance(messages[0], dict) or not isinstance(messages[1], dict)
+            or set(messages[0]) != {"role", "content"} or set(messages[1]) != {"role", "content"}
+            or messages[0]["role"] != "system" or messages[1]["role"] != "user"
+            or not isinstance(messages[0]["content"], str)
+            or not isinstance(messages[1]["content"], list)):
+        raise ValueError("Invalid structured message shape")
+    images, image_bytes = 0, 0
+    for part in messages[1]["content"]:
+        if not isinstance(part, dict):
+            raise ValueError("Invalid structured content part")
+        if part.get("type") == "text" and set(part) == {"type", "text"} and isinstance(part["text"], str):
+            continue
+        if (part.get("type") != "image_url" or set(part) != {"type", "image_url"}
+                or not isinstance(part["image_url"], dict) or set(part["image_url"]) != {"url"}):
+            raise ValueError("Invalid structured image part")
+        url = part["image_url"]["url"]
+        if not isinstance(url, str) or not url.startswith("data:image/png;base64,"):
+            raise ValueError("Only inline PNG data URLs are allowed")
+        data = base64.b64decode(url.split(",", 1)[1], validate=True)
+        if not data.startswith(b"\x89PNG\r\n\x1a\n") or not 0 < len(data) <= 8 * 1024 * 1024:
+            raise ValueError("Invalid inline PNG")
+        images += 1; image_bytes += len(data)
+    if not 1 <= images <= 8 or image_bytes > 24 * 1024 * 1024:
+        raise ValueError("Invalid inline PNG count or total size")
+    return messages
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(add_help=False)
+    source = ap.add_mutually_exclusive_group(required=True)
+    source.add_argument("-p", "--prompt")
+    source.add_argument("--messages-file")
+    ap.add_argument("--messages-sha256")
+    ap.add_argument("--model", default="gemini-2.5-pro")
+    args, _ = ap.parse_known_args(argv)
+
+    if args.messages_file:
+        try:
+            messages = load_messages_file(args.messages_file, args.messages_sha256)
+        except (OSError, ValueError):
+            sys.stderr.write("gemini-review: invalid structured visual evidence\n")
+            sys.exit(2)
+    else:
+        messages = None
+
+    content = args.prompt or ""
+    # Gemini has no filesystem access — inline the diff from the packet cwd.
+    cwd = Path.cwd()
+    diff_file = None
+    if messages is None and (cwd / "diff.patch").is_file():
+        diff_file = cwd / "diff.patch"
+    elif messages is None:
+        patches = sorted(cwd.glob("*.patch"))
+        if patches:
+            diff_file = patches[0]
+    if diff_file:
+        diff_text = diff_file.read_text(errors="ignore")[:MAX_DIFF_CHARS]
+        truncated = "\n[diff truncated]\n" if diff_file.stat().st_size > MAX_DIFF_CHARS else ""
+        content += f"\n\n--- BEGIN DIFF ({diff_file.name}) ---\n{diff_text}{truncated}--- END DIFF ---\n"
+    elif messages is None:
+        content += "\n\n(NOTE: no diff file found in packet dir; review based on instructions only.)\n"
+
+    body = json.dumps({
+        "model": args.model,
+        "messages": messages if messages is not None else [{"role": "user", "content": content}],
+        "temperature": 0.2,
+    }).encode()
+    req = urllib.request.Request(PROXY, data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            data = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        detail = "" if messages is not None else f": {e.read()[:400].decode(errors='ignore')}"
+        sys.stderr.write(f"gemini-review: HTTP {e.code}{detail}\n")
+        sys.exit(4)
+    except Exception as e:  # network/timeout/json
+        detail = "" if messages is not None else f": {e}"
+        sys.stderr.write(f"gemini-review: {type(e).__name__}{detail}\n")
+        sys.exit(5)
+    try:
+        if not isinstance(data, dict) or "error" in data or len(data["choices"]) != 1:
+            raise ValueError("Ambiguous review envelope")
+        choice = data["choices"][0]
+        if not isinstance(choice, dict) or choice.get("index", 0) != 0:
+            raise ValueError("Ambiguous review choice")
+        text = choice["message"]["content"]
+    except (KeyError, IndexError, TypeError, ValueError):
+        detail = "" if messages is not None else f": {json.dumps(data)[:400]}"
+        sys.stderr.write(f"gemini-review: unexpected response shape{detail}\n")
+        sys.exit(6)
+    if not isinstance(text, str) or not text.strip():
+        sys.stderr.write("gemini-review: empty content from model\n")
+        sys.exit(7)
+    if choice.get("finish_reason") != "stop":
+        # Preserve received text for the runner's private diagnostics, but never
+        # let a PASS-shaped partial response become a usable review.
+        sys.stdout.write(text)
+        sys.stderr.write("gemini-review: response did not report normal completion\n")
+        sys.exit(8)
+    sys.stdout.write(text)
+
+
+if __name__ == "__main__":
+    main()
