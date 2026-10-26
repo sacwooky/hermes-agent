@@ -674,7 +674,8 @@ def _acceptance_review_error(conn, task_id: str, metadata) -> Optional[str]:
     return (
         f"kanban_complete blocked: {task_id} is an acceptance review, and {err}. "
         "Your task is still in-flight (no state change). Retry kanban_complete with "
-        'metadata={"acceptance_decision": "accept" | "reject", "reason": "<one line>"}.'
+        'the top-level arguments acceptance_decision="accept" or "reject" and '
+        'acceptance_reason="<one line>".'
     )
 
 
@@ -702,6 +703,20 @@ def _handle_complete(args: dict, **kw) -> str:
             metadata = json.loads(meta_json)
         except json.JSONDecodeError:
             pass
+    # Acceptance reviews: the decision may come as top-level arguments. Some
+    # model lanes deliver a nested metadata object empty, but top-level
+    # scalars intact, so these are the path the review body asks for.
+    decision = str(args.get("acceptance_decision") or "").strip()
+    reason = str(args.get("acceptance_reason") or "").strip()
+    if decision or reason:
+        if metadata is None:
+            metadata = {}
+        if isinstance(metadata, dict):
+            metadata = dict(metadata)
+            if decision:
+                metadata.setdefault("acceptance_decision", decision)
+            if reason:
+                metadata.setdefault("reason", redact_sensitive_text(reason, force=True))
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
     if created_cards is not None:
@@ -1418,6 +1433,22 @@ KANBAN_COMPLETE_SCHEMA = {
                     "Human-readable handoff, 1-3 sentences. Appears in "
                     "Run History on the dashboard and in downstream "
                     "workers' context."
+                ),
+            },
+            "acceptance_decision": {
+                "type": "string",
+                "description": (
+                    "Acceptance reviews only: \"accept\" or \"reject\", your "
+                    "G3 decision. Required, "
+                    "with acceptance_reason, to finish an acceptance review; "
+                    "omit on every other card."
+                ),
+            },
+            "acceptance_reason": {
+                "type": "string",
+                "description": (
+                    "Acceptance reviews only: one line explaining the "
+                    "decision (for a reject, one a builder can fix)."
                 ),
             },
             "metadata": {
