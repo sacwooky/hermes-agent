@@ -94,7 +94,7 @@ def test_anyof_nested_objects_sanitized():
     })]
     out = sanitize_tool_schemas(tools)
     variants = out[0]["function"]["parameters"]["properties"]["opt"]["anyOf"]
-    assert variants[0] == {"type": "object", "properties": {}}
+    assert variants[0] == {"type": "object", "properties": {}, "additionalProperties": True}
     assert variants[1] == {"type": "string"}
 
 
@@ -172,7 +172,9 @@ def test_additional_properties_schema_sanitized():
     })]
     out = sanitize_tool_schemas(tools)
     field = out[0]["function"]["parameters"]["properties"]["dict_field"]
-    assert field["additionalProperties"] == {"type": "object", "properties": {}}
+    assert field["additionalProperties"] == {
+        "type": "object", "properties": {}, "additionalProperties": True,
+    }
 
 
 def test_deepcopy_does_not_mutate_input():
@@ -198,7 +200,7 @@ def test_items_sanitized_in_array_schema():
     })]
     out = sanitize_tool_schemas(tools)
     items = out[0]["function"]["parameters"]["properties"]["bag"]["items"]
-    assert items == {"type": "object", "properties": {}}
+    assert items == {"type": "object", "properties": {}, "additionalProperties": True}
 
 
 def test_ref_with_default_sibling_stripped():
@@ -700,3 +702,69 @@ def test_strip_slash_enum_ignores_non_string_enum_values():
     props = tools[0]["function"]["parameters"]["properties"]
     assert props["level"]["enum"] == [1, 2, 3]
     assert props["flag"]["enum"] == [True, False]
+
+
+# ── Free-form objects stay open ───────────────────────────────────────
+#
+# A nested ``{"type": "object"}`` with no properties is a free-form dict.
+# Injecting ``properties: {}`` alone tells GPT-family models the object must
+# be empty: kanban_complete's ``metadata`` arrived as ``{}`` on every call
+# from the cx/gpt-5.6 lane until it was declared open.
+
+
+def test_nested_free_form_object_declared_open():
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {"metadata": {"type": "object", "description": "free-form dict"}},
+    })]
+    out = sanitize_tool_schemas(tools)
+    meta = out[0]["function"]["parameters"]["properties"]["metadata"]
+    assert meta == {"type": "object", "description": "free-form dict",
+                    "properties": {}, "additionalProperties": True}
+
+
+def test_free_form_object_open_in_items_anyof_and_bare_string():
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {
+            "bag": {"type": "array", "items": {"type": "object"}},
+            "opt": {"anyOf": [{"type": "object"}, {"type": "string"}]},
+            "payload": "object",
+        },
+    })]
+    props = sanitize_tool_schemas(tools)[0]["function"]["parameters"]["properties"]
+    assert props["bag"]["items"]["additionalProperties"] is True
+    assert props["opt"]["anyOf"][0]["additionalProperties"] is True
+    assert props["payload"]["additionalProperties"] is True
+
+
+def test_explicit_additional_properties_false_kept():
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {"closed": {"type": "object", "additionalProperties": False}},
+    })]
+    closed = sanitize_tool_schemas(tools)[0]["function"]["parameters"]["properties"]["closed"]
+    assert closed["additionalProperties"] is False
+
+
+def test_object_with_declared_properties_not_opened():
+    tools = [_tool("t", {
+        "type": "object",
+        "properties": {"cfg": {"type": "object", "properties": {"a": {"type": "string"}}}},
+    })]
+    cfg = sanitize_tool_schemas(tools)[0]["function"]["parameters"]["properties"]["cfg"]
+    assert "additionalProperties" not in cfg
+
+
+def test_top_level_parameters_not_opened():
+    """A no-argument tool must not start accepting arbitrary arguments."""
+    out = sanitize_tool_schemas([_tool("t", {"type": "object"})])
+    assert "additionalProperties" not in out[0]["function"]["parameters"]
+
+
+def test_kanban_complete_metadata_open_after_sanitize():
+    from tools.kanban_tools import KANBAN_COMPLETE_SCHEMA
+
+    tool = {"type": "function", "function": copy.deepcopy(KANBAN_COMPLETE_SCHEMA)}
+    params = sanitize_tool_schemas([tool])[0]["function"]["parameters"]
+    assert params["properties"]["metadata"]["additionalProperties"] is True
