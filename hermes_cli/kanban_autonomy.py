@@ -1727,6 +1727,215 @@ def generate_epic_acceptances(
     return created
 
 
+# ---------------------------------------------------------------------------
+# Agent acceptance (G3 approved by an agent; decision-keith-standing-
+# delegation-merge-deploy-choices-v1, Keith's "Delegate all three")
+# ---------------------------------------------------------------------------
+
+ACCEPTANCE_APPROVERS = ("keith", "agent")
+
+
+def _event_payload(ev: Optional[sqlite3.Row]) -> dict:
+    if ev is None:
+        return {}
+    payload = ev["payload"]
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _gate_epic_id(conn: sqlite3.Connection, gate_id: str) -> Optional[str]:
+    """The epic a G3 gate belongs to, from its first ``acceptance_requested`` event."""
+    ev = conn.execute(
+        "SELECT id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'acceptance_requested' ORDER BY id ASC LIMIT 1",
+        (gate_id,),
+    ).fetchone()
+    return _event_payload(ev).get("epic_id")
+
+
+def _epic_builders(conn: sqlite3.Connection, epic_id: str) -> set[str]:
+    """Assignees of the epic's build stories (its parents typed ``story``)."""
+    rows = conn.execute(
+        "SELECT t.assignee FROM tasks t "
+        "JOIN task_links l ON l.parent_id = t.id "
+        "LEFT JOIN task_metadata m ON m.task_id = t.id "
+        "WHERE l.child_id = ? AND COALESCE(m.work_item_type, 'story') = 'story'",
+        (epic_id,),
+    ).fetchall()
+    return {r["assignee"] for r in rows if r["assignee"]}
+
+
+def _open_acceptance_review(
+    conn: sqlite3.Connection,
+    gate: sqlite3.Row,
+    approval_id: str,
+    *,
+    reviewer: str,
+    fix_assignee: str,
+    board: Optional[str],
+) -> Optional[str]:
+    """Create the dispatchable review task an agent uses to decide a G3 gate.
+
+    The gate itself stays sticky-blocked; the reviewer finishes its own task
+    with ``kanban_complete`` metadata ``acceptance_decision`` (``accept`` or
+    ``reject``) and ``reason``, and :func:`sweep_acceptance_tasks` applies it.
+    Refused (gate left for Keith, ``acceptance_review_refused`` event) when the
+    reviewer is the fix assignee or built a story of the epic: an author never
+    accepts its own work.
+    """
+    gate_id = gate["id"]
+    epic_id = _gate_epic_id(conn, gate_id)
+    builders = _epic_builders(conn, epic_id) if epic_id else set()
+    if reviewer == fix_assignee or reviewer in builders:
+        if _has_event(conn, gate_id, "acceptance_review_refused") is None:
+            with kb.write_txn(conn):
+                kb._append_event(conn, gate_id, "acceptance_review_refused", {
+                    "reviewer": reviewer,
+                    "reason": "reviewer is the fix assignee or built a story of this epic",
+                })
+            _log.warning(
+                "agent acceptance refused for %s: reviewer %r is not independent",
+                gate_id, reviewer,
+            )
+        return None
+    review_id = kb.create_task(
+        conn,
+        title=f"Acceptance review: {gate['title'].removeprefix('Epic acceptance: ')}",
+        body="\n".join([
+            f"You decide G3 acceptance gate `{gate_id}` for epic `{epic_id}` on Keith's",
+            "behalf (decision-keith-standing-delegation-merge-deploy-choices-v1).",
+            "Open the demo, check it against the epic's acceptance criteria and the",
+            "evidence below, then finish this task with `kanban_complete` metadata",
+            '`{"acceptance_decision": "accept" | "reject", "reason": "<one line>"}`.',
+            "Both need a reason; reject with one a builder can fix. Anything else",
+            "leaves the gate for Keith.",
+            "",
+            "---",
+            "",
+            gate["body"] or "",
+        ]),
+        assignee=reviewer,
+        created_by="autonomy",
+        workspace_kind=gate["workspace_kind"] or "scratch",
+        workspace_path=gate["workspace_path"],
+        tenant=gate["tenant"],
+        priority=10,
+        # One review per approval even if we crash before the event below:
+        # a retry gets the same task back instead of a second review.
+        idempotency_key=f"acceptance-review:{gate_id}:{approval_id}",
+        board=board,
+    )
+    with kb.write_txn(conn):
+        _stamp_work_item_type(conn, review_id, "acceptance_review")
+        kb._append_event(conn, gate_id, "acceptance_review_created", {
+            "review_id": review_id, "approval_id": approval_id, "reviewer": reviewer,
+        })
+    return review_id
+
+
+def _record_agent_decision(
+    conn: sqlite3.Connection, gate_id: str, *, accepted: bool, reviewer: str,
+    reason: str, board: Optional[str],
+) -> None:
+    """Put an agent acceptance in Keith's daily digest (fleet-decided.py).
+
+    Best effort: a missing script or failed record is an event on the gate,
+    never a lost or blocked acceptance.
+    """
+    script = Path.home() / ".hermes" / "scripts" / "fleet-decided.py"
+    chose, other = ("accept", "reject") if accepted else ("reject", "accept")
+    status = "missing"
+    if script.exists():
+        try:
+            proc = subprocess.run(
+                ["python3", str(script), "record", "--kind", "choice",
+                 "--project", board or "kanban",
+                 "--what", f"G3 acceptance {gate_id}: {chose}",
+                 "--chose", chose, "--passed-over", other,
+                 "--why", reason,
+                 "--ref", gate_id, "--agent", reviewer],
+                capture_output=True, text=True, timeout=30,
+            )
+            status = "recorded" if proc.returncode == 0 else f"rc={proc.returncode}"
+        except (OSError, subprocess.SubprocessError) as exc:
+            status = f"error: {exc.__class__.__name__}"
+    with kb.write_txn(conn):
+        kb._append_event(conn, gate_id, "acceptance_decision_recorded", {"status": status})
+
+
+def _apply_agent_review(
+    conn: sqlite3.Connection,
+    gate: sqlite3.Row,
+    approval: sqlite3.Row,
+    *,
+    reviewer: str,
+    fix_assignee: str,
+    board: Optional[str],
+) -> bool:
+    """Open or read the agent review for a pending G3 approval.
+
+    Returns ``True`` when the approval was decided (the caller re-reads it).
+    """
+    gate_id = gate["id"]
+    created = _event_payload(_has_event(conn, gate_id, "acceptance_review_created"))
+    if created.get("approval_id") != approval["approval_id"]:
+        _open_acceptance_review(
+            conn, gate, approval["approval_id"],
+            reviewer=reviewer, fix_assignee=fix_assignee, board=board,
+        )
+        return False
+    review_id = created.get("review_id")
+    srow = conn.execute("SELECT status FROM tasks WHERE id = ?", (review_id,)).fetchone()
+    if srow is None or srow["status"] not in ("done", "archived"):
+        return False
+    run_row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+        "ORDER BY started_at DESC, id DESC LIMIT 1",
+        (review_id,),
+    ).fetchone()
+    meta = run_row["metadata"] if run_row is not None else None
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except (json.JSONDecodeError, TypeError):
+            meta = None
+    meta = meta if isinstance(meta, dict) else {}
+    decision = str(meta.get("acceptance_decision") or "").strip().lower()
+    reason = str(meta.get("reason") or "").strip()
+    if decision not in ("accept", "reject") or not reason:
+        invalid = _event_payload(_has_event(conn, gate_id, "acceptance_review_invalid"))
+        if invalid.get("review_id") != review_id:
+            with kb.write_txn(conn):
+                kb._append_event(conn, gate_id, "acceptance_review_invalid", {
+                    "review_id": review_id,
+                    "reason": "review finished without acceptance_decision accept/reject"
+                              " and a reason; gate left for Keith",
+                })
+            _log.warning("agent acceptance review %s for %s had no valid decision",
+                         review_id, gate_id)
+        return False
+    accepted = decision == "accept"
+    now = int(time.time())
+    with kb.write_txn(conn):
+        cur = conn.execute(
+            "UPDATE task_approvals SET status = ?, decision = ?, approver = ?, "
+            "comment = ?, decided_at = ?, updated_at = ? "
+            "WHERE approval_id = ? AND status = 'pending'",
+            ("approved" if accepted else "rejected",
+             "approved" if accepted else "rejected",
+             f"agent:{reviewer}", reason, now, now, approval["approval_id"]),
+        )
+    if cur.rowcount != 1:
+        return False
+    _record_agent_decision(conn, gate_id, accepted=accepted, reviewer=reviewer,
+                           reason=reason, board=board)
+    return True
+
+
 def _latest_approval(
     conn: sqlite3.Connection, task_id: str, approval_type: str
 ) -> Optional[sqlite3.Row]:
@@ -1790,8 +1999,15 @@ def sweep_acceptance_tasks(
     *,
     board: Optional[str] = None,
     fix_assignee: str = "builder",
+    approver: str = "keith",
+    reviewer_assignee: str = "product",
 ) -> dict:
     """Resolve pending acceptance tasks from operator decisions.
+
+    With ``approver='agent'`` a pending approval is first handed to an
+    independent agent review (:func:`_apply_agent_review`); its accept or
+    reject decides the approval, and the paths below then run unchanged.
+    Keith's own accept / approval decision still works and wins if first.
 
     - ``accepted`` event (``hermes kanban accept``) or an ``approved``
       approval row → complete the acceptance task (the epic is fully
@@ -1806,7 +2022,7 @@ def sweep_acceptance_tasks(
     fix_stories: list[str] = []
     rearmed: list[str] = []
     rows = conn.execute(
-        "SELECT t.id, t.title, t.workspace_kind, t.workspace_path, t.tenant "
+        "SELECT t.id, t.title, t.body, t.workspace_kind, t.workspace_path, t.tenant "
         "FROM tasks t JOIN task_metadata m ON m.task_id = t.id "
         "WHERE m.work_item_type = 'acceptance' "
         "AND t.status IN ('blocked', 'scheduled')"
@@ -1815,9 +2031,14 @@ def sweep_acceptance_tasks(
         tid = row["id"]
         approval = _latest_approval(conn, tid, "epic_acceptance")
         accepted_ev = _has_event(conn, tid, "accepted")
+        if (approver == "agent" and accepted_ev is None and approval is not None
+                and approval["status"] == "pending"
+                and _apply_agent_review(conn, row, approval, reviewer=reviewer_assignee,
+                                        fix_assignee=fix_assignee, board=board)):
+            approval = _latest_approval(conn, tid, "epic_acceptance")
         approved = approval is not None and approval["status"] == "approved"
         if accepted_ev is not None or approved:
-            approver = (approval["approver"] if approved else None) or "operator"
+            closed_by = (approval["approver"] if approved else None) or "operator"
             if approval is not None and approval["status"] == "pending":
                 with kb.write_txn(conn):
                     conn.execute(
@@ -1825,7 +2046,7 @@ def sweep_acceptance_tasks(
                         "decision='approved', approver=?, decided_at=?, "
                         "updated_at=? WHERE approval_id=? AND status='pending'",
                         (
-                            approver,
+                            closed_by,
                             int(time.time()),
                             int(time.time()),
                             approval["approval_id"],
@@ -1837,7 +2058,7 @@ def sweep_acceptance_tasks(
             # decision-kanban-approval-gates-scheduled-not-blocked-v1), so an
             # already-stranded accepted gate recovers on the next tick too.
             with kb.write_txn(conn):
-                released = kb._release_epic_acceptance_gate(conn, tid, approver)
+                released = kb._release_epic_acceptance_gate(conn, tid, closed_by)
             if not released:
                 # Fall back to the standard completion path for any gate the
                 # release helper declined (e.g. it had open children) so the
@@ -1845,8 +2066,8 @@ def sweep_acceptance_tasks(
                 kb.complete_task(
                     conn,
                     tid,
-                    result=f"Epic accepted by {approver}.",
-                    summary=f"Epic accepted by {approver}.",
+                    result=f"Epic accepted by {closed_by}.",
+                    summary=f"Epic accepted by {closed_by}.",
                     board=board,
                 )
             # save_learning bridge (off unless the enqueue env is configured).
@@ -2468,6 +2689,8 @@ def run_autonomy_tick(
             enabled: true
             assignee: keith
             fix_assignee: builder
+            approver: keith        # or agent: an independent agent decides G3
+            reviewer_assignee: product
           integration:
             enabled: true
             branch: integration
@@ -2493,10 +2716,16 @@ def run_autonomy_tick(
         except Exception:
             _log.exception("autonomy: generate_epic_acceptances failed")
         try:
+            approver = str(ea_cfg.get("approver") or "keith").strip().lower()
+            if approver not in ACCEPTANCE_APPROVERS:
+                _log.warning("autonomy: unknown epic_acceptance.approver %r; using keith", approver)
+                approver = "keith"
             out["acceptance_sweep"] = sweep_acceptance_tasks(
                 conn,
                 board=board,
                 fix_assignee=str(ea_cfg.get("fix_assignee") or "builder"),
+                approver=approver,
+                reviewer_assignee=str(ea_cfg.get("reviewer_assignee") or "product").strip() or "product",
             )
         except Exception:
             _log.exception("autonomy: sweep_acceptance_tasks failed")
