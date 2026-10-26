@@ -654,6 +654,30 @@ def _emit_completion_atoms(tid: str, metadata) -> None:
         return
 
 
+def _acceptance_review_error(conn, task_id: str, metadata) -> Optional[str]:
+    """Refuse to finish an agent G3 acceptance review without a valid decision.
+
+    The gate sweep would treat such a review as invalid and leave the gate for
+    Keith; refusing here lets the reviewer retry instead (the task is not
+    mutated). Other cards are unaffected.
+    """
+    row = conn.execute(
+        "SELECT work_item_type FROM task_metadata WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    if row is None or row["work_item_type"] != "acceptance_review":
+        return None
+    from hermes_cli.kanban_autonomy import acceptance_decision_error
+
+    err = acceptance_decision_error(metadata)
+    if err is None:
+        return None
+    return (
+        f"kanban_complete blocked: {task_id} is an acceptance review, and {err}. "
+        "Your task is still in-flight (no state change). Retry kanban_complete with "
+        'metadata={"acceptance_decision": "accept" | "reject", "reason": "<one line>"}.'
+    )
+
+
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
     tid = _default_task_id(args.get("task_id"))
@@ -756,6 +780,9 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            review_err = _acceptance_review_error(conn, tid, metadata)
+            if review_err:
+                return tool_error(review_err)
             try:
                 ok = kb.complete_task(
                     conn, tid,
