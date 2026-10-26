@@ -7913,6 +7913,24 @@ def _record_spawn_failure(
     )
 
 
+def _call_spawn(spawn, task: "Task", workspace: str, board: Optional[str]):
+    """Call a worker ``spawn_fn``; returns its pid (or ``None``).
+
+    Back-compat: older spawn_fn signatures accept only (task, workspace).
+    Test stubs in the suite rely on that. Introspect the callable and pass
+    ``board`` only when supported.
+    """
+    import inspect
+
+    try:
+        sig = inspect.signature(spawn)
+        if "board" in sig.parameters:
+            return spawn(task, workspace, board=board)
+        return spawn(task, workspace)
+    except (TypeError, ValueError):
+        return spawn(task, workspace)
+
+
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
@@ -8675,19 +8693,7 @@ def _dispatch_once_locked(
             claimed.skills = _sk
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            # Back-compat: older spawn_fn signatures accept only
-            # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
-            import inspect
-
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+            pid = _call_spawn(_spawn, claimed, str(workspace), board)
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # NOTE: we intentionally do NOT reset consecutive_failures
@@ -9686,6 +9692,117 @@ def _spawn_conductor(
     return proc.pid
 
 
+# Cards a board's conductor never drives itself. An agent G3 acceptance review
+# must be run by its assigned, independent reviewer in that profile's own worker
+# process: the conductor runs as the board's build profile and completes cards
+# without the review's decision metadata.
+CONDUCTOR_SKIPPED_WORK_ITEM_TYPES = ("acceptance_review",)
+_CONDUCTOR_SKIPPED_SQL = ", ".join(f"'{t}'" for t in CONDUCTOR_SKIPPED_WORK_ITEM_TYPES)
+
+
+def conductor_skips(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Whether the board's conductor must leave *task_id* to its own worker."""
+    row = conn.execute(
+        "SELECT work_item_type FROM task_metadata WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    return row is not None and row["work_item_type"] in CONDUCTOR_SKIPPED_WORK_ITEM_TYPES
+
+
+def dispatch_conductor_skipped(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    spawn_fn=None,
+    ttl_seconds: Optional[int] = None,
+    failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
+) -> "DispatchResult":
+    """On a conductor board, spawn the cards the conductor skips as workers.
+
+    Each ready, unclaimed card of a skipped type is claimed and spawned as its
+    own assignee's worker, exactly as :func:`dispatch_once` would (same
+    workspace resolution, spawn call and failure accounting), so the run's
+    profile is the process that really ran it. Assignees that are not Hermes
+    profiles are skipped, as in :func:`dispatch_once`.
+    """
+    result = DispatchResult()
+    try:
+        from hermes_cli.review_loop import pause as _pause
+
+        _paused, _reason = _pause.is_paused(board)
+    except Exception:
+        _paused, _reason = False, None  # fail-open, as in dispatch_once
+    if _paused:
+        result.paused = True
+        result.pause_reason = _reason
+        return result
+    rows = conn.execute(
+        "SELECT t.id, t.assignee FROM tasks t JOIN task_metadata m ON m.task_id = t.id "
+        "WHERE t.status = 'ready' AND t.claim_lock IS NULL AND t.assignee IS NOT NULL "
+        f"AND m.work_item_type IN ({_CONDUCTOR_SKIPPED_SQL}) "
+        "ORDER BY t.priority DESC, t.created_at ASC"
+    ).fetchall()
+    try:
+        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+    except Exception:
+        profile_exists = None  # type: ignore[assignment]
+    for row in rows:
+        if profile_exists is not None and not profile_exists(row["assignee"]):
+            result.skipped_nonspawnable.append(row["id"])
+            continue
+        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        if claimed is None:
+            continue
+        try:
+            workspace = resolve_workspace(claimed, board=board)
+            set_workspace_path(conn, claimed.id, str(workspace))
+            pid = _call_spawn(spawn_fn if spawn_fn is not None else _default_spawn,
+                              claimed, str(workspace), board)
+            if pid:
+                _set_worker_pid(conn, claimed.id, int(pid))
+            result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+        except Exception as exc:
+            if _record_spawn_failure(conn, claimed.id, str(exc), failure_limit=failure_limit):
+                result.auto_blocked.append(claimed.id)
+    return result
+
+
+def conductor_board_sweeps(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    autonomy_cfg: Optional[dict] = None,
+    failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
+    spawn_fn=None,
+) -> dict:
+    """The G3 epic-acceptance sweep a conductor board would otherwise never run.
+
+    A conductor board bypasses :func:`dispatch_once`, and with it the autonomy
+    tick, so finished epics never got their acceptance gate. Runs only the
+    ``epic_acceptance`` sweep (generation, agent review, release) and then
+    spawns any ready acceptance review as its reviewer's own worker. The other
+    autonomy sweeps are left to the conductor's own transport. Never raises.
+    """
+    out: dict = {}
+    ea = (autonomy_cfg or {}).get("epic_acceptance") or {}
+    if not ea.get("enabled"):
+        return out
+    try:
+        from hermes_cli import kanban_autonomy as _autonomy
+
+        out["autonomy"] = _autonomy.run_autonomy_tick(
+            conn, board=board, cfg={"epic_acceptance": ea}
+        )
+    except Exception:
+        _log.exception("conductor board %s: epic acceptance sweep failed", board)
+    try:
+        out["spawned_reviews"] = dispatch_conductor_skipped(
+            conn, board=board, failure_limit=failure_limit, spawn_fn=spawn_fn
+        ).spawned
+    except Exception:
+        _log.exception("conductor board %s: acceptance review spawn failed", board)
+    return out
+
+
 def ensure_conductor(
     conn: sqlite3.Connection,
     *,
@@ -9743,7 +9860,8 @@ def ensure_conductor(
             # ``dispatch_once`` already rely on; there is no cross-board table.
             row = conn.execute(
                 "SELECT 1 FROM tasks WHERE status = 'ready' AND assignee IS NOT NULL "
-                "AND claim_lock IS NULL LIMIT 1"
+                "AND claim_lock IS NULL AND id NOT IN (SELECT task_id FROM task_metadata "
+                f"WHERE work_item_type IN ({_CONDUCTOR_SKIPPED_SQL})) LIMIT 1"
             ).fetchone()
             return row is not None
         except Exception:

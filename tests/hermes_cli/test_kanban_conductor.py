@@ -389,3 +389,104 @@ def test_open_spawn_log_safely_refuses_hardlink(tmp_path):
     finally:
         f.close()
     assert victim.read_text(encoding="utf-8") == "keep"  # refused → wrote to devnull
+
+
+# --------------------------------------------------------------------------
+# K4: the G3 epic-acceptance sweep on conductor boards
+# --------------------------------------------------------------------------
+
+AGENT_EA = {"epic_acceptance": {"enabled": True, "approver": "agent",
+                                "reviewer_assignee": "product", "fix_assignee": "builder"}}
+
+
+def _worker_spy():
+    calls = []
+
+    def _spawn(task, workspace, board=None):
+        calls.append({"id": task.id, "assignee": task.assignee, "board": board})
+        return 4343
+
+    return _spawn, calls
+
+
+def _finished_epic(conn):
+    root = kb.create_task(conn, title="Epic: conductor board", triage=True)
+    child_ids = kb.decompose_triage_task(
+        conn, root, root_assignee="orchestrator", author="orchestrator",
+        children=[{"title": "build it", "assignee": "builder", "parents": []}],
+    )
+    for cid in child_ids:
+        kb.complete_task(conn, cid, result="done")
+    kb.complete_task(conn, root, result="epic complete")
+    return root
+
+
+def _review_id(conn):
+    row = conn.execute("SELECT task_id FROM task_metadata "
+                       "WHERE work_item_type = 'acceptance_review'").fetchone()
+    return row["task_id"] if row else None
+
+
+def test_conductor_board_sweep_opens_the_gate_and_spawns_the_review_as_its_reviewer(
+        conn, all_assignees_spawnable):
+    _finished_epic(conn)
+    spawn, calls = _worker_spy()
+    out = kb.conductor_board_sweeps(conn, board="default", autonomy_cfg=AGENT_EA, spawn_fn=spawn)
+    assert len(out["autonomy"]["acceptances_created"]) == 1
+    rid = _review_id(conn)
+    assert rid, "agent mode opens one review"
+    assert calls == [{"id": rid, "assignee": "product", "board": "default"}]
+    run = kb.latest_run(conn, rid)
+    assert run.profile == "product" and kb.get_task(conn, rid).status == "running"
+
+
+def test_conductor_board_sweep_is_off_without_epic_acceptance(conn, all_assignees_spawnable):
+    _finished_epic(conn)
+    spawn, calls = _worker_spy()
+    assert kb.conductor_board_sweeps(conn, board="default", autonomy_cfg={}, spawn_fn=spawn) == {}
+    assert calls == [] and _review_id(conn) is None
+
+
+def test_conductor_never_takes_an_acceptance_review(conn, all_assignees_spawnable):
+    _finished_epic(conn)
+    kb.conductor_board_sweeps(conn, board="default", autonomy_cfg=AGENT_EA,
+                              spawn_fn=lambda task, ws, board=None: None)
+    rid = _review_id(conn)
+    assert kb.conductor_skips(conn, rid)
+    # Put the review back to ready: it alone must not wake a conductor.
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL WHERE id = ?", (rid,))
+    spawn, calls = _spy_spawn()
+    assert kb.ensure_conductor(conn, board="default", profile="orch", spawn_fn=spawn).spawned == []
+    assert calls == []
+
+
+def test_skipped_cards_leave_other_ready_cards_to_the_conductor(conn, all_assignees_spawnable):
+    other = kb.create_task(conn, title="normal card", assignee="builder")
+    spawn, calls = _worker_spy()
+    assert kb.dispatch_conductor_skipped(conn, board="default", spawn_fn=spawn).spawned == []
+    assert calls == [] and kb.get_task(conn, other).status == "ready"
+    assert not kb.conductor_skips(conn, other)
+
+
+def test_skipped_card_spawn_honours_the_autonomy_pause(conn, all_assignees_spawnable, monkeypatch):
+    _finished_epic(conn)
+    kb.conductor_board_sweeps(conn, board="default", autonomy_cfg=AGENT_EA,
+                              spawn_fn=lambda task, ws, board=None: None)
+    rid = _review_id(conn)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready', claim_lock=NULL WHERE id = ?", (rid,))
+    from hermes_cli.review_loop import pause
+    monkeypatch.setattr(pause, "is_paused", lambda board=None: (True, "test pause"))
+    spawn, calls = _worker_spy()
+    res = kb.dispatch_conductor_skipped(conn, board="default", spawn_fn=spawn)
+    assert res.paused and calls == [] and kb.get_task(conn, rid).status == "ready"
+
+
+def test_skipped_card_with_a_non_profile_assignee_is_not_spawned(conn, monkeypatch):
+    _finished_epic(conn)
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
+    spawn, calls = _worker_spy()
+    out = kb.conductor_board_sweeps(conn, board="default", autonomy_cfg=AGENT_EA, spawn_fn=spawn)
+    assert calls == [] and out["spawned_reviews"] == []
