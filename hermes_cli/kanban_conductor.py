@@ -348,10 +348,12 @@ def drive_board_from_cli(
             except Exception:
                 pass
             rows = kb.list_tasks(c, status="ready")
+            # An acceptance review runs as its own reviewer's worker
+            # (kb.dispatch_conductor_skipped), never inside this session.
             return [
                 {"id": t.id, "title": t.title, "body": t.body}
                 for t in rows
-                if getattr(t, "assignee", None)
+                if getattr(t, "assignee", None) and not kb.conductor_skips(c, t.id)
             ]
         finally:
             _close(c)

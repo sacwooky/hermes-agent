@@ -1251,6 +1251,14 @@ class GatewayKanbanWatchersMixin:
                     # per board instead of spawning a worker per ready card.
                     # Off by default; the existing dispatch_once path below is
                     # byte-for-byte unchanged for every non-opted-in board.
+                    # The G3 epic-acceptance sweep still runs here (it lives in
+                    # the autonomy tick dispatch_once would have run).
+                    _kb.conductor_board_sweeps(
+                        conn,
+                        board=slug,
+                        autonomy_cfg=_merged_autonomy_cfg(slug),
+                        failure_limit=failure_limit,
+                    )
                     return _kb.ensure_conductor(
                         conn,
                         board=slug,

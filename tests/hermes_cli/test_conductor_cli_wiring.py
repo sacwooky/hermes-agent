@@ -255,3 +255,25 @@ def test_conductor_blocks_when_no_workspace_validates(kanban_home, monkeypatch):
     msg = seen["msg"]
     assert "/etc" not in msg and "/root" not in msg and "/sys" not in msg
     assert "BLOCKED" in msg
+
+
+def test_conductor_leaves_an_acceptance_review_to_its_reviewer(kanban_home, monkeypatch):
+    """K4: the conductor drives normal cards but never runs an acceptance review."""
+    from hermes_cli import kanban_autonomy as ka
+    with kb.connect() as c:
+        kb.create_task(c, title="Card A", body="do A", assignee="builder")
+        rid = kb.create_task(c, title="Acceptance review: epic", body="decide", assignee="product")
+        with kb.write_txn(c):
+            ka._stamp_work_item_type(c, rid, "acceptance_review")
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    monkeypatch.setenv("HERMES_PROFILE", "conductor")
+    monkeypatch.setenv("HERMES_KANBAN_CONDUCTOR", "1")
+    fake = _FakeCli(response="DONE: built it, tests pass")
+    drive_board_from_cli(fake, board="default", author="conductor", judge=_judge("done"), idle_max_seconds=0)
+
+    with kb.connect() as c:
+        by_title = {t.title: t.status for t in kb.list_tasks(c, include_archived=False)}
+        assert kb.latest_run(c, rid) is None, "the conductor must not claim the review"
+    assert by_title["Card A"] == "done"
+    assert by_title["Acceptance review: epic"] == "ready"
