@@ -442,6 +442,41 @@ def _isolate_hermes_home(_hermetic_environment):
     return None
 
 
+# ── Live model-catalog fence ─────────────────────────────────────────────────
+# Building an AIAgent looks up model metadata (context length, pricing) from
+# the OpenRouter and models.dev catalogs, a real HTTPS GET with timeout=10. In
+# tests/run_agent/test_run_agent.py 347 of 389 tests do it, so a slow catalog
+# runs the file past the per-file CI limit (fork main runs 40348124677 and
+# 40360527046: SIGKILL at 140s, no test failed). Refusing the name lookup
+# fails exactly like an offline host, which the metadata code already falls
+# back from. Tests that need the live catalogs are marked ``integration``.
+_LIVE_CATALOG_DOMAINS = ("openrouter.ai", "models.dev")
+
+
+def _is_live_catalog_host(host) -> bool:
+    name = (host.decode() if isinstance(host, bytes) else str(host or "")).lower().rstrip(".")
+    return any(name == domain or name.endswith("." + domain) for domain in _LIVE_CATALOG_DOMAINS)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_model_catalogs(request, monkeypatch):
+    if request.node.get_closest_marker("integration"):
+        return
+    import socket
+
+    real_getaddrinfo = socket.getaddrinfo
+
+    def fenced_getaddrinfo(host, *args, **kwargs):
+        if _is_live_catalog_host(host):
+            raise socket.gaierror(
+                socket.EAI_NONAME,
+                f"test fence: {host!r} is a live model catalog; stub the HTTP "
+                "layer or mark the test integration")
+        return real_getaddrinfo(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", fenced_getaddrinfo)
+
+
 # ── Module-level state reset — replaced by per-file process isolation ──────
 #
 # Each test FILE runs in a freshly-spawned ``python -m pytest <file>``
