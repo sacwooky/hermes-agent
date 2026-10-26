@@ -3038,7 +3038,10 @@ class TestVisionAutoSkipsKimiCoding:
         def fake_strict(provider, model=None):
             if provider == "openrouter":
                 return fake_or_client, "google/gemini-3-flash-preview"
-            if provider == "nous":
+            # nous plus the fleet-local auto-chain entries (fleet commit
+            # e791b922a38 prepends openai-codex/gemini/claude-code) are
+            # legitimately probed after the kimi-coding skip; none is available.
+            if provider in {"nous", "openai-codex", "gemini", "claude-code"}:
                 return None, None
             raise AssertionError(
                 f"strict vision backend should not be called for {provider!r} "

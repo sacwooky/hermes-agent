@@ -66,11 +66,11 @@ def test_get_codex_model_ids_adds_forward_compat_models_from_templates(monkeypat
     models = get_codex_model_ids(access_token="codex-access-token")
 
     # When live discovery only returns gpt-5.3-codex, forward-compat synthesis
-    # should surface gpt-5.5, gpt-5.4, gpt-5.4-mini, and gpt-5.3-codex-spark
-    # (each is templated off gpt-5.3-codex).
+    # should surface gpt-5.4, gpt-5.4-mini, and gpt-5.3-codex-spark (each is
+    # templated off gpt-5.3-codex). gpt-5.5 is deliberately NOT synthesized:
+    # the fleet excludes that silent-hang family (fleet commit 9a8d193fb40).
     assert models == [
         "gpt-5.3-codex",
-        "gpt-5.5",
         "gpt-5.4-mini",
         "gpt-5.4",
         "gpt-5.3-codex-spark",
@@ -93,7 +93,7 @@ def test_fetch_from_api_keeps_supported_in_api_false_models(monkeypatch):
         def json(self):
             return {
                 "models": [
-                    {"slug": "gpt-5.5", "priority": 0, "supported_in_api": True},
+                    {"slug": "gpt-5.4", "priority": 0, "supported_in_api": True},
                     {"slug": "gpt-5.3-codex-spark", "priority": 7, "supported_in_api": False},
                     {"slug": "gpt-5-internal", "priority": 99, "visibility": "hidden"},
                 ]
@@ -108,7 +108,7 @@ def test_fetch_from_api_keeps_supported_in_api_false_models(monkeypatch):
 
     models = codex_models._fetch_models_from_api(access_token="tok")
 
-    assert "gpt-5.5" in models
+    assert "gpt-5.4" in models
     assert "gpt-5.3-codex-spark" in models
     assert "gpt-5-internal" not in models
 
