@@ -9918,11 +9918,20 @@ def conductor_board_sweeps(
     ``epic_acceptance`` sweep (generation, agent review, release) and then
     spawns any ready acceptance review as its reviewer's own worker. The other
     autonomy sweeps are left to the conductor's own transport. Never raises.
+
+    Before spawning, a review worker that died is released back to ``ready``
+    by :func:`detect_crashed_workers`, which :func:`dispatch_once` would have
+    run. Only those spawned workers carry a ``worker_pid`` on a conductor
+    board; the conductor's own claims have none, so they are left alone.
     """
     out: dict = {}
     ea = (autonomy_cfg or {}).get("epic_acceptance") or {}
     if not ea.get("enabled"):
         return out
+    try:
+        out["crashed"] = detect_crashed_workers(conn)
+    except Exception:
+        _log.exception("conductor board %s: crashed review detection failed", board)
     try:
         from hermes_cli import kanban_autonomy as _autonomy
 

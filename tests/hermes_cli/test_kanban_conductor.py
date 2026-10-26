@@ -461,6 +461,35 @@ def test_conductor_never_takes_an_acceptance_review(conn, all_assignees_spawnabl
     assert calls == []
 
 
+
+def test_conductor_board_sweep_reaps_a_crashed_review_and_respawns_it(
+        conn, all_assignees_spawnable, monkeypatch):
+    """A review worker that dies on a conductor board is released and respawned (K4 advisory)."""
+    _finished_epic(conn)
+    spawn, calls = _worker_spy()
+    kb.conductor_board_sweeps(conn, board="default", autonomy_cfg=AGENT_EA, spawn_fn=spawn)
+    rid = _review_id(conn)
+    assert kb.get_task(conn, rid).status == "running" and len(calls) == 1
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+    out = kb.conductor_board_sweeps(conn, board="default", autonomy_cfg=AGENT_EA, spawn_fn=spawn)
+    assert out["crashed"] == [rid]
+    assert [c["id"] for c in calls] == [rid, rid], "respawned as its reviewer's worker"
+    assert kb.get_task(conn, rid).status == "running"
+
+
+def test_conductor_board_sweep_leaves_the_conductors_own_claims_alone(
+        conn, all_assignees_spawnable, monkeypatch):
+    """The conductor claims cards without a worker pid; crash detection must not touch them."""
+    card = kb.create_task(conn, title="normal card", assignee="builder")
+    assert kb.claim_task(conn, card) is not None
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+    out = kb.conductor_board_sweeps(conn, board="default", autonomy_cfg=AGENT_EA,
+                                    spawn_fn=lambda task, ws, board=None: None)
+    assert out["crashed"] == []
+    assert kb.get_task(conn, card).status == "running"
+
 def test_skipped_cards_leave_other_ready_cards_to_the_conductor(conn, all_assignees_spawnable):
     other = kb.create_task(conn, title="normal card", assignee="builder")
     spawn, calls = _worker_spy()
