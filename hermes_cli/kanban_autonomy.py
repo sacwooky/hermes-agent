@@ -1811,8 +1811,8 @@ def _open_acceptance_review(
             "Open the demo, check it against the epic's acceptance criteria and the",
             "evidence below, then finish this task with `kanban_complete` metadata",
             '`{"acceptance_decision": "accept" | "reject", "reason": "<one line>"}`.',
-            "Reject with a concrete reason a builder can fix. Anything else leaves",
-            "the gate for Keith.",
+            "Both need a reason; reject with one a builder can fix. Anything else",
+            "leaves the gate for Keith.",
             "",
             "---",
             "",
@@ -1824,6 +1824,9 @@ def _open_acceptance_review(
         workspace_path=gate["workspace_path"],
         tenant=gate["tenant"],
         priority=10,
+        # One review per approval even if we crash before the event below:
+        # a retry gets the same task back instead of a second review.
+        idempotency_key=f"acceptance-review:{gate_id}:{approval_id}",
         board=board,
     )
     with kb.write_txn(conn):
@@ -1853,7 +1856,7 @@ def _record_agent_decision(
                  "--project", board or "kanban",
                  "--what", f"G3 acceptance {gate_id}: {chose}",
                  "--chose", chose, "--passed-over", other,
-                 "--why", reason or "(no reason given)",
+                 "--why", reason,
                  "--ref", gate_id, "--agent", reviewer],
                 capture_output=True, text=True, timeout=30,
             )
@@ -1903,14 +1906,14 @@ def _apply_agent_review(
     meta = meta if isinstance(meta, dict) else {}
     decision = str(meta.get("acceptance_decision") or "").strip().lower()
     reason = str(meta.get("reason") or "").strip()
-    if decision not in ("accept", "reject") or (decision == "reject" and not reason):
+    if decision not in ("accept", "reject") or not reason:
         invalid = _event_payload(_has_event(conn, gate_id, "acceptance_review_invalid"))
         if invalid.get("review_id") != review_id:
             with kb.write_txn(conn):
                 kb._append_event(conn, gate_id, "acceptance_review_invalid", {
                     "review_id": review_id,
                     "reason": "review finished without acceptance_decision accept/reject"
-                              " (a reject needs a reason); gate left for Keith",
+                              " and a reason; gate left for Keith",
                 })
             _log.warning("agent acceptance review %s for %s had no valid decision",
                          review_id, gate_id)
@@ -1924,7 +1927,7 @@ def _apply_agent_review(
             "WHERE approval_id = ? AND status = 'pending'",
             ("approved" if accepted else "rejected",
              "approved" if accepted else "rejected",
-             f"agent:{reviewer}", reason or None, now, now, approval["approval_id"]),
+             f"agent:{reviewer}", reason, now, now, approval["approval_id"]),
         )
     if cur.rowcount != 1:
         return False
@@ -2035,7 +2038,7 @@ def sweep_acceptance_tasks(
             approval = _latest_approval(conn, tid, "epic_acceptance")
         approved = approval is not None and approval["status"] == "approved"
         if accepted_ev is not None or approved:
-            approver = (approval["approver"] if approved else None) or "operator"
+            closed_by = (approval["approver"] if approved else None) or "operator"
             if approval is not None and approval["status"] == "pending":
                 with kb.write_txn(conn):
                     conn.execute(
@@ -2043,7 +2046,7 @@ def sweep_acceptance_tasks(
                         "decision='approved', approver=?, decided_at=?, "
                         "updated_at=? WHERE approval_id=? AND status='pending'",
                         (
-                            approver,
+                            closed_by,
                             int(time.time()),
                             int(time.time()),
                             approval["approval_id"],
@@ -2055,7 +2058,7 @@ def sweep_acceptance_tasks(
             # decision-kanban-approval-gates-scheduled-not-blocked-v1), so an
             # already-stranded accepted gate recovers on the next tick too.
             with kb.write_txn(conn):
-                released = kb._release_epic_acceptance_gate(conn, tid, approver)
+                released = kb._release_epic_acceptance_gate(conn, tid, closed_by)
             if not released:
                 # Fall back to the standard completion path for any gate the
                 # release helper declined (e.g. it had open children) so the
@@ -2063,8 +2066,8 @@ def sweep_acceptance_tasks(
                 kb.complete_task(
                     conn,
                     tid,
-                    result=f"Epic accepted by {approver}.",
-                    summary=f"Epic accepted by {approver}.",
+                    result=f"Epic accepted by {closed_by}.",
+                    summary=f"Epic accepted by {closed_by}.",
                     board=board,
                 )
             # save_learning bridge (off unless the enqueue env is configured).
@@ -2722,7 +2725,7 @@ def run_autonomy_tick(
                 board=board,
                 fix_assignee=str(ea_cfg.get("fix_assignee") or "builder"),
                 approver=approver,
-                reviewer_assignee=str(ea_cfg.get("reviewer_assignee") or "product"),
+                reviewer_assignee=str(ea_cfg.get("reviewer_assignee") or "product").strip() or "product",
             )
         except Exception:
             _log.exception("autonomy: sweep_acceptance_tasks failed")

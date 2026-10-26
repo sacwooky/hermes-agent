@@ -415,8 +415,10 @@ def test_agent_reject_spawns_one_fix_story_and_rearms_a_new_review(kanban_home, 
     {},
     {"acceptance_decision": "looks fine"},
     {"acceptance_decision": "reject"},          # a reject needs a reason
+    {"acceptance_decision": "accept"},          # so does an accept (r1 CODE-001)
+    {"acceptance_decision": "accept", "reason": "   "},
 ])
-def test_agent_review_without_a_valid_decision_releases_nothing(kanban_home, metadata):
+def test_agent_review_without_a_valid_decision_releases_nothing(kanban_home, decided_log, metadata):
     with kb.connect() as conn:
         gate_id, review_id = _agent_gate(conn)
         kb.complete_task(conn, review_id, result="done", metadata=metadata or None)
@@ -426,9 +428,44 @@ def test_agent_review_without_a_valid_decision_releases_nothing(kanban_home, met
         assert kb.get_task(conn, gate_id).status == "blocked"
         assert kb.list_task_approvals(gate_id)[0]["status"] == "pending"
         assert ka._has_event(conn, gate_id, "acceptance_review_invalid") is not None
+        assert ka._has_event(conn, gate_id, "acceptance_decision_recorded") is None
+        assert not decided_log.exists()
         # Keith's own accept still works.
         kb.record_task_acceptance(conn, gate_id, "keith", source="cli")
         assert kb.get_task(conn, gate_id).status == "done"
+
+
+def test_two_gates_in_one_tick_both_get_agent_reviews(kanban_home, decided_log):
+    """r1 advisory: closing the first gate must not switch the sweep out of agent mode."""
+    with kb.connect() as conn:
+        gate_a, review_a = _agent_gate(conn)
+        root, child_ids = _decompose_epic(conn)
+        _finish_epic(conn, root, child_ids)
+        ka.run_autonomy_tick(conn, cfg=AGENT_CFG)
+        gate_b = [r["id"] for r in conn.execute(
+            "SELECT t.id FROM tasks t JOIN task_metadata m ON m.task_id = t.id "
+            "WHERE m.work_item_type = 'acceptance' AND t.id != ?", (gate_a,)).fetchall()][0]
+        review_b = ka._event_payload(
+            ka._has_event(conn, gate_b, "acceptance_review_created"))["review_id"]
+        for rid in (review_a, review_b):
+            kb.complete_task(conn, rid, result="ok", metadata={
+                "acceptance_decision": "accept", "reason": "criteria met"})
+        out = ka.run_autonomy_tick(conn, cfg=AGENT_CFG)
+        assert sorted(out["acceptance_sweep"]["completed"]) == sorted([gate_a, gate_b])
+        for g in (gate_a, gate_b):
+            assert kb.list_task_approvals(g)[0]["approver"] == "agent:product"
+
+
+def test_a_retried_review_open_returns_the_same_task(kanban_home):
+    """r1 advisory: a crash after creating the review but before its event opens no second review."""
+    with kb.connect() as conn:
+        gate_id, review_id = _agent_gate(conn)
+        gate = conn.execute("SELECT id, title, body, workspace_kind, workspace_path, tenant "
+                            "FROM tasks WHERE id = ?", (gate_id,)).fetchone()
+        approval_id = kb.list_task_approvals(gate_id)[0]["approval_id"]
+        again = ka._open_acceptance_review(conn, gate, approval_id, reviewer="product",
+                                           fix_assignee="builder", board=None)
+        assert again == review_id
 
 
 @pytest.mark.parametrize("reviewer", ["builder", "qa-fixer"])
