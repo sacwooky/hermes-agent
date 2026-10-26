@@ -812,7 +812,10 @@ def _resolve_named_custom_runtime(
     # `provider: ollama` with a LAN/WireGuard `base_url` doesn't silently
     # fall through to OpenRouter.
     requested_norm = (requested_provider or "").strip().lower()
-    if requested_norm and requested_norm != "custom":
+    # An explicit ``custom:<name>`` key targets a saved entry, so it must not
+    # collapse to bare custom (auth.resolve_provider maps it to the generic
+    # "custom" auth class, which would skip the entry's credentials below).
+    if requested_norm and requested_norm != "custom" and not requested_norm.startswith("custom:"):
         try:
             from hermes_cli.auth import resolve_provider as _resolve_provider
 
