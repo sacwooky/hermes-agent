@@ -485,6 +485,63 @@ def test_agent_review_refused_when_the_reviewer_is_not_independent(kanban_home, 
         assert kb.list_task_approvals(gate_id)[0]["status"] == "pending"
 
 
+def _assert_not_applied(conn, gate_id, decided_log):
+    assert kb.get_task(conn, gate_id).status == "blocked"
+    assert kb.list_task_approvals(gate_id)[0]["status"] == "pending"
+    assert ka._has_event(conn, gate_id, "acceptance_review_refused") is not None
+    assert not decided_log.exists()
+
+
+def test_review_run_by_a_builder_is_not_applied(kanban_home, decided_log):
+    """r1 advisory CODE-A02: the run that decides must be the assigned reviewer's."""
+    with kb.connect() as conn:
+        gate_id, review_id = _agent_gate(conn)
+        kb.assign_task(conn, review_id, "builder")
+        kb.complete_task(conn, review_id, result="ok", metadata={
+            "acceptance_decision": "accept", "reason": "criteria met"})
+        kb.assign_task(conn, review_id, "product")   # handed back after the builder ran it
+        out = ka.run_autonomy_tick(conn, cfg=AGENT_CFG)
+        assert out["acceptance_sweep"]["completed"] == []
+        _assert_not_applied(conn, gate_id, decided_log)
+
+
+def test_review_reassigned_mid_flight_is_not_applied(kanban_home, decided_log):
+    with kb.connect() as conn:
+        gate_id, review_id = _agent_gate(conn)
+        kb.assign_task(conn, review_id, "studio")
+        kb.complete_task(conn, review_id, result="ok", metadata={
+            "acceptance_decision": "accept", "reason": "criteria met"})
+        ka.run_autonomy_tick(conn, cfg=AGENT_CFG)
+        _assert_not_applied(conn, gate_id, decided_log)
+
+
+def test_reviewer_made_fix_assignee_after_opening_is_not_applied(kanban_home, decided_log):
+    with kb.connect() as conn:
+        gate_id, review_id = _agent_gate(conn)
+        kb.complete_task(conn, review_id, result="ok", metadata={
+            "acceptance_decision": "accept", "reason": "criteria met"})
+        cfg = {"epic_acceptance": {**AGENT_CFG["epic_acceptance"], "fix_assignee": "product"}}
+        ka.run_autonomy_tick(conn, cfg=cfg)
+        _assert_not_applied(conn, gate_id, decided_log)
+
+
+def test_digest_record_has_a_short_timeout(kanban_home, decided_log, monkeypatch):
+    """r1 advisory CODE-A01: a slow fleet-decided.py cannot hold the sweep for long."""
+    seen = {}
+    real_run = subprocess.run
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(ka.subprocess, "run", spy)
+    with kb.connect() as conn:
+        gate_id, _ = _agent_gate(conn)
+        ka._record_agent_decision(conn, gate_id, accepted=True, reviewer="product",
+                                  reason="criteria met", board=None)
+    assert seen["timeout"] <= 10
+
+
 def test_keith_mode_opens_no_review_and_unknown_approver_falls_back(kanban_home):
     with kb.connect() as conn:
         root, child_ids = _decompose_epic(conn)
