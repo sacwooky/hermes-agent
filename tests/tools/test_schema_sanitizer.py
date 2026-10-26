@@ -838,6 +838,7 @@ def test_kanban_complete_metadata_through_provider_paths():
         [{"type": "function", "function": copy.deepcopy(KANBAN_COMPLETE_SCHEMA)}]
     )
     gemini = _translate_tools_to_gemini(tools)[0]["functionDeclarations"][0]["parameters"]
+    assert gemini["properties"]["metadata"]["type"] == "object"
     assert "additionalProperties" not in gemini["properties"]["metadata"]
     moonshot = sanitize_moonshot_tools(tools)[0]["function"]["parameters"]
     assert moonshot["properties"]["metadata"]["additionalProperties"] is True
