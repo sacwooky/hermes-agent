@@ -24,8 +24,12 @@ Per-board overrides under `kanban.boards.<slug>.autonomy` work as for the other 
 
 1. For each pending approval the sweep opens one **acceptance review** task (`work_item_type`
    `acceptance_review`) assigned to `reviewer_assignee`, carrying the gate's evidence. The gate stays blocked.
-2. The reviewer checks the demo against the epic's acceptance criteria and finishes with `kanban_complete`
-   metadata `{"acceptance_decision": "accept" | "reject", "reason": "<one line>"}`.
+2. The reviewer checks the demo against the epic's acceptance criteria and finishes with `kanban_complete`,
+   passing the top-level arguments `acceptance_decision` (`"accept"` or `"reject"`) and `acceptance_reason`
+   (one line); the tool stores them in the run's metadata. The same keys inside `metadata`
+   (`acceptance_decision`, `reason`) still work. `kanban_complete` refuses to finish a review without a valid
+   decision, so the reviewer retries instead of leaving the gate for Keith. On a conductor board the review runs as
+   its reviewer's own worker, never inside the conductor session.
 3. On the next tick the approval is decided as `agent:<profile>` with the reason as its comment. Accept releases
    the gate; reject spawns one fix story, and when it lands the gate re-arms and a fresh review opens.
 

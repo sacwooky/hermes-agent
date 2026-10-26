@@ -500,6 +500,69 @@ def test_acceptance_review_with_a_valid_decision_completes(worker_env):
     assert d["ok"] is True
 
 
+def test_acceptance_review_completes_with_top_level_decision_args(worker_env):
+    """K3 e2e: the cx/ lane delivered metadata={} but top-level scalars intact."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    _make_acceptance_review(worker_env)
+    d = json.loads(kt._handle_complete({
+        "summary": "criteria met", "metadata": {},
+        "acceptance_decision": "accept", "acceptance_reason": "the one criterion is met",
+    }))
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        meta = kb.latest_run(conn, worker_env).metadata
+    finally:
+        conn.close()
+    assert meta["acceptance_decision"] == "accept"
+    assert meta["reason"] == "the one criterion is met"
+
+
+def test_top_level_decision_does_not_override_metadata(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    _make_acceptance_review(worker_env)
+    d = json.loads(kt._handle_complete({
+        "summary": "nav broken",
+        "metadata": {"acceptance_decision": "reject", "reason": "nav is broken"},
+        "acceptance_decision": "accept", "acceptance_reason": "x",
+    }))
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        meta = kb.latest_run(conn, worker_env).metadata
+    finally:
+        conn.close()
+    assert meta["acceptance_decision"] == "reject" and meta["reason"] == "nav is broken"
+
+
+@pytest.mark.parametrize("args", [
+    {"acceptance_decision": "", "acceptance_reason": ""},
+    {"acceptance_decision": "accept", "acceptance_reason": ""},
+    {"acceptance_decision": "", "acceptance_reason": "looks good"},
+])
+def test_top_level_decision_still_needs_both_values(worker_env, args):
+    """A lane that fills every optional field with "" cannot slip past the check."""
+    from tools import kanban_tools as kt
+    _make_acceptance_review(worker_env)
+    err = json.loads(kt._handle_complete({"summary": "s", "metadata": {}, **args}))["error"]
+    assert "still in-flight" in err and "acceptance_reason" in err
+
+
+def test_empty_top_level_args_leave_other_cards_alone(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    d = json.loads(kt._handle_complete({"summary": "built it", "metadata": {"files": 2},
+                                        "acceptance_decision": "", "acceptance_reason": ""}))
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        assert kb.latest_run(conn, worker_env).metadata == {"files": 2}
+    finally:
+        conn.close()
+
+
 def test_other_cards_complete_without_a_decision(worker_env):
     from tools import kanban_tools as kt
     d = json.loads(kt._handle_complete({"summary": "built it", "metadata": {}}))
