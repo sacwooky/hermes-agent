@@ -456,6 +456,56 @@ def test_complete_does_not_stamp_worker_session_id_without_scoped_task(
         conn.close()
 
 
+def _make_acceptance_review(task_id):
+    from hermes_cli import kanban_autonomy as ka
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        with kb.write_txn(conn):
+            ka._stamp_work_item_type(conn, task_id, "acceptance_review")
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("metadata", [
+    None, {}, {"acceptance_decision": "accept"}, {"acceptance_decision": "maybe", "reason": "x"},
+    {"acceptance_decision": "reject", "reason": "  "},
+])
+def test_acceptance_review_needs_a_decision_and_reason(worker_env, metadata):
+    """An agent G3 review cannot finish without a valid decision; it retries instead."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    _make_acceptance_review(worker_env)
+    args = {"summary": "accept recommended"}
+    if metadata is not None:
+        args["metadata"] = metadata
+    err = json.loads(kt._handle_complete(args))["error"]
+    assert "acceptance review" in err
+    assert ("acceptance_decision must be" in err) or ("reason must be" in err)
+    assert "still in-flight" in err
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+def test_acceptance_review_with_a_valid_decision_completes(worker_env):
+    from tools import kanban_tools as kt
+    _make_acceptance_review(worker_env)
+    d = json.loads(kt._handle_complete({
+        "summary": "criteria met",
+        "metadata": {"acceptance_decision": "Accept", "reason": "the one criterion is met"},
+    }))
+    assert d["ok"] is True
+
+
+def test_other_cards_complete_without_a_decision(worker_env):
+    from tools import kanban_tools as kt
+    d = json.loads(kt._handle_complete({"summary": "built it", "metadata": {}}))
+    assert d["ok"] is True
+
+
 def test_complete_with_result_only(worker_env):
     """`result` alone (without summary) is accepted for legacy compat."""
     from tools import kanban_tools as kt

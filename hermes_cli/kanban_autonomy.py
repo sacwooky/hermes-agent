@@ -1837,6 +1837,23 @@ def _open_acceptance_review(
     return review_id
 
 
+def acceptance_decision_error(metadata) -> Optional[str]:
+    """Why *metadata* is not a valid agent acceptance decision, or ``None``.
+
+    One rule for both sides: :func:`_apply_agent_review` refuses to apply an
+    invalid decision, and the worker's ``kanban_complete`` refuses to finish an
+    ``acceptance_review`` card with one, so the agent retries instead of
+    leaving the gate for Keith by accident.
+    """
+    meta = metadata if isinstance(metadata, dict) else {}
+    decision = str(meta.get("acceptance_decision") or "").strip().lower()
+    if decision not in ("accept", "reject"):
+        return 'metadata.acceptance_decision must be "accept" or "reject"'
+    if not str(meta.get("reason") or "").strip():
+        return "metadata.reason must be a non-empty one-line reason"
+    return None
+
+
 def _record_agent_decision(
     conn: sqlite3.Connection, gate_id: str, *, accepted: bool, reviewer: str,
     reason: str, board: Optional[str],
@@ -1929,7 +1946,7 @@ def _apply_agent_review(
     meta = meta if isinstance(meta, dict) else {}
     decision = str(meta.get("acceptance_decision") or "").strip().lower()
     reason = str(meta.get("reason") or "").strip()
-    if decision not in ("accept", "reject") or not reason:
+    if acceptance_decision_error(meta) is not None:
         invalid = _event_payload(_has_event(conn, gate_id, "acceptance_review_invalid"))
         if invalid.get("review_id") != review_id:
             with kb.write_txn(conn):
