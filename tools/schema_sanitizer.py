@@ -74,7 +74,7 @@ def _sanitize_single_tool(tool: dict) -> dict:
         fn["parameters"] = {"type": "object", "properties": {}}
         return out
 
-    fn["parameters"] = _sanitize_node(params, path=fn.get("name", "<tool>"))
+    fn["parameters"] = _sanitize_node(params, path=fn.get("name", "<tool>"), nested=False)
     # After recursion, guarantee the top-level is an object with properties.
     top = fn["parameters"]
     if not isinstance(top, dict):
@@ -228,12 +228,14 @@ def strip_nullable_unions(
     return stripped
 
 
-def _sanitize_node(node: Any, path: str) -> Any:
+def _sanitize_node(node: Any, path: str, nested: bool = True) -> Any:
     """Recursively sanitize a JSON-Schema fragment.
 
     - Replaces bare-string schema values ("object", "string", ...) with
       ``{"type": <value>}`` so downstream consumers see a dict.
-    - Injects ``properties: {}`` into object-typed nodes missing it.
+    - Injects ``properties: {}`` into object-typed nodes missing it. A nested
+      one is a free-form dict, so it also gets ``additionalProperties: true``
+      unless it already says otherwise (``nested=False`` for the top level).
     - Normalizes ``type: [X, "null"]`` arrays to single ``type: X`` (keeping
       ``nullable: true`` as a hint).
     - Recurses into ``properties``, ``items``, ``additionalProperties``,
@@ -247,10 +249,12 @@ def _sanitize_node(node: Any, path: str) -> Any:
                 "with {'type': %r}",
                 path, node, node,
             )
-            return {"type": node} if node != "object" else {
-                "type": "object",
-                "properties": {},
-            }
+            if node != "object":
+                return {"type": node}
+            out = {"type": "object", "properties": {}}
+            if nested:
+                out["additionalProperties"] = True
+            return out
         # Any other stray string is not a schema — drop it by replacing with
         # a permissive object schema rather than propagate something the
         # backend will reject.
@@ -319,8 +323,13 @@ def _sanitize_node(node: Any, path: str) -> Any:
 
     # Object nodes without properties: inject empty properties dict.
     # llama.cpp's grammar generator can't constrain a free-form object.
+    # ``properties: {}`` alone reads as "must be empty" to GPT-family models
+    # (kanban_complete metadata arrived as {}), so keep a nested free-form
+    # object explicitly open.
     if out.get("type") == "object" and not isinstance(out.get("properties"), dict):
         out["properties"] = {}
+        if nested:
+            out.setdefault("additionalProperties", True)
 
     # Prune ``required`` entries that don't exist in properties (defense
     # against malformed MCP schemas; also caught upstream for MCP tools, but
