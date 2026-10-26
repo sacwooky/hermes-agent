@@ -103,7 +103,7 @@ def process_turn_response(
     """
     # Deferred import to avoid a circular import (conversation_loop imports
     # this module's caller wiring; _ra() lazy-loads run_agent).
-    from agent.conversation_loop import _ra, logger
+    from agent.conversation_loop import _ra, _sync_failover_system_message, logger
 
     _turn_exit_reason = None
 
@@ -888,6 +888,8 @@ def process_turn_response(
                         "switching to fallback provider..."
                     )
                     if agent._try_activate_fallback():
+                        active_system_prompt = _sync_failover_system_message(
+                            agent, api_messages, active_system_prompt)
                         agent._empty_content_retries = 0
                         agent._buffer_status(
                             f"↻ Switched to fallback: {agent.model} "

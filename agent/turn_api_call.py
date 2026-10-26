@@ -148,6 +148,7 @@ def run_api_call_with_retry(
     _try_refresh_nous_paid_entitlement_credentials = conversation_loop._try_refresh_nous_paid_entitlement_credentials
     _ra = conversation_loop._ra
     sanitize_active_system_prompt = conversation_loop.sanitize_active_system_prompt
+    _sync_failover_system_message = conversation_loop._sync_failover_system_message
     apply_turn_compression = conversation_loop.apply_turn_compression
     _CONTENT_POLICY_RECOVERY_HINT = conversation_loop._CONTENT_POLICY_RECOVERY_HINT
     INTERRUPT_WAITING_FOR_MODEL_PREFIX = conversation_loop.INTERRUPT_WAITING_FOR_MODEL_PREFIX
@@ -202,6 +203,8 @@ def run_api_call_with_retry(
                     )
                     agent._buffer_status(f"⏳ {_nous_msg}")
                     if agent._try_activate_fallback():
+                        active_system_prompt = _sync_failover_system_message(
+                            agent, api_messages, active_system_prompt)
                         retry_count = 0
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
@@ -527,6 +530,8 @@ def run_api_call_with_retry(
                 if agent._fallback_index < len(agent._fallback_chain):
                     agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
                 if agent._try_activate_fallback():
+                    active_system_prompt = _sync_failover_system_message(
+                        agent, api_messages, active_system_prompt)
                     retry_count = 0
                     compression_attempts = 0
                     _retry.primary_recovery_attempted = False
@@ -598,6 +603,8 @@ def run_api_call_with_retry(
                     if agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
                     if agent._try_activate_fallback():
+                        active_system_prompt = _sync_failover_system_message(
+                            agent, api_messages, active_system_prompt)
                         retry_count = 0
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
@@ -741,6 +748,8 @@ def run_api_call_with_retry(
                         "⚠️ Model declined to respond (safety refusal) — trying fallback..."
                     )
                 if agent._try_activate_fallback():
+                    active_system_prompt = _sync_failover_system_message(
+                        agent, api_messages, active_system_prompt)
                     retry_count = 0
                     compression_attempts = 0
                     _retry.primary_recovery_attempted = False
@@ -2049,10 +2058,45 @@ def run_api_call_with_retry(
                     else:
                         agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
                     if agent._try_activate_fallback(reason=classified.reason):
+                        active_system_prompt = _sync_failover_system_message(
+                            agent, api_messages, active_system_prompt)
                         retry_count = 0
                         compression_attempts = 0
                         _retry.primary_recovery_attempted = False
                         continue
+
+            # ── Auth-failure provider failover ───────────────────────
+            # A 401/403 that survives the per-provider credential-refresh
+            # attempt above (each guarded by its own
+            # ``*_auth_retry_attempted`` flag) means the active provider's
+            # credential or endpoint is broken in a way refreshing can't
+            # fix (revoked OAuth, blocked/expired key, an account pinned to
+            # a dead/staging endpoint). Previously the loop only printed
+            # "switch providers manually" advice and fell through, so a
+            # user with a configured fallback chain kept thrashing on the
+            # same dead credential every turn instead of failing over.
+            # Escalate to the fallback chain here, mirroring the rate-
+            # limit/billing failover above. When no fallback is configured
+            # (or the chain is exhausted), _try_activate_fallback returns
+            # False and we fall through to the existing terminal handling
+            # + provider-specific troubleshooting guidance unchanged.
+            if (
+                classified.is_auth
+                and not _retry.auth_failover_attempted
+                and agent._fallback_index < len(agent._fallback_chain)
+            ):
+                _retry.auth_failover_attempted = True
+                agent._buffer_status(
+                    "🔐 Authentication failed and could not be refreshed — "
+                    "switching to fallback provider..."
+                )
+                if agent._try_activate_fallback(reason=classified.reason):
+                    active_system_prompt = _sync_failover_system_message(
+                        agent, api_messages, active_system_prompt)
+                    retry_count = 0
+                    compression_attempts = 0
+                    _retry.primary_recovery_attempted = False
+                    continue
 
             # ── Nous Portal: record rate limit & skip retries ─────
             # When Nous returns a 429 that is a genuine account-
@@ -2487,6 +2531,8 @@ def run_api_call_with_retry(
                     else:
                         agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
                 if agent._try_activate_fallback():
+                    active_system_prompt = _sync_failover_system_message(
+                        agent, api_messages, active_system_prompt)
                     retry_count = 0
                     compression_attempts = 0
                     _retry.primary_recovery_attempted = False
@@ -2656,6 +2702,8 @@ def run_api_call_with_retry(
                 if agent._has_pending_fallback():
                     agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
                 if agent._try_activate_fallback():
+                    active_system_prompt = _sync_failover_system_message(
+                        agent, api_messages, active_system_prompt)
                     retry_count = 0
                     compression_attempts = 0
                     _retry.primary_recovery_attempted = False
