@@ -1858,7 +1858,8 @@ def _record_agent_decision(
                  "--chose", chose, "--passed-over", other,
                  "--why", reason,
                  "--ref", gate_id, "--agent", reviewer],
-                capture_output=True, text=True, timeout=30,
+                # Short: the sweep waits on this, and the decision is already committed.
+                capture_output=True, text=True, timeout=10,
             )
             status = "recorded" if proc.returncode == 0 else f"rc={proc.returncode}"
         except (OSError, subprocess.SubprocessError) as exc:
@@ -1889,14 +1890,36 @@ def _apply_agent_review(
         )
         return False
     review_id = created.get("review_id")
-    srow = conn.execute("SELECT status FROM tasks WHERE id = ?", (review_id,)).fetchone()
+    srow = conn.execute("SELECT status, assignee FROM tasks WHERE id = ?",
+                        (review_id,)).fetchone()
     if srow is None or srow["status"] not in ("done", "archived"):
         return False
     run_row = conn.execute(
-        "SELECT metadata FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
+        "SELECT metadata, profile FROM task_runs WHERE task_id = ? AND outcome = 'completed' "
         "ORDER BY started_at DESC, id DESC LIMIT 1",
         (review_id,),
     ).fetchone()
+    # Independence again at apply time: the review must still belong to the
+    # reviewer it was opened for, that reviewer must have run it, and a config
+    # change since must not have made it the fix assignee or a builder.
+    reviewer = created.get("reviewer") or reviewer
+    epic_id = _gate_epic_id(conn, gate_id)
+    builders = _epic_builders(conn, epic_id) if epic_id else set()
+    ran_as = run_row["profile"] if run_row is not None else None
+    if (srow["assignee"] != reviewer or ran_as != reviewer
+            or reviewer == fix_assignee or reviewer in builders):
+        stale = _event_payload(_has_event(conn, gate_id, "acceptance_review_refused"))
+        if stale.get("review_id") != review_id:
+            with kb.write_txn(conn):
+                kb._append_event(conn, gate_id, "acceptance_review_refused", {
+                    "review_id": review_id, "reviewer": reviewer,
+                    "assignee": srow["assignee"], "ran_as": ran_as,
+                    "reason": "at apply time the review was not run by its independent"
+                              " reviewer; gate left for Keith",
+                })
+            _log.warning("agent acceptance review %s for %s not applied: reviewer %r "
+                         "not independent at apply time", review_id, gate_id, reviewer)
+        return False
     meta = run_row["metadata"] if run_row is not None else None
     if isinstance(meta, str):
         try:
