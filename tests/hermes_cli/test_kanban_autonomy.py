@@ -323,6 +323,143 @@ def test_autonomy_tick_respects_feature_gates(kanban_home):
 
 
 # ---------------------------------------------------------------------------
+# Agent acceptance (approver: agent)
+
+
+AGENT_CFG = {"epic_acceptance": {"enabled": True, "approver": "agent",
+                                 "reviewer_assignee": "product"}}
+
+
+@pytest.fixture
+def decided_log(tmp_path):
+    """A stand-in fleet-decided.py under the patched home that logs its argv."""
+    scripts = tmp_path / ".hermes" / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    log = tmp_path / "decided.log"
+    (scripts / "fleet-decided.py").write_text(
+        "import json, sys\n"
+        f"open({str(log)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+    )
+    return log
+
+
+def _agent_gate(conn):
+    root, child_ids = _decompose_epic(conn)
+    _finish_epic(conn, root, child_ids)
+    ka.run_autonomy_tick(conn, cfg=AGENT_CFG)
+    (gate_id,) = [r["id"] for r in conn.execute(
+        "SELECT t.id FROM tasks t JOIN task_metadata m ON m.task_id = t.id "
+        "WHERE m.work_item_type = 'acceptance'").fetchall()]
+    review = ka._event_payload(ka._has_event(conn, gate_id, "acceptance_review_created"))
+    return gate_id, review.get("review_id")
+
+
+def test_agent_mode_opens_one_independent_review(kanban_home):
+    with kb.connect() as conn:
+        gate_id, review_id = _agent_gate(conn)
+        assert review_id, "no review task opened"
+        review = kb.get_task(conn, review_id)
+        assert review.assignee == "product"
+        assert review.status == "ready"
+        assert kb.get_task_metadata(review_id)["work_item_type"] == "acceptance_review"
+        assert gate_id in (review.body or "")
+        # The gate itself is still sticky-blocked and pending.
+        assert kb.get_task(conn, gate_id).status == "blocked"
+        assert kb.list_task_approvals(gate_id)[0]["status"] == "pending"
+        # Another tick opens no second review.
+        ka.run_autonomy_tick(conn, cfg=AGENT_CFG)
+        n = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ? "
+                         "AND kind = 'acceptance_review_created'", (gate_id,)).fetchone()[0]
+        assert n == 1
+
+
+def test_agent_accept_releases_the_gate_and_records_for_the_digest(kanban_home, decided_log):
+    with kb.connect() as conn:
+        gate_id, review_id = _agent_gate(conn)
+        kb.complete_task(conn, review_id, result="demo matches the criteria",
+                         metadata={"acceptance_decision": "accept",
+                                   "reason": "all five criteria met in the demo"})
+        out = ka.run_autonomy_tick(conn, cfg=AGENT_CFG)
+        assert out["acceptance_sweep"]["completed"] == [gate_id]
+        assert kb.get_task(conn, gate_id).status == "done"
+        approval = kb.list_task_approvals(gate_id)[0]
+        assert approval["status"] == "approved"
+        assert approval["approver"] == "agent:product"
+    argv = json.loads(decided_log.read_text().splitlines()[0])
+    assert argv[:3] == ["record", "--kind", "choice"]
+    assert "all five criteria met in the demo" in argv
+    assert gate_id in argv
+
+
+def test_agent_reject_spawns_one_fix_story_and_rearms_a_new_review(kanban_home, decided_log):
+    with kb.connect() as conn:
+        gate_id, review_id = _agent_gate(conn)
+        kb.complete_task(conn, review_id, result="nav broken",
+                         metadata={"acceptance_decision": "reject",
+                                   "reason": "nav is broken on mobile"})
+        out = ka.run_autonomy_tick(conn, cfg=AGENT_CFG)
+        assert len(out["acceptance_sweep"]["fix_stories"]) == 1
+        fix_id = out["acceptance_sweep"]["fix_stories"][0]
+        assert "nav is broken on mobile" in (kb.get_task(conn, fix_id).body or "")
+        assert kb.get_task(conn, gate_id).status == "blocked"
+        kb.complete_task(conn, fix_id, result="fixed nav")
+        out = ka.run_autonomy_tick(conn, cfg=AGENT_CFG)
+        assert out["acceptance_sweep"]["rearmed"] == [gate_id]
+        # The re-armed approval gets its own fresh review on the next tick.
+        ka.run_autonomy_tick(conn, cfg=AGENT_CFG)
+        second = ka._event_payload(ka._has_event(conn, gate_id, "acceptance_review_created"))
+        assert second["review_id"] != review_id
+
+
+@pytest.mark.parametrize("metadata", [
+    {},
+    {"acceptance_decision": "looks fine"},
+    {"acceptance_decision": "reject"},          # a reject needs a reason
+])
+def test_agent_review_without_a_valid_decision_releases_nothing(kanban_home, metadata):
+    with kb.connect() as conn:
+        gate_id, review_id = _agent_gate(conn)
+        kb.complete_task(conn, review_id, result="done", metadata=metadata or None)
+        out = ka.run_autonomy_tick(conn, cfg=AGENT_CFG)
+        assert out["acceptance_sweep"]["completed"] == []
+        assert out["acceptance_sweep"]["fix_stories"] == []
+        assert kb.get_task(conn, gate_id).status == "blocked"
+        assert kb.list_task_approvals(gate_id)[0]["status"] == "pending"
+        assert ka._has_event(conn, gate_id, "acceptance_review_invalid") is not None
+        # Keith's own accept still works.
+        kb.record_task_acceptance(conn, gate_id, "keith", source="cli")
+        assert kb.get_task(conn, gate_id).status == "done"
+
+
+@pytest.mark.parametrize("reviewer", ["builder", "qa-fixer"])
+def test_agent_review_refused_when_the_reviewer_is_not_independent(kanban_home, reviewer):
+    cfg = {"epic_acceptance": {"enabled": True, "approver": "agent",
+                               "reviewer_assignee": reviewer,
+                               "fix_assignee": "qa-fixer"}}
+    with kb.connect() as conn:
+        root, child_ids = _decompose_epic(conn)   # the build story is assigned to builder
+        _finish_epic(conn, root, child_ids)
+        ka.run_autonomy_tick(conn, cfg=cfg)
+        (gate_id,) = [r["id"] for r in conn.execute(
+            "SELECT t.id FROM tasks t JOIN task_metadata m ON m.task_id = t.id "
+            "WHERE m.work_item_type = 'acceptance'").fetchall()]
+        assert ka._has_event(conn, gate_id, "acceptance_review_created") is None
+        assert ka._has_event(conn, gate_id, "acceptance_review_refused") is not None
+        assert kb.list_task_approvals(gate_id)[0]["status"] == "pending"
+
+
+def test_keith_mode_opens_no_review_and_unknown_approver_falls_back(kanban_home):
+    with kb.connect() as conn:
+        root, child_ids = _decompose_epic(conn)
+        _finish_epic(conn, root, child_ids)
+        ka.run_autonomy_tick(conn, cfg={"epic_acceptance": {"enabled": True,
+                                                            "approver": "anyone"}})
+        ka.run_autonomy_tick(conn, cfg={"epic_acceptance": {"enabled": True}})
+        assert conn.execute("SELECT COUNT(*) FROM task_events "
+                            "WHERE kind = 'acceptance_review_created'").fetchone()[0] == 0
+
+
+# ---------------------------------------------------------------------------
 # Unintegrated-work sweep
 # ---------------------------------------------------------------------------
 
