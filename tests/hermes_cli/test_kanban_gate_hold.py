@@ -50,10 +50,12 @@ class TestHasGateHold:
             kb.block_task(conn, tid, reason="Waiting on dependencies: need Phase 11 packet")
             assert kb._has_gate_hold(conn, tid) is True
 
+    # 'review-required' became a gate phrase in fleet commit d10dea3c852 (C3b),
+    # so these soft-reason tests use a non-gate phrase instead.
     def test_blocked_event_with_non_gate_phrase_returns_false(self, kanban_home):
         with kb.connect() as conn:
             tid = kb.create_task(conn, title="t", assignee="a")
-            kb.block_task(conn, tid, reason="review-required: needs code review")
+            kb.block_task(conn, tid, reason="need clarification: needs code review")
             assert kb._has_gate_hold(conn, tid) is False
 
     def test_blocked_then_unblocked_returns_false(self, kanban_home):
@@ -71,7 +73,7 @@ class TestHasGateHold:
             # Unblock
             kb.unblock_task(conn, tid)
             # Second block with non-gate phrase
-            kb.block_task(conn, tid, reason="review-required: diff looks wrong")
+            kb.block_task(conn, tid, reason="need clarification: diff looks wrong")
             assert kb._has_gate_hold(conn, tid) is False
 
     def test_created_blocked_status_with_gate_reason(self, kanban_home):

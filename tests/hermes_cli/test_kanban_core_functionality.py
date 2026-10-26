@@ -2850,7 +2850,9 @@ def test_default_spawn_leaves_terminal_timeout_without_runtime_cap(kanban_home, 
         conn.close()
 
     assert captured["env"]["TERMINAL_TIMEOUT"] == "180"
-    assert "TERMINAL_MAX_FOREGROUND_TIMEOUT" not in captured["env"]
+    # Fleet divergence (0b0e7299c11): uncapped workers still get the
+    # foreground-timeout cap floored at the kanban lane floor (1800s).
+    assert captured["env"]["TERMINAL_MAX_FOREGROUND_TIMEOUT"] == "1800"
 
 
 def test_build_worker_context_includes_runtime_timeout_budget(kanban_home, monkeypatch):
