@@ -8934,7 +8934,7 @@ def _open_spawn_log_safely(log_path: Path, rotate_bytes: int, backup_count: int)
         fd = os.open(log_path, flags, 0o600)
     except OSError:
         _log.warning(
-            "spawn log path %s not safe to open (symlink/permissions); dropping logs",
+            "spawn log path %s not safe to open (symlink/permissions); dropping logs",  # windows-footgun: ok
             log_path,
         )
         return open(os.devnull, "ab")
