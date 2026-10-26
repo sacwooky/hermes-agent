@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 
 from tools.schema_sanitizer import (
+    _sanitize_node,
     sanitize_tool_schemas,
     strip_pattern_and_format,
     strip_slash_enum,
@@ -760,6 +761,16 @@ def test_top_level_parameters_not_opened():
     """A no-argument tool must not start accepting arbitrary arguments."""
     out = sanitize_tool_schemas([_tool("t", {"type": "object"})])
     assert "additionalProperties" not in out[0]["function"]["parameters"]
+
+
+def test_top_level_bare_string_parameters_not_opened():
+    """Both top-level routes stay closed: _sanitize_single_tool replaces a
+    non-dict ``parameters`` before recursing, and _sanitize_node itself keeps a
+    bare "object" closed when it is not nested."""
+    out = sanitize_tool_schemas([_tool("t", "object")])
+    assert out[0]["function"]["parameters"] == {"type": "object", "properties": {}}
+    assert _sanitize_node("object", path="t", nested=False) == {"type": "object", "properties": {}}
+    assert _sanitize_node("object", path="t")["additionalProperties"] is True
 
 
 def test_kanban_complete_metadata_open_after_sanitize():

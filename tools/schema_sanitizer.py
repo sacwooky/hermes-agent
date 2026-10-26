@@ -249,11 +249,12 @@ def _sanitize_node(node: Any, path: str, nested: bool = True) -> Any:
                 "with {'type': %r}",
                 path, node, node,
             )
-            return {"type": node} if node != "object" else {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": True,
-            }
+            if node != "object":
+                return {"type": node}
+            out = {"type": "object", "properties": {}}
+            if nested:
+                out["additionalProperties"] = True
+            return out
         # Any other stray string is not a schema — drop it by replacing with
         # a permissive object schema rather than propagate something the
         # backend will reject.
