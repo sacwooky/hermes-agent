@@ -426,9 +426,10 @@ class TestF2Gate:
 
     def test_r3_gate_no_false_positive_on_soft_blocks(self, kanban_home):
         """F2 must NOT false-positive on soft block reasons like
-        'need clarification' or 'review-required'."""
+        'need clarification'.  ('review-required' is a gate phrase since
+        fleet commit d10dea3c852 (C3b), so it is no longer a soft block.)"""
         soft_reasons = [
-            "review-required: needs code review",
+            "needs a second look at the diff",
             "need clarification on scope",
             "waiting for feedback from user",
             "blocked: dependency not resolved yet",

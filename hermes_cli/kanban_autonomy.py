@@ -2013,7 +2013,7 @@ def maybe_enqueue_learning(
         return {"enqueued": False, "reason": "bridge not configured (off)"}
     cfile = None
     try:
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as fh:
             json.dump(ld["candidates"], fh)
             cfile = fh.name
         argv = cmd.split() + [

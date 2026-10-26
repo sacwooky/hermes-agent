@@ -966,6 +966,8 @@ class TestCodexSoftAcceptPlausibilityGate:
 
     def test_real_catalog_model_unaffected(self):
         from hermes_cli.models import validate_requested_model
-        r = validate_requested_model("gpt-5.5", "openai-codex")
+        # gpt-5.5 is excluded from the fleet's Codex catalog (silent-hang
+        # family, fleet commit 9a8d193fb40), so use a model still in it.
+        r = validate_requested_model("gpt-5.4", "openai-codex")
         assert r["accepted"] is True
         assert r["recognized"] is True

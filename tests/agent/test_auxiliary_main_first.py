@@ -457,7 +457,9 @@ class TestResolveVisionMainFirst:
             provider, client, model = resolve_vision_provider_client()
 
         assert client is fallback_client
-        assert provider in {"openrouter", "nous"}
+        # The fleet's vision auto chain (fleet commit e791b922a38) probes
+        # openai-codex/gemini/claude-code before the openrouter/nous aggregators.
+        assert provider in {"openai-codex", "gemini", "claude-code", "openrouter", "nous"}
 
     def test_explicit_provider_override_still_wins(self):
         """Explicit config override bypasses main-first policy."""

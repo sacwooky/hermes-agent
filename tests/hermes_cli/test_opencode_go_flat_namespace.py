@@ -126,9 +126,15 @@ def _run_switch(raw_input: str, **extra):
         # For other providers, return empty so tests don't depend on them.
         return []
 
+    # validate_requested_model() probes the provider's live /v1/models; pin it
+    # to the same snapshot so the test never depends on the real endpoint
+    # (which currently lists e.g. ``deepseek-v4.1-flash`` and would auto-correct).
     with patch(
         "hermes_cli.model_switch.list_provider_models",
         side_effect=fake_list_provider_models,
+    ), patch(
+        "hermes_cli.models.fetch_api_models",
+        return_value=list(_OPENCODE_GO_LIVE),
     ):
         return switch_model(raw_input=raw_input, **defaults)
 

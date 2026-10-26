@@ -50,9 +50,9 @@ class TestSourceUsesReentrantAssignment:
     revert (e.g. a stale-branch merge resolving in favor of the old code)."""
 
     def test_genuine_branch_does_not_skip_to_max_retries(self):
-        from agent import conversation_loop
+        from agent import turn_api_call
 
-        src = inspect.getsource(conversation_loop)
+        src = inspect.getsource(turn_api_call)
         # Locate the genuine-rate-limit branch.
         match = re.search(
             r"if _genuine_nous_rate_limit:\n(?:.*\n)*?\s*continue\n",
@@ -62,7 +62,7 @@ class TestSourceUsesReentrantAssignment:
         # the regex above finds the first block ending in `continue`, which is
         # the retry-count branch.
         assert match is not None, (
-            "genuine-Nous-429 branch not found in conversation_loop — "
+            "genuine-Nous-429 branch not found in turn_api_call — "
             "update this test if the branch was refactored"
         )
         block = match.group(0)
