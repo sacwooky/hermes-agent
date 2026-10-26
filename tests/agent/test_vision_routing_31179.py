@@ -69,6 +69,21 @@ def _fresh_modules():
             del sys.modules[mod]
 
 
+def _pin_text_only_caps(monkeypatch):
+    """Pin the main model as text-only, as models.dev lists deepseek-v4-pro.
+
+    Without this the answer comes from the live models.dev catalog, which the
+    test conftest refuses; an unknown model is assumed vision-capable.
+    """
+    import agent.models_dev as models_dev
+
+    monkeypatch.setattr(
+        models_dev,
+        "get_model_capabilities",
+        lambda provider, model: models_dev.ModelCapabilities(supports_vision=False),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fix 1: provider=openai → custom + api.openai.com/v1
 # ---------------------------------------------------------------------------
@@ -156,6 +171,7 @@ model:
 """)
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
         _fresh_modules()
+        _pin_text_only_caps(monkeypatch)
 
         from agent.auxiliary_client import resolve_vision_provider_client
         provider, client, _model = resolve_vision_provider_client(provider="auto")
@@ -244,6 +260,7 @@ model:
 """)
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
         _fresh_modules()
+        _pin_text_only_caps(monkeypatch)
 
         from tools.vision_tools import check_vision_requirements
         assert check_vision_requirements() is False
@@ -259,6 +276,7 @@ model:
 """)
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
         _fresh_modules()
+        _pin_text_only_caps(monkeypatch)
 
         import tools.browser_tool
         # Force the browser side to True so we exercise the vision-gating part.
