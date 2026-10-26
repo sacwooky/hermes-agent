@@ -5174,6 +5174,8 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     )
     assert resp.get("result"), f"got error: {resp.get('error')}"
     sid = resp["result"]["session_id"]
+    # session.close pops the dict, so hold the build's ready event now.
+    build_done = server._sessions[sid]["agent_ready"]
     assert build_entered.wait(timeout=1.0), "deferred build did not start"
 
     # Wait until the (deferred) build thread has actually entered
@@ -5219,6 +5221,10 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
         f"orphan notify registration was not unregistered — "
         f"unregistered_keys={unregistered_keys}"
     )
+    # The build thread is still running past the orphan cleanup. Let it reach
+    # ready.set() before this test ends, or its late unregister lands in the
+    # next test's shim (CI flake in the no-race test under 8-worker load).
+    assert build_done.wait(timeout=10.0), "build thread did not finish"
 
 
 def test_session_create_no_race_keeps_worker_alive(monkeypatch):
@@ -5289,12 +5295,15 @@ def test_session_create_no_race_keeps_worker_alive(monkeypatch):
         assert built, "agent build did not complete within timeout"
 
         # Build finished without a close race — nothing should have been
-        # cleaned up by the orphan check.
+        # cleaned up by the orphan check. The shims are module-global, so a
+        # build thread another test left behind can record its OWN key here;
+        # only this session's key is this test's business.
+        own_key = session["session_key"]
         assert (
-            closed_workers == []
+            own_key not in closed_workers
         ), f"build thread closed its own worker despite no race: {closed_workers}"
         assert (
-            unregistered_keys == []
+            own_key not in unregistered_keys
         ), f"build thread unregistered its own notify despite no race: {unregistered_keys}"
 
         # Session should have the live worker installed.
