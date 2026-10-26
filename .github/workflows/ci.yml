@@ -79,9 +79,10 @@ jobs:
     if: needs.detect.outputs.event_name == 'pull_request'
     uses: ./.github/workflows/history-check.yml
 
+  # AUTHOR_MAP is upstream's release-credit list; forks skip the check.
   contributor-check:
     needs: detect
-    if: needs.detect.outputs.python == 'true'
+    if: github.repository == 'NousResearch/hermes-agent' && needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/contributor-check.yml
 
   uv-lockfile:
