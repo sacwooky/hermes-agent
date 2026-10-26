@@ -2179,6 +2179,7 @@ def test_create_partial_session_context_no_subscribe(monkeypatch, worker_env):
     d = json.loads(out)
     assert d["ok"] is True
     assert d["subscribed"] is False, d
+    assert _list_subs_for_task(d["task_id"]) == []
 
 
 def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worker_env):

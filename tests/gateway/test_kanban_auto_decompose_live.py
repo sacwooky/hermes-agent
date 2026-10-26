@@ -66,7 +66,7 @@ def test_config_read_error_fails_safe_disabled():
     assert per_tick == 3
 
 
-def test_non_dict_config_fails_safe():
+def test_none_or_non_dict_config_is_default_on():
     enabled, _ = _resolve_auto_decompose_settings(lambda: None)
     assert enabled is True  # no kanban key → default-on (not an error path)
     enabled2, _ = _resolve_auto_decompose_settings(lambda: ["not", "a", "dict"])
