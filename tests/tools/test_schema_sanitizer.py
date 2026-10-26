@@ -779,3 +779,65 @@ def test_kanban_complete_metadata_open_after_sanitize():
     tool = {"type": "function", "function": copy.deepcopy(KANBAN_COMPLETE_SCHEMA)}
     params = sanitize_tool_schemas([tool])[0]["function"]["parameters"]
     assert params["properties"]["metadata"]["additionalProperties"] is True
+
+
+# Provider contract: a nested free-form object leaves sanitize_tool_schemas
+# with ``additionalProperties: true``. Gemini's Schema subset rejects that key,
+# so its preparation path must strip it; Moonshot accepts it, so its
+# preparation path must keep it.
+
+def _nested_free_form_tools() -> list[dict]:
+    return sanitize_tool_schemas([_tool("t", {
+        "type": "object",
+        "properties": {
+            "meta": {"type": "object"},
+            "bag": {"type": "array", "items": {"type": "object"}},
+            "opt": {"anyOf": [{"type": "object"}, {"type": "string"}]},
+        },
+    })])
+
+
+def _has_additional_properties(node) -> bool:
+    if isinstance(node, dict):
+        return "additionalProperties" in node or any(
+            _has_additional_properties(v) for v in node.values()
+        )
+    if isinstance(node, list):
+        return any(_has_additional_properties(v) for v in node)
+    return False
+
+
+def test_gemini_preparation_strips_nested_free_form_open():
+    from agent.gemini_native_adapter import _translate_tools_to_gemini
+
+    tools = _nested_free_form_tools()
+    assert _has_additional_properties(tools)
+    decl = _translate_tools_to_gemini(tools)[0]["functionDeclarations"][0]
+    params = decl["parameters"]
+    assert not _has_additional_properties(params)
+    assert params["properties"]["meta"] == {"type": "object", "properties": {}}
+    assert params["properties"]["bag"]["items"] == {"type": "object", "properties": {}}
+    assert params["properties"]["opt"]["anyOf"][0] == {"type": "object", "properties": {}}
+
+
+def test_moonshot_preparation_keeps_nested_free_form_open():
+    from agent.moonshot_schema import sanitize_moonshot_tools
+
+    props = sanitize_moonshot_tools(_nested_free_form_tools())[0]["function"]["parameters"]["properties"]
+    assert props["meta"]["additionalProperties"] is True
+    assert props["bag"]["items"]["additionalProperties"] is True
+    assert props["opt"]["anyOf"][0]["additionalProperties"] is True
+
+
+def test_kanban_complete_metadata_through_provider_paths():
+    from agent.gemini_native_adapter import _translate_tools_to_gemini
+    from agent.moonshot_schema import sanitize_moonshot_tools
+    from tools.kanban_tools import KANBAN_COMPLETE_SCHEMA
+
+    tools = sanitize_tool_schemas(
+        [{"type": "function", "function": copy.deepcopy(KANBAN_COMPLETE_SCHEMA)}]
+    )
+    gemini = _translate_tools_to_gemini(tools)[0]["functionDeclarations"][0]["parameters"]
+    assert "additionalProperties" not in gemini["properties"]["metadata"]
+    moonshot = sanitize_moonshot_tools(tools)[0]["function"]["parameters"]
+    assert moonshot["properties"]["metadata"]["additionalProperties"] is True
