@@ -49,11 +49,15 @@ PTB_INVALID_TOKEN_404 = InvalidToken(
 
 
 def _make_adapter(extra=None):
-    """Build a TelegramAdapter with a mock bot wired for the rich path."""
+    """Build a TelegramAdapter with a mock bot wired for the rich path.
+
+    The fleet defaults rich OFF (``disable_rich_messages`` true, commit
+    fc8b1c526d3), so the rich-path tests opt in explicitly.
+    """
     config = PlatformConfig(
         enabled=True,
         token="fake-token",
-        extra={"rich_messages": True, **(extra or {})},
+        extra={"rich_messages": True, "disable_rich_messages": False, **(extra or {})},
     )
     adapter = TelegramAdapter(config)
     bot = MagicMock()
@@ -236,7 +240,10 @@ async def test_rich_messages_can_be_opted_in():
     """Setting platforms.telegram.extra.rich_messages: true enables native
     Bot API rich rendering for tables/task lists/details/math."""
     config = PlatformConfig(
-        enabled=True, token="fake-token", extra={"rich_messages": True}
+        enabled=True,
+        token="fake-token",
+        # Fleet default is rich OFF (fc8b1c526d3); opt in explicitly.
+        extra={"rich_messages": True, "disable_rich_messages": False},
     )
     adapter = TelegramAdapter(config)
     bot = MagicMock()
